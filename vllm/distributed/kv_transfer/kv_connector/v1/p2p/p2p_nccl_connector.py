@@ -18,13 +18,13 @@ from vllm.distributed.kv_transfer.kv_connector.v1.p2p.p2p_nccl_engine import (
 )
 from vllm.distributed.parallel_state import get_world_group
 from vllm.logger import init_logger
-from vllm.v1.attention.backends.mla.common import MLACommonMetadata
+from vllm.v1.attention.backend import AttentionMetadata
 from vllm.v1.core.sched.output import SchedulerOutput
 
 if TYPE_CHECKING:
-    from vllm.attention.backends.abstract import AttentionMetadata
     from vllm.forward_context import ForwardContext
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+    from vllm.v1.kv_cache_interface import KVCacheConfig
     from vllm.v1.request import Request
 
 logger = init_logger(__name__)
@@ -71,8 +71,17 @@ class P2pNcclConnectorMetadata(KVConnectorMetadata):
 
 
 class P2pNcclConnector(KVConnectorBase_V1):
-    def __init__(self, vllm_config: "VllmConfig", role: KVConnectorRole):
-        super().__init__(vllm_config=vllm_config, role=role)
+    def __init__(
+        self,
+        vllm_config: "VllmConfig",
+        role: KVConnectorRole,
+        kv_cache_config: "KVCacheConfig",
+    ):
+        super().__init__(
+            vllm_config=vllm_config,
+            role=role,
+            kv_cache_config=kv_cache_config,
+        )
         self._block_size = vllm_config.cache_config.block_size
         self._requests_need_load: dict[str, Any] = {}
         self.is_producer = self._kv_transfer_config.is_kv_producer
@@ -130,12 +139,9 @@ class P2pNcclConnector(KVConnectorBase_V1):
             """
             Inject KV cache data into a given attention layer tensor.
 
-            This function updates `layer` in-place with values from `kv_cache`,
-            handling different backend layouts:
-              - MLA (Multi-Linear Attention) or FlashInfer: KV tensors are
-                indexed along the first dimension.
-              - FlashAttention: KV tensors are indexed along the second
-                dimension.
+            This function updates `layer` in-place with values from `kv_cache`.
+            All backends (MLA, FlashAttention, FlashInfer, TritonAttention)
+            are indexed along the first dimension (block index).
 
             If the number of provided block IDs does not match the number of KV
             blocks, only the overlapping portion is updated, and a warning is
@@ -150,37 +156,19 @@ class P2pNcclConnector(KVConnectorBase_V1):
             Returns:
                 None. The function modifies `layer` in-place.
             """
-            if (
-                isinstance(attn_metadata, MLACommonMetadata) or layer.shape[1] == 2
-            ):  # MLA or FlashInfer
-                num_block = kv_cache.shape[0]
-                self.check_tensors_except_dim(layer, kv_cache, 0)
-                if len(block_ids) == num_block:
-                    layer[block_ids, ...] = kv_cache
-                else:
-                    layer[block_ids[:num_block], ...] = kv_cache
-                    logger.warning(
-                        "🚧kv_cache does not match, block_ids:%d, "
-                        "num_block:%d, request_id:%s",
-                        len(block_ids),
-                        num_block,
-                        request_id,
-                    )
-
-            elif layer.shape[0] == 2:  # FlashAttention
-                num_block = kv_cache.shape[1]
-                self.check_tensors_except_dim(layer, kv_cache, 1)
-                if len(block_ids) == num_block:
-                    layer[:, block_ids, ...] = kv_cache
-                else:
-                    layer[:, block_ids[:num_block], ...] = kv_cache
-                    logger.warning(
-                        "🚧kv_cache does not match, block_ids:%d, "
-                        "num_block:%d, request_id:%s",
-                        len(block_ids),
-                        num_block,
-                        request_id,
-                    )
+            num_block = kv_cache.shape[0]
+            self.check_tensors_except_dim(layer, kv_cache, 0)
+            if len(block_ids) == num_block:
+                layer[block_ids, ...] = kv_cache
+            else:
+                layer[block_ids[:num_block], ...] = kv_cache
+                logger.warning(
+                    "🚧kv_cache does not match, block_ids:%d, "
+                    "num_block:%d, request_id:%s",
+                    len(block_ids),
+                    num_block,
+                    request_id,
+                )
 
         # Get the metadata
         metadata: KVConnectorMetadata = self._get_connector_metadata()
@@ -204,7 +192,7 @@ class P2pNcclConnector(KVConnectorBase_V1):
                 if kv_cache is None:
                     continue
 
-                layer = kv_cache[forward_context.virtual_engine]
+                layer = kv_cache
 
                 kv_cache = self.p2p_nccl_engine.recv_tensor(
                     request.request_id + "#" + layer_name, remote_address
@@ -233,7 +221,7 @@ class P2pNcclConnector(KVConnectorBase_V1):
         self,
         layer_name: str,
         kv_layer: torch.Tensor,
-        attn_metadata: "AttentionMetadata",
+        attn_metadata: AttentionMetadata,
         **kwargs: Any,
     ) -> None:
         """Start saving the KV cache of the layer from vLLM's paged buffer
@@ -253,37 +241,6 @@ class P2pNcclConnector(KVConnectorBase_V1):
 
         assert self.p2p_nccl_engine is not None
 
-        def extract_kv_from_layer(
-            layer: torch.Tensor,
-            block_ids: torch.Tensor,
-        ) -> torch.Tensor:
-            """
-            Extract KV cache slices from a given attention layer tensor.
-
-            This function handles multiple backend layouts:
-              - MLA (Multi-Linear Attention) or FlashInfer: KV tensors are
-                indexed along the first dimension.
-              - FlashAttention: KV tensors are indexed along the second
-                dimension.
-
-            Args:
-                layer (torch.Tensor): The KV cache from the attention layer.
-                block_ids (torch.Tensor): Indices of blocks to extract.
-
-            Returns:
-                torch.Tensor: A tensor containing the extracted KV slices.
-                Returns None if the layout is unsupported.
-            """
-            if (
-                isinstance(attn_metadata, MLACommonMetadata) or layer.shape[1] == 2
-            ):  # MLA or FlashInfer
-                return layer[block_ids, ...]
-
-            if layer.shape[0] == 2:  # FlashAttention
-                return layer[:, block_ids, ...]
-
-            return None
-
         connector_metadata = self._get_connector_metadata()
         assert isinstance(connector_metadata, P2pNcclConnectorMetadata)
         for request in connector_metadata.requests:
@@ -291,7 +248,7 @@ class P2pNcclConnector(KVConnectorBase_V1):
             ip, port = self.parse_request_id(request_id, True)
             remote_address = ip + ":" + str(port + self._rank)
 
-            kv_cache = extract_kv_from_layer(kv_layer, request.block_ids)
+            kv_cache = kv_layer[request.block_ids, ...]
             self.p2p_nccl_engine.send_tensor(
                 request_id + "#" + layer_name, kv_cache, remote_address
             )
@@ -415,10 +372,10 @@ class P2pNcclConnector(KVConnectorBase_V1):
         for i, req_id in enumerate(cached_reqs.req_ids):
             num_computed_tokens = cached_reqs.num_computed_tokens[i]
             new_block_ids = cached_reqs.new_block_ids[i]
-            resumed_from_preemption = cached_reqs.resumed_from_preemption[i]
+            resumed_from_preemption = req_id in cached_reqs.resumed_req_ids
 
             if self.is_producer:
-                num_scheduled_tokens = (scheduler_output.num_scheduled_tokens)[req_id]
+                num_scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
                 num_tokens = num_scheduled_tokens + num_computed_tokens
                 assert req_id in self.chunked_prefill
                 assert new_block_ids is not None

@@ -5,23 +5,13 @@ Taken from https://github.com/ModelTC/LightLLM/blob/8ed97c74c18f11505b048b1ba00b
 and updated to fit vllm needs and terminology.
 """
 
-import functools
-
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.model_executor.layers.fused_moe.utils import count_expert_num_tokens
 from vllm.triton_utils import tl, triton
-from vllm.utils import round_up
-
-
-@functools.cache
-def deep_gemm_block_shape() -> list[int]:
-    # Lazy import to avoid CUDA initialization problems.
-    import deep_gemm as dg
-
-    block = dg.get_m_alignment_for_contiguous_layout()
-    return [block, block]
+from vllm.utils.deep_gemm import get_mk_alignment_for_contiguous_layout
+from vllm.utils.math_utils import round_up
 
 
 def expert_num_tokens_round_up_and_sum(
@@ -86,18 +76,28 @@ def _fwd_kernel_ep_scatter_1(
     )
     tokens_per_expert = round_up_128(tokens_per_expert)
     cumsum = tl.cumsum(tokens_per_expert) - tokens_per_expert
-    tl.store(expert_start_loc + offset_cumsum, cumsum, mask=offset_cumsum < num_experts)
 
-    cur_expert_start = tl.load(expert_start_loc + cur_expert)
+    # Extract this block's offset from the register vector (warp shuffle,
+    # no global memory round-trip) then write it once to expert_start_loc.
+    cur_expert_start = tl.sum(
+        tl.where(offset_cumsum == cur_expert, cumsum, tl.zeros_like(cumsum))
+    )
+    tl.store(expert_start_loc + cur_expert, cur_expert_start)
     cur_expert_token_num = tl.load(num_recv_tokens_per_expert + cur_expert)
 
     m_indices_start_ptr = m_indices + cur_expert_start
     off_expert = tl.arange(0, BLOCK_E)
 
-    for start_m in tl.range(0, cur_expert_token_num, BLOCK_E, num_stages=4):
+    # any rows in the per-expert aligned region that do not correspond to
+    # real tokens are left untouched here and should remain initialized to
+    # -1 so DeepGEMM can skip them
+    for start_m in tl.range(0, cur_expert_token_num, BLOCK_E):
+        offs = start_m + off_expert
+        mask = offs < cur_expert_token_num
         tl.store(
-            m_indices_start_ptr + start_m + off_expert,
+            m_indices_start_ptr + offs,
             cur_expert,
+            mask=mask,
         )
 
 
@@ -140,6 +140,8 @@ def _fwd_kernel_ep_scatter_2(
     offset_in_s = tl.arange(0, SCALE_HIDDEN_SIZE_PAD)
     mask_s = offset_in_s < SCALE_HIDDEN_SIZE
 
+    output_tensor_stride0 = output_tensor_stride0.to(tl.int64)
+
     for token_id in range(start_token_id, total_token_num, grid_num):
         to_copy = tl.load(recv_x + token_id * recv_x_stride0 + offset_in, mask=mask)
         to_copy_s = tl.load(
@@ -154,12 +156,13 @@ def _fwd_kernel_ep_scatter_2(
 
             if expert_id >= 0:
                 dest_token_index = tl.atomic_add(expert_start_loc + expert_id, 1)
+                dest_token_index_i64 = dest_token_index.to(tl.int64)
                 tl.store(
                     output_index + token_id * output_index_stride0 + topk_index,
                     dest_token_index,
                 )
                 output_tensor_ptr = (
-                    output_tensor + dest_token_index * output_tensor_stride0
+                    output_tensor + dest_token_index_i64 * output_tensor_stride0
                 )
                 output_tensor_scale_ptr = (
                     output_tensor_scale + dest_token_index * output_tensor_scale_stride0
@@ -190,6 +193,7 @@ def ep_scatter(
     grid = num_experts
 
     assert m_indices.shape[0] % BLOCK_E == 0
+    assert expert_start_loc.shape[0] == num_experts
 
     _fwd_kernel_ep_scatter_1[(grid,)](
         num_recv_tokens_per_expert,
@@ -354,8 +358,7 @@ def deepgemm_moe_permute(
     H = aq.size(1)
     device = aq.device
 
-    block_m = deep_gemm_block_shape()[0]
-    block_k = deep_gemm_block_shape()[1]
+    block_m, block_k = get_mk_alignment_for_contiguous_layout()
 
     M_sum = compute_aligned_M(
         M=topk_ids.size(0),
@@ -377,12 +380,17 @@ def deepgemm_moe_permute(
         (M_sum, H // block_k), device=device, dtype=torch.float32
     )
 
-    maybe_has_empty_blocks = (expert_tokens_meta is None) or (
-        expert_tokens_meta.expert_num_tokens_cpu is None
+    # DeepGEMM uses negative values in m_indices (here expert_ids) to mark
+    # completely invalid / padded blocks that should be skipped. We always
+    # initialize expert_ids to -1 so any row that is not explicitly written
+    # by the scatter kernel will be treated as invalid and skipped by
+    # DeepGEMM's scheduler.
+    expert_ids = torch.full(
+        (M_sum,),
+        fill_value=-1,
+        device=device,
+        dtype=torch.int32,
     )
-    expert_ids_init = torch.zeros if maybe_has_empty_blocks else torch.empty
-
-    expert_ids = expert_ids_init((M_sum), device=device, dtype=torch.int32)
     inv_perm = torch.empty(topk_ids.shape, device=device, dtype=torch.int32)
 
     expert_num_tokens = None

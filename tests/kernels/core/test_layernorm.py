@@ -6,15 +6,25 @@ import torch
 
 from tests.kernels.quant_utils import FP8_DTYPE
 from tests.kernels.utils import opcheck
-from vllm.model_executor.layers.layernorm import PolyNorm, RMSNorm
+from vllm.model_executor.layers.layernorm import GemmaRMSNorm, RMSNorm
 from vllm.platforms import current_platform
+from vllm.utils.torch_utils import set_random_seed
+
+if current_platform.is_rocm():
+    from vllm.platforms.rocm import on_gfx90a
+
+    on_mi250 = on_gfx90a()
+else:
+    on_mi250 = False
 
 DTYPES = [torch.half, torch.bfloat16, torch.float]
 NUM_TOKENS = [7, 83, 4096]  # Arbitrary values for testing
 HIDDEN_SIZES = [8, 768, 769, 5120, 5125, 8192]  # Arbitrary values for testing
-ADD_RESIDUAL = [False, True]
+ADD_RESIDUAL = [False, True] if not on_mi250 else [True]
 SEEDS = [0]
-CUDA_DEVICES = [f"cuda:{i}" for i in range(1 if torch.cuda.device_count() == 1 else 2)]
+CUDA_DEVICES = [
+    f"cuda:{i}" for i in range(1 if torch.accelerator.device_count() == 1 else 2)
+]
 
 
 @pytest.mark.parametrize("num_tokens", NUM_TOKENS)
@@ -26,6 +36,7 @@ CUDA_DEVICES = [f"cuda:{i}" for i in range(1 if torch.cuda.device_count() == 1 e
 @pytest.mark.parametrize("strided_input", [False, True])
 @torch.inference_mode()
 def test_rms_norm(
+    default_vllm_config,
     num_tokens: int,
     hidden_size: int,
     add_residual: bool,
@@ -34,7 +45,7 @@ def test_rms_norm(
     device: str,
     strided_input: bool,
 ) -> None:
-    current_platform.seed_everything(seed)
+    set_random_seed(seed)
     torch.set_default_device(device)
     layer = RMSNorm(hidden_size).to(dtype=dtype)
     layer.weight.data.normal_(mean=1.0, std=0.1)
@@ -72,38 +83,6 @@ def test_rms_norm(
 
 @pytest.mark.parametrize("num_tokens", NUM_TOKENS)
 @pytest.mark.parametrize("hidden_size", HIDDEN_SIZES)
-@pytest.mark.parametrize("dtype", DTYPES)
-@pytest.mark.parametrize("seed", SEEDS)
-@pytest.mark.parametrize("device", CUDA_DEVICES)
-@torch.inference_mode()
-def test_poly_norm(
-    num_tokens: int,
-    hidden_size: int,
-    dtype: torch.dtype,
-    seed: int,
-    device: str,
-) -> None:
-    current_platform.seed_everything(seed)
-    torch.set_default_device(device)
-    layer = PolyNorm().to(dtype=dtype)
-    layer.weight.data.normal_(mean=1.0, std=0.1)
-    layer.bias.data.normal_(mean=1.0, std=0.1)
-    scale = 1 / (2 * hidden_size)
-    x = torch.randn(num_tokens, hidden_size, dtype=dtype)
-    x *= scale
-
-    ref_out = layer.forward_native(x)
-    out = layer(x)
-    torch.testing.assert_close(out, ref_out, atol=1e-2, rtol=1e-2)
-
-    opcheck(
-        torch.ops._C.poly_norm,
-        (out, x, layer.weight.data, layer.bias.data, layer.variance_epsilon),
-    )
-
-
-@pytest.mark.parametrize("num_tokens", NUM_TOKENS)
-@pytest.mark.parametrize("hidden_size", HIDDEN_SIZES)
 @pytest.mark.parametrize("add_residual", ADD_RESIDUAL)
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("quant_scale", [0.01, 1.0, 10.0])
@@ -120,7 +99,7 @@ def test_fused_rms_norm_quant(
     device: str,
     strided_input: bool,
 ) -> None:
-    current_platform.seed_everything(seed)
+    set_random_seed(seed)
     torch.set_default_device(device)
 
     weight = torch.empty(hidden_size, dtype=dtype).normal_(mean=1.0, std=0.1)
@@ -158,7 +137,7 @@ def test_fused_rms_norm_quant(
             out_quant, x_unfused.contiguous(), quant_scale_t
         )
 
-        torch.cuda.synchronize()
+        torch.accelerator.synchronize()
         torch.testing.assert_close(residual_fused, residual, atol=1e-2, rtol=1e-2)
         opcheck(
             torch.ops._C.fused_add_rms_norm_static_fp8_quant,
@@ -183,3 +162,31 @@ def test_fused_rms_norm_quant(
         atol=1e-3,
         rtol=1e-3,
     )
+
+
+@torch.inference_mode()
+def test_gemma_rms_norm_mixed_input_weight_dtype(default_vllm_config) -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+
+    device = CUDA_DEVICES[0]
+    torch.set_default_device(device)
+
+    num_tokens, hidden_size = 32, 1024
+    x = torch.randn(num_tokens, hidden_size, dtype=torch.bfloat16, device=device)
+    layer = GemmaRMSNorm(hidden_size, eps=1e-6).to(device=device)
+    layer.weight.data.normal_(mean=0.0, std=0.1)
+
+    # Gemma uses fp32 weight parameter while activations can be bf16.
+    assert layer.weight.dtype == torch.float32
+    out = layer(x)
+
+    x_fp32 = x.float()
+    weight_fp32 = layer.weight.data.float() + 1.0
+    variance = x_fp32.pow(2).mean(dim=-1, keepdim=True)
+    ref = (x_fp32 * torch.rsqrt(variance + layer.variance_epsilon) * weight_fp32).to(
+        x.dtype
+    )
+
+    assert out.dtype == x.dtype
+    torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)

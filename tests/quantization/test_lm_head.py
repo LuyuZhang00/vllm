@@ -8,8 +8,7 @@ Run `pytest tests/quantization/test_quant_lm_head_true.py --forked`.
 import pytest
 import torch
 
-from vllm.model_executor.layers.quantization.gptq import GPTQLinearMethod
-from vllm.model_executor.layers.quantization.gptq_marlin import GPTQMarlinLinearMethod
+from vllm.model_executor.layers.quantization.auto_gptq import AutoGPTQLinearMethod
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     UnquantizedEmbeddingMethod,
 )
@@ -31,14 +30,16 @@ def test_lm_head(
 ) -> None:
     # `LLM.apply_model` requires pickling a function.
     monkeypatch.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
-    with vllm_runner(model_id, dtype=torch.float16, max_model_len=2048) as vllm_model:
+    with vllm_runner(
+        model_id, dtype=torch.float16, max_model_len=2048, enforce_eager=True
+    ) as vllm_model:
 
         def check_model(model):
             lm_head_layer = model.lm_head
             if lm_head_quantized:
                 assert isinstance(
                     lm_head_layer.quant_method,
-                    (GPTQLinearMethod, GPTQMarlinLinearMethod),
+                    AutoGPTQLinearMethod,
                 )
             else:
                 assert isinstance(
@@ -47,4 +48,4 @@ def test_lm_head(
 
         vllm_model.apply_model(check_model)
 
-        print(vllm_model.generate_greedy(["Hello my name is"], max_tokens=10)[0][1])
+        print(vllm_model.generate_greedy(["Hello my name is"], max_tokens=4)[0][1])

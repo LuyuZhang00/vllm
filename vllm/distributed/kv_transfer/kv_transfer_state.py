@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from typing import TYPE_CHECKING
 
-from vllm import envs
 from vllm.distributed.kv_transfer.kv_connector.base import KVConnectorBaseType
 from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
 from vllm.distributed.kv_transfer.kv_connector.v1 import (
@@ -12,6 +11,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1 import (
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
+    from vllm.v1.kv_cache_interface import KVCacheConfig
 
 _KV_CONNECTOR_AGENT: KVConnectorBaseType | None = None
 
@@ -48,7 +48,23 @@ def is_v1_kv_transfer_group(connector: KVConnectorBaseType | None = None) -> boo
     return isinstance(connector, KVConnectorBase_V1)
 
 
-def ensure_kv_transfer_initialized(vllm_config: "VllmConfig") -> None:
+def _sync_engine_id_across_tp(vllm_config: "VllmConfig") -> None:
+    """Broadcast engine_id from TP rank 0 so all workers in a
+    multi-node TP group share the same value."""
+    from vllm.distributed.parallel_state import (
+        get_tp_group,
+    )
+
+    assert vllm_config.kv_transfer_config is not None
+    synced_id = get_tp_group().broadcast_object(
+        vllm_config.kv_transfer_config.engine_id, src=0
+    )
+    vllm_config.kv_transfer_config.engine_id = synced_id
+
+
+def ensure_kv_transfer_initialized(
+    vllm_config: "VllmConfig", kv_cache_config: "KVCacheConfig"
+) -> None:
     """
     Initialize KV cache transfer parallel group.
     """
@@ -62,12 +78,13 @@ def ensure_kv_transfer_initialized(vllm_config: "VllmConfig") -> None:
         vllm_config.kv_transfer_config.is_kv_transfer_instance
         and _KV_CONNECTOR_AGENT is None
     ):
-        if envs.VLLM_USE_V1:
-            _KV_CONNECTOR_AGENT = KVConnectorFactory.create_connector(
-                config=vllm_config, role=KVConnectorRole.WORKER
-            )
-        else:
-            raise ValueError("V0 is no longer supported")
+        _sync_engine_id_across_tp(vllm_config)
+
+        _KV_CONNECTOR_AGENT = KVConnectorFactory.create_connector(
+            config=vllm_config,
+            role=KVConnectorRole.WORKER,
+            kv_cache_config=kv_cache_config,
+        )
 
 
 def ensure_kv_transfer_shutdown() -> None:

@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 
 from vllm.config.model import LogprobsMode
-from vllm.utils import is_pin_memory_available
+from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.v1.outputs import LogprobsTensors, SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.ops.bad_words import apply_bad_words
@@ -69,17 +69,23 @@ class Sampler(nn.Module):
         logits: torch.Tensor,
         sampling_metadata: SamplingMetadata,
         predict_bonus_token: bool = False,
+        logprobs_mode_override: LogprobsMode | None = None,
     ) -> SamplerOutput:
+        logprobs_mode = logprobs_mode_override or self.logprobs_mode
         # NOTE(woosuk): Use the original logits (before any penalties or
         # temperature scaling) for the top-k logprobs.
         # This is different from the V0 sampler, which uses the logits that
         # is used for sampling (after penalties and temperature scaling).
         num_logprobs = sampling_metadata.max_num_logprobs
-        if num_logprobs is not None:
-            if self.logprobs_mode == "raw_logprobs":
+        raw_logprobs: torch.Tensor | None = None
+        if num_logprobs is not None or sampling_metadata.logprob_token_ids:
+            if logprobs_mode == "raw_logprobs":
                 raw_logprobs = self.compute_logprobs(logits)
-            elif self.logprobs_mode == "raw_logits":
-                raw_logprobs = logits.clone()
+            elif logprobs_mode == "raw_logits":
+                if logits.dtype == torch.float32:
+                    raw_logprobs = logits.clone()
+                else:
+                    raw_logprobs = logits.to(torch.float32)
 
         # Use float32 for the logits.
         logits = logits.to(torch.float32)
@@ -97,13 +103,32 @@ class Sampler(nn.Module):
         # return int32 (while PyTorch argmax and topk return int64).
         sampled = sampled.long()
 
-        # Gather the logprobs of the topk and sampled token (if requested).
-        # Get logprobs and rank tensors (if requested)
-        logprobs_tensors = (
-            None
-            if num_logprobs is None
-            else self.gather_logprobs(raw_logprobs, num_logprobs, token_ids=sampled)
-        )
+        # Handle logprob_token_ids if specified (more efficient than full vocab)
+        # This is used by generative_scoring API to get logprobs for specific tokens
+        logprob_token_ids_tensors = None
+        if sampling_metadata.logprob_token_ids:
+            assert raw_logprobs is not None
+            logprob_token_ids_tensors = self.gather_specific_token_logprobs(
+                raw_logprobs, sampling_metadata.logprob_token_ids, sampled
+            )
+
+        if num_logprobs is None:
+            logprobs_tensors = logprob_token_ids_tensors
+        elif num_logprobs == -1:
+            # Return the full unsorted and unranked logprobs.
+            logprobs_tensors = LogprobsTensors(
+                torch.empty(0), raw_logprobs, torch.empty(0)
+            )
+        else:
+            # Gather the logprobs and ranks of the topk and sampled token.
+            logprobs_tensors = self.gather_logprobs(
+                raw_logprobs, num_logprobs, token_ids=sampled
+            )
+
+        # If we have both num_logprobs and logprob_token_ids, prefer
+        # logprob_token_ids as it's more specific
+        if logprob_token_ids_tensors is not None and num_logprobs is not None:
+            logprobs_tensors = logprob_token_ids_tensors
 
         # Use int32 to reduce the tensor size.
         sampled = sampled.to(torch.int32)
@@ -117,6 +142,82 @@ class Sampler(nn.Module):
             logprobs_tensors=logprobs_tensors,
         )
         return sampler_output
+
+    def gather_specific_token_logprobs(
+        self,
+        logprobs: torch.Tensor,
+        logprob_token_ids: dict[int, list[int]],
+        sampled: torch.Tensor,
+    ) -> LogprobsTensors | None:
+        """Gather logprobs for specific token IDs requested per request.
+
+        Used by the generative_scoring API to return logprobs for an explicit
+        set of token ids rather than the top-k. Handles heterogeneous token
+        id lists across requests by padding shorter lists to the max length.
+
+        Args:
+            logprobs: [batch_size, vocab_size] tensor of (raw) logprobs to
+                gather from.
+            logprob_token_ids: dict mapping req_index -> list of token IDs
+            sampled: [batch_size] tensor of sampled token IDs
+
+        Returns:
+            LogprobsTensors with logprobs for the specified tokens, or None
+            if no requests have logprob_token_ids.
+        """
+        if not logprob_token_ids:
+            return None
+
+        batch_size = logprobs.shape[0]
+        device = logprobs.device
+
+        # Find max number of tokens across all requests
+        max_num_tokens = max(len(tids) for tids in logprob_token_ids.values())
+        pin = self.pin_memory
+
+        # Build the padded token_ids and valid_mask matrices on pinned CPU,
+        # then upload non-blocking.
+        token_ids_cpu = torch.zeros(
+            batch_size, max_num_tokens + 1, dtype=torch.int64, pin_memory=pin
+        )
+        # Create mask for valid positions (True = valid, False = padded)
+        valid_mask_cpu = torch.zeros(
+            batch_size, max_num_tokens + 1, dtype=torch.bool, pin_memory=pin
+        )
+        valid_mask_cpu[:, 0] = True  # Sampled token is always valid
+        for req_idx, token_ids in logprob_token_ids.items():
+            num_tokens = len(token_ids)
+            token_ids_cpu[req_idx, 1 : num_tokens + 1] = torch.as_tensor(
+                token_ids, dtype=torch.int64
+            )
+            valid_mask_cpu[req_idx, 1 : num_tokens + 1] = True
+
+        token_ids_tensor = token_ids_cpu.to(device, non_blocking=True)
+        valid_mask = valid_mask_cpu.to(device, non_blocking=True)
+        # Sampled token in column 0 — fill on-device from the sampled GPU
+        # tensor so we don't need to D2H + re-upload.
+        token_ids_tensor[:, 0] = sampled
+
+        # Gather logprobs at the requested token ids.
+        gathered_logprobs = logprobs.gather(-1, token_ids_tensor)
+
+        # Mask invalid (padded) positions with -inf
+        gathered_logprobs = gathered_logprobs.masked_fill(~valid_mask, float("-inf"))
+
+        # Compute ranks for the sampled token. log_softmax is monotonic w.r.t.
+        # the original logits, so ranks computed from logprobs are equivalent.
+        sampled_logprobs = logprobs.gather(-1, sampled.unsqueeze(-1))
+        # Avoid 0/1 specialization recompile on the batch dimension of the
+        # compiled batched_count_greater_than. See gather_logprobs for context.
+        torch._dynamo.decorators.mark_unbacked(logprobs, 0)
+        torch._dynamo.decorators.mark_unbacked(sampled_logprobs, 0)
+        token_ranks = batched_count_greater_than(logprobs, sampled_logprobs)
+
+        return LogprobsTensors(
+            logprob_token_ids=token_ids_tensor.to(torch.int32),
+            logprobs=gathered_logprobs,
+            selected_token_ranks=token_ranks,
+        )
 
     @staticmethod
     def apply_temperature(
@@ -138,6 +239,7 @@ class Sampler(nn.Module):
         self,
         logits: torch.Tensor,
         sampling_metadata: SamplingMetadata,
+        logprobs_mode_override: LogprobsMode | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Sample logits based on sampling metadata.
 
@@ -145,6 +247,7 @@ class Sampler(nn.Module):
         may update the logits tensor in-place.
         """
 
+        logprobs_mode = logprobs_mode_override or self.logprobs_mode
         assert not (sampling_metadata.all_greedy and sampling_metadata.all_random)
         if sampling_metadata.all_random:
             greedy_sampled = None
@@ -152,10 +255,13 @@ class Sampler(nn.Module):
             greedy_sampled = self.greedy_sample(logits)
             if sampling_metadata.all_greedy:
                 processed_logprobs = None
-                if sampling_metadata.max_num_logprobs is not None:
-                    if self.logprobs_mode == "processed_logits":
+                if (
+                    sampling_metadata.max_num_logprobs is not None
+                    or sampling_metadata.logprob_token_ids
+                ):
+                    if logprobs_mode == "processed_logits":
                         processed_logprobs = logits
-                    elif self.logprobs_mode == "processed_logprobs":
+                    elif logprobs_mode == "processed_logprobs":
                         processed_logprobs = self.compute_logprobs(logits)
                 return greedy_sampled, processed_logprobs
 
@@ -205,7 +311,7 @@ class Sampler(nn.Module):
 
         Args:
           logprobs: (num tokens) x (vocab) tensor
-          num_logprobs: minimum number of logprobs to
+          num_logprobs: maximum number of logprobs to
                         retain per token
           token_ids: prompt tokens (if prompt logprobs)
                      or sampled tokens (if sampled
@@ -227,6 +333,12 @@ class Sampler(nn.Module):
         token_logprobs = logprobs.gather(-1, token_ids)
 
         # Compute the ranks of the actual token.
+        # Avoid 0/1 specialization recompile on the batch dimension
+        # of the compiled batched_count_greater_than. mark_unbacked makes
+        # the size fully symbolic so dynamo doesn't specialize when
+        # batch_size transitions from 1 to >=2.
+        torch._dynamo.decorators.mark_unbacked(logprobs, 0)
+        torch._dynamo.decorators.mark_unbacked(token_logprobs, 0)
         token_ranks = batched_count_greater_than(logprobs, token_logprobs)
 
         # Concatenate together with the topk.
@@ -261,9 +373,13 @@ class Sampler(nn.Module):
         any_penalties_or_bad_words = (
             bool(bad_words_token_ids) or not sampling_metadata.no_penalties
         )
+        holder = sampling_metadata.thinking_budget_state_holder
+        needs_thinking_combine = holder is not None and holder.has_tracked_requests()
 
         output_token_ids = sampling_metadata.output_token_ids
-        if predict_bonus_token and any_penalties_or_bad_words:
+        if predict_bonus_token and (
+            any_penalties_or_bad_words or needs_thinking_combine
+        ):
             # Combine base outputs with spec tokens when speculative decoding
             # is enabled.
             output_token_ids = self._combine_outputs_with_spec_tokens(
@@ -285,6 +401,17 @@ class Sampler(nn.Module):
 
         # Apply penalties (e.g., freq_penalties).
         logits = self.apply_penalties(logits, sampling_metadata, output_token_ids)
+        if holder is not None and holder.has_tracked_requests():
+            holder.update_state(
+                output_token_ids,
+                sampling_metadata.spec_token_ids,
+                repeat_indices=None,
+            )
+            logits = holder.apply_to_logits(
+                logits,
+                predict_bonus_token,
+                sampling_metadata.spec_token_ids,
+            )
         return logits
 
     @staticmethod

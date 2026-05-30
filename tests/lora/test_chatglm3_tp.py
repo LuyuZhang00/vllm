@@ -1,8 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import pytest
+
 import vllm
+import vllm.config
 from vllm.lora.request import LoRARequest
+from vllm.platforms import current_platform
 
 from ..utils import create_new_process_for_each_test, multi_gpu_test
 
@@ -49,16 +53,19 @@ def do_sample(llm: vllm.LLM, lora_path: str, lora_id: int) -> list[str]:
     return generated_texts
 
 
+@pytest.mark.skipif(
+    current_platform.is_cuda_alike(), reason="Skipping to avoid redundant model tests"
+)
 @create_new_process_for_each_test()
 def test_chatglm3_lora(chatglm3_lora_files):
     llm = vllm.LLM(
         MODEL_PATH,
-        max_model_len=1024,
+        max_model_len=512,
         enable_lora=True,
-        max_loras=4,
+        max_loras=2,
+        max_num_seqs=16,
         max_lora_rank=64,
         trust_remote_code=True,
-        enable_chunked_prefill=True,
     )
 
     output1 = do_sample(llm, chatglm3_lora_files, lora_id=1)
@@ -69,19 +76,24 @@ def test_chatglm3_lora(chatglm3_lora_files):
         assert output2[i] == EXPECTED_LORA_OUTPUT[i]
 
 
+@pytest.mark.skipif(
+    current_platform.is_cuda_alike(), reason="Skipping to avoid redundant model tests"
+)
 @multi_gpu_test(num_gpus=4)
-@create_new_process_for_each_test()
 def test_chatglm3_lora_tp4(chatglm3_lora_files):
     llm = vllm.LLM(
         MODEL_PATH,
-        max_model_len=1024,
+        max_model_len=512,
         enable_lora=True,
-        max_loras=4,
+        max_loras=2,
         max_lora_rank=64,
+        max_num_seqs=16,
         tensor_parallel_size=4,
         trust_remote_code=True,
         fully_sharded_loras=False,
-        enable_chunked_prefill=True,
+        compilation_config=vllm.config.CompilationConfig(  # Avoid OOM
+            cudagraph_specialize_lora=False,
+        ),
     )
 
     output1 = do_sample(llm, chatglm3_lora_files, lora_id=1)
@@ -93,22 +105,23 @@ def test_chatglm3_lora_tp4(chatglm3_lora_files):
 
 
 @multi_gpu_test(num_gpus=4)
-@create_new_process_for_each_test()
 def test_chatglm3_lora_tp4_fully_sharded_loras(chatglm3_lora_files):
     # https://github.com/NVIDIA/nccl/issues/1790, set a lower value for
     # gpu_memory_utilization here because NCCL >= 2.26.3 seems to use
     # more GPU memory causing vLLM to OOM
     llm = vllm.LLM(
         MODEL_PATH,
-        max_model_len=1024,
+        max_model_len=512,
         enable_lora=True,
-        max_loras=4,
+        max_loras=2,
         max_lora_rank=64,
         tensor_parallel_size=4,
         trust_remote_code=True,
         fully_sharded_loras=True,
-        enable_chunked_prefill=True,
-        gpu_memory_utilization=0.85,
+        gpu_memory_utilization=0.8,
+        compilation_config=vllm.config.CompilationConfig(  # Avoid OOM
+            cudagraph_specialize_lora=False,
+        ),
     )
     output1 = do_sample(llm, chatglm3_lora_files, lora_id=1)
     for i in range(len(EXPECTED_LORA_OUTPUT)):

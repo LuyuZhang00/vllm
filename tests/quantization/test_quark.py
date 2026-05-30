@@ -8,7 +8,6 @@ See also `tests/kernels/moe/test_ocp_mx_moe.py`.
 """
 
 import importlib.metadata
-import os
 from dataclasses import dataclass
 from importlib.util import find_spec
 
@@ -23,13 +22,21 @@ from vllm.model_executor.layers.quantization.quark.quark import (  # noqa: E501
     QuarkW8A8Fp8,
     QuarkW8A8Int8,
 )
+from vllm.model_executor.layers.quantization.quark.quark_moe import (  # noqa: E501
+    QuarkW8A8Int8MoEMethod,
+)
 from vllm.platforms import current_platform
 
 from .reference_mxfp4 import dq_mxfp4_torch, qdq_mxfp4_torch
 
+# Minimum amd-quark version for MXFP4/OCP_MX tests (single source of truth).
+QUARK_MXFP4_MIN_VERSION = "0.8.99"
+
 QUARK_MXFP4_AVAILABLE = find_spec("quark") is not None and version.parse(
     importlib.metadata.version("amd-quark")
-) >= version.parse("0.8.99")
+) >= version.parse(QUARK_MXFP4_MIN_VERSION)
+
+DEVICE_TYPE = current_platform.device_type
 
 if QUARK_MXFP4_AVAILABLE:
     from quark.torch.export.nn.modules.realquantizer import StaticScaledRealQuantizer
@@ -56,7 +63,10 @@ def enable_pickle(monkeypatch):
 def test_quark_fp8_w_per_tensor_a_per_tensor(vllm_runner, kv_cache_dtype, tp):
     model_path = "amd/Llama-3.1-8B-Instruct-FP8-KV-Quark-test"
     with vllm_runner(
-        model_path, kv_cache_dtype=kv_cache_dtype, tensor_parallel_size=tp
+        model_path,
+        enforce_eager=True,
+        kv_cache_dtype=kv_cache_dtype,
+        tensor_parallel_size=tp,
     ) as llm:
 
         def check_model(model):
@@ -74,14 +84,14 @@ def test_quark_fp8_w_per_tensor_a_per_tensor(vllm_runner, kv_cache_dtype, tp):
 
         llm.apply_model(check_model)
 
-        output = llm.generate_greedy("Hello my name is", max_tokens=20)
+        output = llm.generate_greedy("Hello my name is", max_tokens=4)
         assert output
 
 
 @pytest.mark.parametrize("tp", [1])
 def test_quark_fp8_w_per_channel_a_per_token(vllm_runner, tp):
     model_path = "amd/Qwen2.5-1.5B-Instruct-ptpc-Quark-ts"
-    with vllm_runner(model_path, tensor_parallel_size=tp) as llm:
+    with vllm_runner(model_path, enforce_eager=True, tensor_parallel_size=tp) as llm:
 
         def check_model(model):
             layer = model.model.layers[0]
@@ -98,14 +108,14 @@ def test_quark_fp8_w_per_channel_a_per_token(vllm_runner, tp):
 
         llm.apply_model(check_model)
 
-        output = llm.generate_greedy("Hello my name is", max_tokens=20)
+        output = llm.generate_greedy("Hello my name is", max_tokens=4)
         assert output
 
 
 @pytest.mark.parametrize("tp", [1])
 def test_quark_int8_w_per_tensor_a_per_tensor(vllm_runner, tp):
     model_path = "amd/Llama-3.1-8B-Instruct-w-int8-a-int8-sym-test"
-    with vllm_runner(model_path, tensor_parallel_size=tp) as llm:
+    with vllm_runner(model_path, enforce_eager=True, tensor_parallel_size=tp) as llm:
 
         def check_model(model):
             layer = model.model.layers[0]
@@ -117,7 +127,35 @@ def test_quark_int8_w_per_tensor_a_per_tensor(vllm_runner, tp):
 
         llm.apply_model(check_model)
 
-        output = llm.generate_greedy("Hello my name is", max_tokens=20)
+        output = llm.generate_greedy("Hello my name is", max_tokens=4)
+        assert output
+
+
+@pytest.mark.parametrize("tp", [1])
+def test_quark_int8_w8a8_moe(vllm_runner, tp):
+    """Test W8A8 INT8 MoE quantization with a tiny Qwen3 MoE model."""
+    model_path = "nameistoken/tiny-qwen3-moe-w8a8-int8-quark"
+    with vllm_runner(
+        model_path,
+        enforce_eager=True,
+        tensor_parallel_size=tp,
+        gpu_memory_utilization=0.1,
+    ) as llm:
+
+        def check_model(model):
+            layer = model.model.layers[0]
+            # MoE experts should use QuarkW8A8Int8MoEMethod
+            moe = layer.mlp.experts
+            assert isinstance(moe.quant_method, QuarkW8A8Int8MoEMethod), (
+                f"Expected QuarkW8A8Int8MoEMethod, got {type(moe.quant_method)}"
+            )
+            # Non-MoE linear layers should use QuarkW8A8Int8
+            qkv_proj = layer.self_attn.qkv_proj
+            assert isinstance(qkv_proj.scheme, QuarkW8A8Int8)
+
+        llm.apply_model(check_model)
+
+        output = llm.generate_greedy("Hello", max_tokens=4)
         assert output
 
 
@@ -198,23 +236,30 @@ WIKITEXT_ACCURACY_CONFIGS = [
 ]
 
 
-@pytest.mark.skipif(not QUARK_MXFP4_AVAILABLE, reason="amd-quark>=0.9 is not available")
-@pytest.mark.parametrize("config", WIKITEXT_ACCURACY_CONFIGS)
-@pytest.mark.parametrize("tp_size", [1, 2])
+@pytest.mark.skipif(
+    not QUARK_MXFP4_AVAILABLE,
+    reason=f"amd-quark>={QUARK_MXFP4_MIN_VERSION} is not available",
+)
+@pytest.mark.parametrize(
+    "config",
+    [pytest.param(val, id=f"config:{val}") for val in WIKITEXT_ACCURACY_CONFIGS],
+)
+@pytest.mark.parametrize(
+    "tp_size", [pytest.param(val, id=f"tp_size:{val}") for val in [1, 2]]
+)
 def test_ocp_mx_wikitext_correctness(config: AccuracyTestConfig, tp_size: int):
-    if torch.cuda.device_count() < tp_size:
-        pytest.skip(
-            f"This test requires >={tp_size} gpus, got only {torch.cuda.device_count()}"
-        )
+    device_count = torch.accelerator.device_count()
+    if device_count < tp_size:
+        pytest.skip(f"This test requires >={tp_size} gpus, got only {device_count}")
 
     task = "wikitext"
     rtol = 0.1
 
-    # Smaller cuda_graph_sizes to speed up the test.
+    # Smaller cudagraph_capture_sizes to speed up the test.
     results = lm_eval.simple_evaluate(
         model="vllm",
         model_args=config.get_model_args(
-            tp_size=tp_size, kwargs={"cuda_graph_sizes": [16]}
+            tp_size=tp_size, kwargs={"cudagraph_capture_sizes": [16]}
         ),
         tasks=task,
         batch_size=64,
@@ -228,22 +273,69 @@ def test_ocp_mx_wikitext_correctness(config: AccuracyTestConfig, tp_size: int):
     ), f"Expected: {EXPECTED_VALUE} |  Measured: {measured_value}"
 
 
+@pytest.mark.skipif(
+    not QUARK_MXFP4_AVAILABLE,
+    reason=f"amd-quark>={QUARK_MXFP4_MIN_VERSION} is not available",
+)
+@pytest.mark.parametrize("tp_size", [1, 2])
+def test_nvfp4_wikitext_correctness(tp_size: int):
+    device_count = torch.accelerator.device_count()
+    if device_count < tp_size:
+        pytest.skip(f"This test requires >={tp_size} gpus, got only {device_count}")
+
+    # NOTE: expected_value from nvidia/Qwen3-30B-A3B-NVFP4
+    expected_value = 11.2391
+
+    model_name = "amd-quark/Qwen3-30B-A3B-nvfp4-quark"
+    task = "wikitext"
+
+    rtol = 0.25
+
+    config = AccuracyTestConfig(
+        model_name=model_name,
+        excepted_value=expected_value,
+    )
+
+    model_args = config.get_model_args(
+        tp_size=tp_size,
+        kwargs={
+            "cudagraph_capture_sizes": [16],
+        },
+    )
+    model_args.pop("add_bos_token")
+
+    # Smaller cudagraph_capture_sizes to speed up the test.
+    results = lm_eval.simple_evaluate(
+        model="vllm",
+        model_args=model_args,
+        tasks=task,
+        batch_size=64,
+    )
+
+    EXPECTED_VALUE = config.excepted_value
+    measured_value = results["results"][task]["word_perplexity,none"]
+    assert (
+        measured_value < EXPECTED_VALUE + rtol
+        and measured_value > EXPECTED_VALUE - rtol
+    ), f"Expected: {EXPECTED_VALUE} |  Measured: {measured_value}"
+
+
 @pytest.mark.parametrize("config", GSM8K_ACCURACY_CONFIGS)
-@pytest.mark.skipif(not QUARK_MXFP4_AVAILABLE, reason="amd-quark>=0.9 is not available")
+@pytest.mark.skipif(
+    not QUARK_MXFP4_AVAILABLE,
+    reason=f"amd-quark>={QUARK_MXFP4_MIN_VERSION} is not available",
+)
 @pytest.mark.skipif(
     not HF_HUB_AMD_ORG_ACCESS,
     reason="Read access to huggingface.co/amd is required for this test.",
 )
 def test_mxfp4_gsm8k_correctness(config: AccuracyTestConfig):
-    if torch.cuda.device_count() < 8:
-        pytest.skip(
-            f"This test requires >=8 gpus, got only {torch.cuda.device_count()}"
-        )
+    device_count = torch.accelerator.device_count()
+    if device_count < 8:
+        pytest.skip(f"This test requires >=8 gpus, got only {device_count}")
 
     task = "gsm8k"
     rtol = 0.03
-
-    os.environ["VLLM_USE_TRITON_FLASH_ATTN"] = "0"
 
     results = lm_eval.simple_evaluate(
         model="vllm",
@@ -260,17 +352,18 @@ def test_mxfp4_gsm8k_correctness(config: AccuracyTestConfig):
         and measured_value + rtol > EXPECTED_VALUE
     ), f"Expected: {EXPECTED_VALUE} |  Measured: {measured_value}"
 
-    del os.environ["VLLM_USE_TRITON_FLASH_ATTN"]
 
-
-@pytest.mark.skipif(not QUARK_MXFP4_AVAILABLE, reason="amd-quark>=0.9 is not available")
+@pytest.mark.skipif(
+    not QUARK_MXFP4_AVAILABLE,
+    reason=f"amd-quark>={QUARK_MXFP4_MIN_VERSION} is not available",
+)
 @pytest.mark.parametrize("float_dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("scalings", [[2.3, 0.03, 7.3, 0.1, 0.004, 17.3, 1e4, 1e-4]])
 def test_mxfp4_fused_qdq_match_quark(float_dtype: torch.dtype, scalings: list[int]):
     torch.manual_seed(0)
 
     hidden_size = 64 * 32
-    inp = (torch.rand(1, hidden_size, dtype=float_dtype, device="cuda") - 0.5) * 2
+    inp = (torch.rand(1, hidden_size, dtype=float_dtype, device=DEVICE_TYPE) - 0.5) * 2
     for i in range(hidden_size // 32):
         inp[:, i * 32 : (i + 1) * 32] = (
             inp[:, i * 32 : (i + 1) * 32] * scalings[i % len(scalings)]
@@ -291,7 +384,10 @@ def test_mxfp4_fused_qdq_match_quark(float_dtype: torch.dtype, scalings: list[in
         )
 
 
-@pytest.mark.skipif(not QUARK_MXFP4_AVAILABLE, reason="amd-quark>=0.9 is not available")
+@pytest.mark.skipif(
+    not QUARK_MXFP4_AVAILABLE,
+    reason=f"amd-quark>={QUARK_MXFP4_MIN_VERSION} is not available",
+)
 @pytest.mark.parametrize("float_dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("scalings", [[2.3, 0.03, 7.3, 0.1, 0.004, 17.3, 1e4, 1e-4]])
 def test_mxfp4_dequant_kernel_match_quark(
@@ -311,15 +407,15 @@ def test_mxfp4_dequant_kernel_match_quark(
         reorder=False,
         real_quantized=True,
         float_dtype=float_dtype,
-        device="cuda",
+        device=DEVICE_TYPE,
     )
 
-    observer = qspec.observer_cls(qspec, device="cuda")
+    observer = qspec.observer_cls(qspec, device=DEVICE_TYPE)
 
     hidden_size = 512
     shape = (11008, hidden_size)
 
-    w = (torch.rand(shape, device="cuda", dtype=float_dtype) - 0.5) * 2
+    w = (torch.rand(shape, device=DEVICE_TYPE, dtype=float_dtype) - 0.5) * 2
 
     # Make it so that different groups have different scales.
     for i in range(hidden_size // 32):
@@ -331,7 +427,7 @@ def test_mxfp4_dequant_kernel_match_quark(
     scale, _ = observer._calculate_qparams()
     weight_quantizer.scale = scale
 
-    w_mxfp4 = weight_quantizer.to_real_quantize_params(w).to("cuda")
+    w_mxfp4 = weight_quantizer.to_real_quantize_params(w).to(DEVICE_TYPE)
     weight_quantizer.maybe_convert_and_transpose_scale()
 
     scale = weight_quantizer.scale
