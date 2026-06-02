@@ -319,9 +319,42 @@ class KVCacheManager:
 
         Returns:
             A list of new allocated blocks.
+            
+        为请求分配新令牌的 KV 缓存槽位。
+        
+        该方法负责为请求分配 KV 缓存块，支持前缀缓存、外部缓存（通过连接器）、推测解码前瞻令牌等场景。
+        
+        参数说明：
+            request: 要分配槽位的请求对象
+            num_new_tokens: 要分配和计算的新令牌数量
+            num_new_computed_tokens: 新命中前缀缓存的计算令牌数（不包括外部令牌）
+            new_computed_blocks: 上述新计算令牌的缓存块，按 KV 缓存组分组
+            num_lookahead_tokens: 要分配的推测令牌数量（用于 Eagle 等推测解码提议器）
+            num_external_computed_tokens: KV 缓存不由 vLLM 缓存但由连接器缓存的令牌数
+            delay_cache_blocks: 是否跳过缓存块（用于 P/D 的 KV 传输场景）
+            num_encoder_tokens: 编码器-解码器模型中用于交叉注意力的编码器令牌数
+            full_sequence_must_fit: 是否要求完整序列必须能放入缓存（用于准入控制）
+        
+        块布局说明：
+        - comp: 已计算的令牌（request.num_computed_tokens）
+        - new_comp: 新计算的令牌（命中前缀缓存）
+        - ext_comp: 外部计算的令牌（连接器缓存）
+        - new: 新令牌（包括未验证的草稿令牌）
+        - lookahead: 前瞻令牌（推测解码）
+        
+        分配流程分为三个阶段：
+        1. 释放 `comp` 中不必要的块并检查是否有足够空闲块
+        2. 处理前缀令牌（`comp + new_comp + ext_comp`）：
+           - 释放不必要的块（如滑动窗口外的块）
+           - 为滑动窗口内的 `ext_comp` 令牌分配新块
+        3. 为待计算的令牌（`new + lookahead`）分配新块
+        
+        返回值：
+            新分配的块列表，如果无法分配则返回 None
         """
         # When loading KV data asynchronously, we may have zero new tokens to
         # compute while still allocating slots for externally computed tokens.
+        # 异步加载 KV 数据时，可能没有新令牌需要计算，但仍需为外部计算的令牌分配槽位
         if num_new_tokens == 0 and num_external_computed_tokens == 0:
             raise ValueError(
                 "num_new_tokens must be greater than 0 when there are no "
@@ -332,9 +365,11 @@ class KVCacheManager:
             new_computed_block_list = new_computed_blocks.blocks
         else:
             new_computed_block_list = self.empty_kv_cache_blocks.blocks
+        # 获取新计算块列表，若无则使用空块列表
 
         # The number of computed tokens is the number of computed tokens plus
         # the new prefix caching hits
+        # 计算令牌数 = 已计算令牌数 + 新前缀缓存命中数
         num_local_computed_tokens = (
             request.num_computed_tokens + num_new_computed_tokens
         )
@@ -342,9 +377,11 @@ class KVCacheManager:
             num_local_computed_tokens + num_external_computed_tokens,
             self.max_model_len,
         )
+        # 总计算令牌数 = 本地计算令牌数 + 外部计算令牌数（不超过模型最大长度）
 
         if full_sequence_must_fit:
             # First check and fail if the full request sequence won't fit.
+            # 首先检查完整请求序列是否能放入缓存，如果不能则直接返回
             full_num_tokens = min(request.num_tokens, self.max_model_len)
 
             num_blocks_to_allocate = self.coordinator.get_num_blocks_to_allocate(
@@ -358,11 +395,14 @@ class KVCacheManager:
             )
             if num_blocks_to_allocate > self.block_pool.get_num_free_blocks():
                 return None
+            # 如果需要的块数超过空闲块数，返回 None（准入控制）
 
         num_tokens_main_model = total_computed_tokens + num_new_tokens
         num_tokens_need_slot = min(
             num_tokens_main_model + num_lookahead_tokens, self.max_model_len
         )
+        # 主模型需要的令牌数 = 总计算令牌数 + 新令牌数
+        # 需要槽位的令牌数 = 主模型令牌数 + 前瞻令牌数（不超过模型最大长度）
 
         # Free the blocks that are skipped during the attention computation
         # (e.g., tokens outside the sliding window).
@@ -370,6 +410,9 @@ class KVCacheManager:
         # insufficient free blocks.
         # Should call this function before allocating new blocks to reduce
         # the number of evicted blocks.
+        # 释放注意力计算中跳过的块（如滑动窗口外的令牌）
+        # 即使由于空闲块不足无法调度该请求，也可以执行此操作
+        # 应在分配新块之前调用此函数以减少被驱逐的块数
         self.coordinator.remove_skipped_blocks(
             request.request_id, total_computed_tokens
         )
@@ -383,9 +426,11 @@ class KVCacheManager:
             + num_external_computed_tokens,
             num_tokens_main_model=num_tokens_main_model,
         )
+        # 计算需要分配的块数
 
         if num_blocks_to_allocate > self.block_pool.get_num_free_blocks():
             # Cannot allocate new blocks
+            # 无法分配新块，返回 None
             return None
 
         if (
@@ -394,6 +439,7 @@ class KVCacheManager:
         ):
             # Append the new computed blocks to the request blocks until now to
             # avoid the case where the new blocks cannot be allocated.
+            # 将新计算块追加到请求块中，以避免新块无法分配的情况
             self.coordinator.allocate_new_computed_blocks(
                 request_id=request.request_id,
                 new_computed_blocks=new_computed_block_list,
@@ -407,9 +453,11 @@ class KVCacheManager:
             num_tokens_main_model,
             num_encoder_tokens,
         )
+        # 分配新块
 
         # P/D: delay caching blocks if we have to recv from
         # remote. Update state for locally cached blocks.
+        # P/D：如果需要从远程接收，延迟缓存块。更新本地缓存块的状态
         if not self.enable_caching or delay_cache_blocks:
             return self.create_kv_cache_blocks(new_blocks)
 
@@ -418,11 +466,15 @@ class KVCacheManager:
         # "non-committable" tokens (e.g., draft tokens that could be rejected).
         # Therefore, we cap the number at `request.num_tokens`, ensuring only
         # "finalized" tokens are cached.
+        # 注意(woosuk)：我们希望提交（缓存）最多 num_local_computed_tokens + num_external_computed_tokens + num_new_tokens，
+        # 但必须排除"不可提交"的令牌（如可能被拒绝的草稿令牌）。
+        # 因此，我们将数量限制在 `request.num_tokens`，确保只有"最终"令牌被缓存。
         num_tokens_to_cache = min(
             total_computed_tokens + num_new_tokens,
             request.num_tokens,
         )
         self.coordinator.cache_blocks(request, num_tokens_to_cache)
+        # 缓存块
 
         return self.create_kv_cache_blocks(new_blocks)
 

@@ -114,12 +114,20 @@ def init_none_hash(hash_fn: Callable[[Any], bytes]):
 
 @dataclass(slots=True)
 class KVCacheBlock:
-    """KV-cache block metadata."""
+    """KV-cache block metadata.
+    
+    KV 缓存块元数据类，用于管理单个 KV 缓存块的状态和属性。
+    
+    每个 KV 缓存块代表 GPU 内存中的一个固定大小的内存块，用于存储键值对缓存。
+    该类维护了块的引用计数、哈希值以及双向链表指针，支持高效的内存管理和前缀缓存。
+    """
 
     # Block ID, ranging from 0 to num_gpu_blocks - 1.
     block_id: int
+    
     # Reference count.
     ref_cnt: int = 0
+    
     # The hash key (block hash + group id) of the block, only available
     # when the block is full and cached.
     _block_hash: BlockHashWithGroupId | None = None
@@ -134,20 +142,51 @@ class KVCacheBlock:
 
     @property
     def block_hash(self) -> BlockHashWithGroupId | None:
+        """Get the block hash.
+        
+        获取块的哈希值。
+        
+        Returns:
+            BlockHashWithGroupId | None: 块的哈希值（包含组ID），如果块未缓存则返回 None
+        """
         return self._block_hash
 
     @block_hash.setter
     def block_hash(self, block_hash: BlockHashWithGroupId):
+        """Set the block hash.
+        
+        设置块的哈希值。
+        
+        注意：每个块只能设置一次哈希值，重复设置会触发断言错误。
+        
+        Args:
+            block_hash: 要设置的块哈希值（包含组ID）
+        
+        Raises:
+            AssertionError: 如果块已经有哈希值
+        """
         assert self.block_hash is None, (
             "The block already has a hash. This should not happen."
         )
         self._block_hash = block_hash
 
     def reset_hash(self):
-        """Reset the block hash when the block is evicted."""
+        """Reset the block hash when the block is evicted.
+        
+        重置块的哈希值，用于块被驱逐时。
+        
+        当块从缓存中移除时，需要调用此方法清除哈希值，以便该块可以被重新分配。
+        """
         self._block_hash = None
 
     def __repr__(self) -> str:
+        """Return the string representation of the block.
+        
+        返回块的字符串表示，用于调试和日志记录。
+        
+        Returns:
+            str: 包含块ID、引用计数、哈希值和链表指针的字符串表示
+        """
         # Use block_id instead of KVCacheBlock object to avoid calling __repr__
         # on KVCacheBlock object recursively.
         prev_block_id = self.prev_free_block.block_id if self.prev_free_block else None
@@ -181,9 +220,32 @@ class FreeKVCacheBlockQueue:
 
     Args:
         blocks: A list of KVCacheBlock objects.
+    
+    空闲 KV 缓存块队列类，用于管理空闲的 KV 缓存块。
+    
+    该类实现了一个双向链表来组织空闲的 KVCacheBlock 对象，支持高效的块分配和释放操作。
+    与 Python 内置的 deque 不同，该类支持在队列中间 O(1) 时间复杂度移除任意块。
+    
+    为了接近 C++ 实现的 deque 的性能，该类在操作链表时不分配任何 Python 对象，
+    而是直接操作 KVCacheBlock 对象的 prev_free_block 和 next_free_block 属性。
+    
+    队列的排序规则：
+    1. 初始时按块 ID 排序
+    2. 当块被分配后又释放时，按照 LRU（最近最少使用）顺序追加：
+       - 最近最少使用的块在队列前端
+       - 如果两个块有相同的最后访问时间，哈希令牌更多的块（块链的尾部）排在前面
+    
+    注意：LRU 顺序是通过在释放请求的块时反转块顺序来维护的，此操作在该类外部执行。
     """
 
     def __init__(self, blocks: list[KVCacheBlock]) -> None:
+        """Initialize the free block queue.
+        
+        初始化空闲 KV 缓存块队列。
+        
+        Args:
+            blocks: KVCacheBlock 对象列表
+        """
         self.num_free_blocks = len(blocks)
 
         # Initialize doubly links of consecutive blocks
@@ -215,9 +277,15 @@ class FreeKVCacheBlockQueue:
 
     def popleft(self) -> KVCacheBlock:
         """Pop the first free block and reduce num_free_blocks by 1.
-
+        
+        弹出队列中第一个空闲块，并将空闲块数量减 1。
+        
         Returns:
-            The first free block.
+            KVCacheBlock: 弹出的第一个空闲块
+        
+        Raises:
+            ValueError: 如果没有可用的空闲块
+            RuntimeError: 如果块的链接状态无效
         """
         if (
             self.fake_free_list_head.next_free_block is self.fake_free_list_tail
@@ -252,12 +320,17 @@ class FreeKVCacheBlockQueue:
 
     def popleft_n(self, n: int) -> list[KVCacheBlock]:
         """Pop the first n free blocks and reduce num_free_blocks by n.
-
+        
+        弹出队列中前 n 个空闲块，并将空闲块数量减 n。
+        
         Args:
-            n: The number of blocks to pop.
-
+            n: 要弹出的块数量
+        
         Returns:
-            A list of n free blocks.
+            list[KVCacheBlock]: 弹出的 n 个空闲块列表
+        
+        Raises:
+            AssertionError: 如果 n 大于空闲块数量
         """
         if n == 0:
             return []
@@ -285,9 +358,14 @@ class FreeKVCacheBlockQueue:
 
     def remove(self, block: KVCacheBlock) -> None:
         """Remove a block in the free list and reduce num_free_blocks by 1.
-
+        
+        从空闲队列中移除指定的块，并将空闲块数量减 1。
+        
         Args:
-            block: The block to remove.
+            block: 要移除的块
+        
+        Raises:
+            RuntimeError: 如果块不在空闲队列中（链接状态无效）
         """
         if block.prev_free_block is None or block.next_free_block is None:
             # This should not happen if the block is from the free list.
@@ -304,11 +382,15 @@ class FreeKVCacheBlockQueue:
         self.num_free_blocks -= 1
 
     def append(self, block: KVCacheBlock) -> None:
-        """Put a block back into the free list and increase
-        num_free_blocks by 1.
-
+        """Put a block back into the free list and increase num_free_blocks by 1.
+        
+        将一个块添加回空闲队列，并将空闲块数量加 1。
+        
         Args:
-            block: The block to append.
+            block: 要添加的块
+        
+        Raises:
+            RuntimeError: 如果队列的尾指针状态无效
         """
         if self.fake_free_list_tail.prev_free_block is None:
             raise RuntimeError(
@@ -327,10 +409,15 @@ class FreeKVCacheBlockQueue:
         self.num_free_blocks += 1
 
     def append_n(self, blocks: list[KVCacheBlock]) -> None:
-        """Put a list of blocks back into the free list
-
+        """Put a list of blocks back into the free list.
+        
+        将一组块添加回空闲队列。
+        
         Args:
-            blocks: The blocks to append.
+            blocks: 要添加的块列表
+        
+        Raises:
+            AssertionError: 如果队列的尾指针状态无效
         """
         if len(blocks) == 0:
             return
@@ -353,9 +440,14 @@ class FreeKVCacheBlockQueue:
 
     def get_all_free_blocks(self) -> list[KVCacheBlock]:
         """Get all free blocks in the free list. Mainly used for testing.
-
+        
+        获取空闲队列中的所有块，主要用于测试。
+        
         Returns:
-            A list of free blocks.
+            list[KVCacheBlock]: 所有空闲块的列表
+        
+        Raises:
+            RuntimeError: 如果队列的头指针状态无效
         """
         ret = []
         if self.fake_free_list_head.next_free_block is None:

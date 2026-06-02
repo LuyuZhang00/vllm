@@ -233,61 +233,78 @@ class EngineCore:
 
     @instrument(span_name="Prepare model")
     def _initialize_kv_caches(self, vllm_config: VllmConfig) -> KVCacheConfig:
+        """
+        初始化 KV 缓存配置，包括内存分析、配置生成和缓存初始化。
+        
+        Args:
+            vllm_config: vLLM 整体配置对象
+            
+        Returns:
+            KVCacheConfig: 调度器使用的 KV 缓存配置
+        """
+        # 记录初始化开始时间
         start = time.time()
 
-        # Get all kv cache needed by the model
+        # 获取模型所需的所有 KV 缓存规格
         kv_cache_specs = self.model_executor.get_kv_cache_specs()
 
+        # 检查是否需要 KV 缓存
         has_kv_cache = any(kv_cache_spec for kv_cache_spec in kv_cache_specs)
         if has_kv_cache:
+            # 如果启用了弹性 EP 扩容模式
             if envs.VLLM_ELASTIC_EP_SCALE_UP_LAUNCH:
-                # NOTE(yongji): should already be set
-                # during _eep_scale_up_before_kv_init
+                # 注意：可用内存应该已经在 _eep_scale_up_before_kv_init 中设置
                 assert self.available_gpu_memory_for_kv_cache > 0
                 available_gpu_memory = [self.available_gpu_memory_for_kv_cache] * len(
                     kv_cache_specs
                 )
             else:
-                # Profiles the peak memory usage of the model to determine how
-                # much memory can be allocated for kv cache.
+                # 分析模型的峰值内存使用情况，确定可以为 KV 缓存分配多少内存
                 available_gpu_memory = self.model_executor.determine_available_memory()
                 self.available_gpu_memory_for_kv_cache = available_gpu_memory[0]
         else:
-            # Attention free models don't need memory for kv cache
+            # 无注意力机制的模型不需要 KV 缓存内存
             available_gpu_memory = [0] * len(kv_cache_specs)
 
+        # 验证 KV 缓存规格和可用内存数组长度匹配
         assert len(kv_cache_specs) == len(available_gpu_memory)
 
-        # Track max_model_len before KV cache config to detect auto-fit changes
+        # 记录 KV 缓存配置之前的 max_model_len，用于检测自动适配时的变化
         max_model_len_before = vllm_config.model_config.max_model_len
 
+        # 获取 KV 缓存配置（可能会自动调整 max_model_len 以适应可用内存）
         kv_cache_configs = get_kv_cache_configs(
             vllm_config, kv_cache_specs, available_gpu_memory
         )
 
-        # If auto-fit reduced max_model_len, sync the new value to workers.
-        # This is needed because workers were spawned before memory profiling
-        # and have the original (larger) max_model_len cached.
+        # 如果自动适配调整了 max_model_len，需要将新值同步到所有 worker
+        # 这是必要的，因为 worker 在内存分析之前就已经启动，缓存了原始的（更大的）max_model_len
         max_model_len_after = vllm_config.model_config.max_model_len
         if max_model_len_after != max_model_len_before:
             self.collective_rpc("update_max_model_len", args=(max_model_len_after,))
 
+        # 生成调度器使用的 KV 缓存配置
         scheduler_kv_cache_config = generate_scheduler_kv_cache_config(kv_cache_configs)
+        # 更新配置中的 GPU 块数量
         vllm_config.cache_config.num_gpu_blocks = scheduler_kv_cache_config.num_blocks
+        # 如果有多个 KV 缓存组，选择最小的块大小作为配置
         kv_cache_groups = scheduler_kv_cache_config.kv_cache_groups
         if kv_cache_groups:
             vllm_config.cache_config.block_size = min(
                 g.kv_cache_spec.block_size for g in kv_cache_groups
             )
 
+        # 验证块大小是否有效
         vllm_config.validate_block_size()
 
-        # Initialize kv cache and warmup the execution
+        # 初始化 KV 缓存并预热模型执行
         self.model_executor.initialize_from_config(kv_cache_configs)
 
+        # 计算初始化耗时
         elapsed = time.time() - start
         compile_time = vllm_config.compilation_config.compilation_time
         encoder_compile_time = vllm_config.compilation_config.encoder_compilation_time
+        # 根据是否有编码器编译时间记录不同详细程度的日志
         if encoder_compile_time > 0:
             logger.info_once(
                 "init engine (profile, create kv cache, warmup model) took "
