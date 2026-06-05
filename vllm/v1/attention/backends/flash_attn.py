@@ -65,6 +65,10 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 logger = init_logger(__name__)
 
 
+# FlashAttentionBackend: FlashAttention 后端的入口注册类。
+# 作用：声明该后端支持的数据类型、KV Cache 类型、计算能力等硬件约束，
+# 并提供元数据构建器（FlashAttentionMetadataBuilder）和注意力实现（FlashAttentionImpl）
+# 的工厂方法。vLLM 的注意力调度层通过此类判断是否可以使用 FlashAttention 后端。
 class FlashAttentionBackend(AttentionBackend):
     supported_dtypes: ClassVar[list[torch.dtype]] = [torch.float16, torch.bfloat16]
     supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
@@ -198,10 +202,13 @@ class FlashAttentionBackend(AttentionBackend):
             return False
         return flash_attn_supports_sinks()
 
+    # 要求 GPU 计算能力 >= 8.0（Ampere 及以上），因为 FlashAttention 依赖这些架构的硬件特性。
     @classmethod
     def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
         return capability >= DeviceCapability(8, 0)
 
+    # 组合兼容性检查：在给定 head_size、dtype、KV Cache 类型、block_size 等参数下，
+    # 判断该后端是否支持该配置组合。返回 None 表示支持，返回字符串表示不支持的原因。
     @classmethod
     def supports_combination(
         cls,
@@ -219,6 +226,11 @@ class FlashAttentionBackend(AttentionBackend):
         return None
 
 
+# FlashAttentionMetadata: FlashAttention 前向传播所需的全部元数据。
+# 由 FlashAttentionMetadataBuilder.build() 在每一步调度时构建，
+# 传递给 FlashAttentionImpl.forward() 指导注意力计算。
+# 包含三类信息：(1) 基本的序列/块表信息；(2) 级联注意力（cascade）的前缀/后缀切分信息；
+# (3) DCP（Decode Context Parallelism）的上下文分片信息。
 @dataclass
 class FlashAttentionMetadata:
     # NOTE(sang): Definition of context_len, query_len, and seq_len.
@@ -237,6 +249,9 @@ class FlashAttentionMetadata:
     block_table: torch.Tensor
     slot_mapping: torch.Tensor
 
+    # 级联注意力（cascade attention）相关字段。
+    # 当多个请求共享较长公共前缀时，将 KV 分为公共前缀和各请求后缀两部分分别计算，
+    # 再合并结果，以减少重复计算量。use_cascade 标记是否启用此优化。
     # For cascade attention.
     use_cascade: bool
     common_prefix_len: int
@@ -244,10 +259,17 @@ class FlashAttentionMetadata:
     prefix_kv_lens: torch.Tensor | None
     suffix_kv_lens: torch.Tensor | None
 
+    # DCP（Decode Context Parallelism）相关字段。
+    # DCP 将长序列的 KV 上下文按 rank 切分，每个 rank 只处理本地切片，
+    # 再通过通信合并注意力结果，用于支持超长上下文的分布式解码。
+    # max_dcp_context_kv_len 用于避免 GPU->CPU 同步，预先计算最大值。
     # For GQA DCP
     max_dcp_context_kv_len: int | None = None
     dcp_context_kv_lens: torch.Tensor | None = None
 
+    # AOT（Ahead-Of-Time）调度元数据，由 FA3 的 get_scheduler_metadata() 生成。
+    # 用于在 CUDA Graph 捕获时预计算调度信息，避免运行时开销。
+    # max_num_splits 控制 split-KV 的分片数，0 表示使用 FA3 的启发式。
     # Optional aot scheduling
     scheduler_metadata: torch.Tensor | None = None
     prefix_scheduler_metadata: torch.Tensor | None = None
@@ -307,6 +329,10 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
     ) -> AttentionCGSupport:
         return cls._cudagraph_support
 
+    # FlashAttentionMetadataBuilder 的初始化。
+    # 在引擎启动时调用一次，预分配持久化缓冲区（如 scheduler_metadata、dcp_context_kv_lens），
+    # 并读取并行配置（DCP world size/rank）、CUDA Graph 配置等。
+    # 这些缓冲区在后续每次 build() 调用中被原地复用，避免反复分配内存。
     def __init__(
         self,
         kv_cache_spec: AttentionSpec,
@@ -385,6 +411,14 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
         # populated on first build() call.
         self.aot_sliding_window: tuple[int, int] | None = None
 
+    # build(): 核心元数据构建方法，每一步调度时调用。
+    # 根据当前 batch 的序列信息，决定使用哪种注意力模式：
+    # (1) 普通模式：直接构建 scheduler_metadata 进行标准 flash_attn_varlen_func 调用。
+    # (2) 级联模式（cascade）：当 common_prefix_len > 0 时，将 KV 拆为前缀+后缀，
+    #     构建 cu_prefix_query_lens、prefix_kv_lens、suffix_kv_lens 等字段。
+    # (3) DCP 模式：当 dcp_world_size > 1 时，计算每个 rank 的本地 KV 长度切片，
+    #     构建 dcp_context_kv_lens 和 max_dcp_context_kv_len。
+    # fast_build=True 时跳过 AOT 调度（用于投机解码等迭代次数少的场景）。
     def build(
         self,
         common_prefix_len: int,
@@ -589,9 +623,23 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
         return use_cascade_attention(*args, **kwargs)
 
 
+# FlashAttentionImpl: FlashAttention 的前向计算实现。
+# 每个注意力层（Attention）实例化一个 FlashAttentionImpl，负责：
+# (1) 将 Q/K/V 与 KV Cache 传入 flash_attn_varlen_func 完成注意力计算；
+# (2) 管理 KV Cache 的写入（do_kv_cache_update）；
+# (3) 支持编码器/解码器/交叉注意力/DCP/级联等多种注意力路径。
 class FlashAttentionImpl(AttentionImpl):
     can_return_lse_for_decode: bool = True
 
+    # __init__(): 初始化注意力实现层的配置参数。
+    # 关键参数说明：
+    # - sliding_window: 滑动窗口注意力的窗口大小。(-1,-1) 表示无滑动窗口。
+    #   编码器模式下左右窗口对称；解码器模式下右侧窗口为 0（只看左侧历史）。
+    # - logits_soft_cap: Gemma 风格的 soft cap 值，限制注意力 logits 的范围。
+    #   FlashAttention 中设为 0 表示不启用 soft cap。
+    # - sinks: FlashAttention 3 特有的 sink token 机制，用于稳定注意力分布。
+    # - dcp_combine: DCP 模式下的通信原语选择。
+    #   a2a 模式使用 all-to-all，否则使用 all-gather + reduce-scatter。
     def __init__(
         self,
         num_heads: int,
@@ -664,6 +712,18 @@ class FlashAttentionImpl(AttentionImpl):
         if vllm_config is not None and self.dcp_world_size > 1:
             self._dcp_dtype = vllm_config.model_config.dtype
 
+    # forward(): 注意力前向传播的核心调度方法。
+    # 根据注意力类型和元数据中的模式标记，分发到不同计算路径：
+    # (1) 编码器路径：encoder_only/encoder 类型直接调用 _forward_encoder_attention，
+    #     不经过 KV Cache，直接在 Q/K/V 上做双向注意力。
+    # (2) 普通解码器路径：从 KV Cache 中取出 key_cache/value_cache，
+    #     调用 flash_attn_varlen_func 执行标准的分页注意力。
+    # (3) DCP 路径：当 dcp_world_size > 1 时，调用 _forward_with_dcp，
+    #     将上下文 KV 按 rank 切分计算后通过通信合并。
+    # (4) 级联路径：当 use_cascade=True 时，调用 cascade_attention()，
+    #     将公共前缀和各请求后缀分别计算后合并。
+    # 注意：此方法在 piece-wise CUDA Graph 模式下以 eager PyTorch 执行，
+    # 因此需要尽量减少 CPU 开销（避免不必要的 view/slice 操作）。
     def forward(
         self,
         layer: torch.nn.Module,
@@ -847,6 +907,11 @@ class FlashAttentionImpl(AttentionImpl):
         )
         return output
 
+    # do_kv_cache_update(): 将当前 step 产生的新 K/V 写入分页 KV Cache。
+    # 使用 reshape_and_cache_flash 算子，通过 slot_mapping 索引进行 scatter write，
+    # 将连续的 key/value 张量写入 paged cache 的对应物理槽位。
+    # 编码器注意力不需要 KV Cache，直接跳过。
+    # kv_sharing_target_layer_name 非空时也跳过（共享其他层的 KV Cache）。
     def do_kv_cache_update(
         self,
         layer: torch.nn.Module,
@@ -882,6 +947,18 @@ class FlashAttentionImpl(AttentionImpl):
             layer._v_scale,
         )
 
+    # _forward_with_dcp(): DCP（Decode Context Parallelism）模式的前向计算。
+    # DCP 将长上下文的 KV Cache 按 rank 切分，每个 rank 只存储和计算一部分 KV。
+    # 计算流程分三步：
+    # 1. all_gather 查询：将 query 在所有 DCP rank 间做 all_gather，
+    #    使每个 rank 拿到完整的 query（用于计算注意力时 Q 侧需要完整信息）。
+    # 2. 上下文注意力：用 gather 后的 query 与本地 KV 切片计算注意力，
+    #    得到 context_attn_out 和 context_lse。
+    # 3. DCP combine：通过 dcp_combine（a2a 或 ag+rs）在 rank 间通信合并
+    #    上下文注意力的输出和 LSE。
+    # 4. 本地查询注意力：用原始 query 与本地 K/V（非缓存）计算因果注意力，
+    #    捕获本地 token 间的依赖关系。
+    # 5. 最终合并：使用 merge_attn_states() 合并上下文注意力和本地查询注意力的结果。
     def _forward_with_dcp(
         self,
         query: torch.Tensor,
@@ -981,6 +1058,10 @@ class FlashAttentionImpl(AttentionImpl):
             query_lse,
         )
 
+    # _forward_encoder_attention(): 编码器注意力的前向计算。
+    # 与解码器不同，编码器注意力不使用 KV Cache，直接在 Q/K/V 张量上做双向注意力
+    # （causal=False），适用于 BERT-style 的编码器模型或 encoder-decoder 模型的编码器侧。
+    # cu_seqlens_q 和 cu_seqlens_k 相同（因为 Q 和 K 来自同一序列）。
     def _forward_encoder_attention(
         self,
         query: torch.Tensor,
@@ -1051,6 +1132,16 @@ class FlashAttentionImpl(AttentionImpl):
         return output
 
 
+# use_cascade_attention(): 启发式决策函数，判断是否值得使用级联注意力。
+# 级联注意力将注意力计算拆为"公共前缀"和"各请求后缀"两部分：
+# - 公共前缀只计算一次，所有请求共享结果，避免重复计算；
+# - 后缀部分按各请求独立计算。
+# 适用场景：多个请求共享较长的公共前缀（如 system prompt）。
+# 决策逻辑分两步：
+# (1) 快速排除：公共前缀太短（<256 tokens）、ALiBi/滑动窗口/局部注意力、
+#     请求数太少（<8）、DCP 模式下均不使用级联。
+# (2) 性能模型比较：计算级联注意力和 FlashDecoding 各自需要的 CTA 数和 wave 数，
+#     选择 GPU SM 利用率更高的方案。
 def use_cascade_attention(
     common_prefix_len: int,
     query_lens: np.ndarray,
@@ -1129,6 +1220,15 @@ def use_cascade_attention(
     return cascade_time < flash_decoding_time
 
 
+# cascade_attention(): 级联注意力的具体实现。
+# 核心思路——将 KV 分为前缀（prefix）和后缀（suffix）两部分分别计算，再合并：
+# 1. 前缀部分（prefix）：所有请求共享的公共 KV 前缀，使用 block_table[:1]（单一共享块表），
+#    以 causal=False 计算，返回 prefix_output 和 prefix_lse（log-sum-exp）。
+#    s_aux（sink tokens）在内核中被融入 prefix_lse，确保在最终合并时生效。
+# 2. 后缀部分（suffix）：各请求独立的 KV 后缀，使用 block_table[:, num_common_kv_blocks:]
+#    （跳过公共前缀的块），以 causal=True 计算，返回 suffix_output 和 suffix_lse。
+# 3. 合并：使用 merge_attn_states() 基于 LSE 做数值稳定的加权合并。
+# 这种设计的好处是公共前缀的 KV 只需加载和计算一次，显著减少带宽和算力消耗。
 def cascade_attention(
     output: torch.Tensor,
     query: torch.Tensor,

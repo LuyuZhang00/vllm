@@ -51,6 +51,15 @@ BlockHashWithGroupId = NewType("BlockHashWithGroupId", bytes)
 # after we default block hashing to use sha256 bytes.
 ExternalBlockHash: TypeAlias = bytes | int
 
+# 哈希类型系统说明:
+# - BlockHash: 单个 KV 缓存块的哈希值，用于前缀缓存（prefix caching）的匹配。
+#   使用 NewType 包装 bytes 以防止与原始字节串的误用。
+# - BlockHashWithGroupId: 将 BlockHash 与 KV 缓存组 ID 拼接在一起的复合哈希。
+#   组 ID 用于区分不同注意力类型（如 FullAttention、SlidingWindow）的缓存块，
+#   确保不同组的相同 token 序列不会被错误地复用。
+# - ExternalBlockHash: 对外暴露的哈希格式，支持 bytes 或 int，
+#   用于 KV 事件系统中可复现的块哈希分发。
+
 
 def make_block_hash_with_group_id(
     block_hash: BlockHash, group_id: int
@@ -61,20 +70,28 @@ def make_block_hash_with_group_id(
     the block hash bytes.  This representation avoids creating tuples while
     still allowing us to recover both components when needed.
     """
+    # 哈希计算流水线的第二步：将块哈希与组 ID 拼接成复合键。
+    # 组 ID 使用 4 字节大端编码追加到块哈希末尾，形成唯一的缓存键。
+    # 这样设计避免了使用 tuple 作为字典键的开销，同时支持高效的拆包操作。
     return BlockHashWithGroupId(block_hash + group_id.to_bytes(4, "big", signed=False))
 
 
 def get_block_hash(key: BlockHashWithGroupId) -> BlockHash:
     """Extract the `BlockHash` from a `BlockHashWithGroupId`."""
+    # 从复合键中提取原始块哈希：去掉末尾 4 字节的组 ID。
     return BlockHash(key[:-4])
 
 
 def get_group_id(key: BlockHashWithGroupId) -> int:
     """Extract the group id from a `BlockHashWithGroupId`."""
+    # 从复合键中提取组 ID：读取末尾 4 字节并解析为大端整数。
     return int.from_bytes(key[-4:], "big", signed=False)
 
 
 def maybe_convert_block_hash(hash_bytes: BlockHash) -> ExternalBlockHash:
+    # 将内部 BlockHash 转换为外部格式 ExternalBlockHash。
+    # 当 VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES 启用时，将 bytes 转为 64 位整数，
+    # 用于 KV 事件系统中需要整数哈希的场景（如外部缓存服务）。
     if not envs.VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES:
         return hash_bytes
     return int.from_bytes(hash_bytes, byteorder="big") & ((1 << 64) - 1)
@@ -95,6 +112,11 @@ _CBOR_HASH_FUNCTIONS = frozenset({sha256_cbor, xxhash_cbor})
 
 
 def init_none_hash(hash_fn: Callable[[Any], bytes]):
+    # 初始化哈希链的种子值 NONE_HASH。
+    # 这是链式依赖哈希的起点：每个请求的第一个块没有父块，
+    # 因此使用 NONE_HASH 作为父块哈希。
+    # 如果设置了 PYTHONHASHSEED，种子可复现（跨进程共享缓存）；
+    # 否则使用随机种子，避免不同运行间的哈希碰撞。
     global NONE_HASH
 
     hash_seed = os.getenv("PYTHONHASHSEED")
@@ -608,6 +630,10 @@ def generate_block_hash_extra_keys(
     Returns:
         A tuple of extra keys and the next multi-modal index.
     """
+    # 额外键生成：将会影响块哈希的非 token 因素聚合在一起。
+    # 为什么需要额外键：相同 token 序列在不同上下文（如不同 LoRA 适配器、
+    # 不同多模态输入、不同缓存盐值）下应产生不同的哈希值，避免错误复用。
+    # 聚合四类额外键：LoRA 名称、多模态输入哈希、缓存盐值、prompt embeddings 哈希。
     mm_extra_keys: list[Any]
     mm_extra_keys, new_start_mm_idx = _gen_mm_extra_hash_keys(
         request, start_token_idx, end_token_idx, start_mm_idx
@@ -651,6 +677,13 @@ def hash_block_tokens(
         The hash value of the block and the token ids in the block.
         The entire tuple is used as the hash key of the block.
     """
+    # 链式依赖哈希：每个块的哈希值不仅取决于自身的 token 内容，
+    # 还取决于父块的哈希值（即前序所有块的内容）。
+    # 为什么需要链式哈希：实现位置感知的前缀缓存。
+    # 相同的 token 序列在不同位置会产生不同的哈希值，因为它们的父块哈希不同。
+    # 例如：token [A, B, C] 在序列开头和序列中间会得到不同的哈希，
+    # 这确保了前缀匹配的正确性——只有真正的前缀才能被复用。
+    # 对于第一个块（无父块），使用 NONE_HASH 作为种子，保证哈希链的起点一致。
     if not parent_block_hash:
         parent_block_hash = NONE_HASH
 
@@ -734,6 +767,11 @@ def get_request_block_hasher(
     Returns a function which computes the list of un-computed block hashes
     of a request."""
 
+    # 请求级块哈希器工厂：返回一个闭包，用于增量计算请求的新块哈希。
+    # 设计思路：使用闭包捕获 block_size 和 hash_fn，使得调度器可以
+    # 对每个请求调用返回的函数来获取新完成块的哈希值。
+    # 增量计算：只哈希尚未计算的新块（从已有的 block_hashes 长度推算起始位置），
+    # 避免重复计算已完成块的哈希，这对长序列的流式生成至关重要。
     def request_block_hasher(request: Request) -> list[BlockHash]:
         start_token_idx = len(request.block_hashes) * block_size
         num_tokens = request.num_tokens

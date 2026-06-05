@@ -51,6 +51,14 @@ class RequestOutputCollector:
     producer gets ahead of the consumer.
     """
 
+    # [中文注释] 输出收集器：生产者-消费者模式的核心组件
+    # - 生产者: OutputProcessor.process_outputs() 通过 put() 推送已完成的输出
+    # - 消费者: 用户的 generate() 协程通过 get() 拉取输出
+    # - asyncio.Event (self.ready) 实现跨协程的异步等待通知
+    # - DELTA 模式下，若生产者速度超过消费者，多次输出会通过
+    #   RequestOutput.add(aggregate=True) 合并为单个增量输出，
+    #   避免消费者积压过多中间结果，同时保证增量文本拼接正确
+
     def __init__(self, output_kind: RequestOutputKind, request_id: str):
         self.aggregate = output_kind == RequestOutputKind.DELTA
         self.request_id = request_id
@@ -179,6 +187,12 @@ class RequestState:
         self.routed_experts_chunks: list[np.ndarray] = []
 
         # Stream Interval
+        # [中文注释] 流式输出间隔控制：
+        # - stream_interval: 每隔多少个 token 才向用户推送一次输出（默认1=每个token都推）
+        #   增大此值可减少网络开销，但会增加用户感知的首 token 延迟
+        # - sent_tokens_offset: 已推送给用户的 token 偏移量
+        #   仅在 DELTA 模式下使用，用于切片获取"本轮新增"的 token，
+        #   避免重复发送已消费的 token
         self.stream_interval = stream_interval
         self.sent_tokens_offset = 0  # Offset of sent tokens
 
@@ -277,6 +291,16 @@ class RequestState:
         stop_reason: int | str | None,
         kv_transfer_params: dict[str, Any] | None = None,
     ) -> RequestOutput | PoolingRequestOutput | None:
+        # [中文注释] 根据当前请求状态构造用户可见的输出对象。
+        # 该方法在 process_outputs 的第 4 步被调用，是输出流水线的最后阶段。
+        # 核心逻辑:
+        #   1. FINAL_ONLY 模式下只在结束时返回输出，中间步骤返回 None
+        #   2. stream_interval > 1 时做节流: 仅在首 token、累积足够 token
+        #      或请求结束时才生成输出，减少高频流式推送的开销
+        #   3. DELTA 模式下通过 sent_tokens_offset 切片只取新增 token，
+        #      并更新偏移量；非 DELTA 模式发送全量 token
+        #   4. 并行采样 (n>1) 时，通过 parent_req.get_outputs() 将多个子
+        #      请求的输出聚合到父请求，只有所有子请求都产出时才返回
         finished = finish_reason is not None
         final_only = self.output_kind == RequestOutputKind.FINAL_ONLY
 
@@ -428,6 +452,14 @@ class OutputProcessor:
         self.log_stats = log_stats
         self.tokenizer = tokenizer
         self.stream_interval = stream_interval
+        # [中文注释] 三个核心追踪结构，用于将 EngineCore 的内部请求 ID
+        # 与用户传入的外部请求 ID 进行双向映射:
+        # - request_states: 内部 req_id -> RequestState，跟踪每个请求的
+        #   反分词器、logprobs 处理器、流式状态等全部输出侧状态
+        # - external_req_ids: 外部 req_id -> [内部 req_id, ...]，一个外部
+        #   ID 可能对应多个内部请求（并行采样 n>1 时），中止时需要级联处理
+        # - parent_requests: 父请求 ID -> ParentRequest，并行采样场景下
+        #   聚合多个子请求的输出，统一对外表现为一个请求
         self.request_states: dict[str, RequestState] = {}
         self.parent_requests: dict[str, ParentRequest] = {}
         self.external_req_ids: defaultdict[str, list[str]] = defaultdict(list)
@@ -462,6 +494,17 @@ class OutputProcessor:
         a parent request, in which case the associated child requests are aborted
         also.
         """
+        # [中文注释] 中止请求的两级解析与级联清理逻辑:
+        # 1. ID 解析阶段: 根据 internal 标志区分两种入参
+        #    - internal=True: 入参是 EngineCore 内部生成的随机 ID，直接使用
+        #      同时从 external_req_ids 反向映射表中清理该条目
+        #    - internal=False: 入参是用户传入的外部 ID，通过 external_req_ids
+        #      映射表查找所有关联的内部 ID（并行采样时可能有多个）
+        # 2. 执行中止阶段: 遍历内部 ID 列表
+        #    - 普通请求: 从 request_states 中移除，向 queue 推送 ABORT 输出
+        #      让阻塞的 generate() 协程收到通知并抛出异常
+        #    - 父请求 (并行采样): 先递归中止所有子请求，再移除父请求本身
+        #      确保不会有孤儿子请求继续占用资源
         internal_req_ids = []
         for request_id in request_ids:
             if internal:
@@ -600,6 +643,22 @@ class OutputProcessor:
         If you need to touch every element of the batch, do it from
         within the loop below.
         """
+        # [中文注释] 输出处理的主循环 —— 整个输出链路的唯一入口
+        # 这是 vLLM V1 中唯一遍历 EngineCoreOutputs 批次的位置，
+        # 所有需要逐请求处理的逻辑都必须内联在此循环中以最小化 Python 开销。
+        #
+        # 4 步流水线（对每个 EngineCoreOutput）:
+        #   步骤 1 - 统计: 记录 TTFT、吞吐量、LoRA 状态等指标
+        #   步骤 2 - 反分词: IncrementalDetokenizer 将 token ID 增量解码为
+        #            文本，同时检查自定义 stop string
+        #   步骤 3 - Logprobs: LogprobsProcessor 累积采样/提示词的对数概率
+        #   步骤 4 - 创建输出: 调用 make_request_output 构造 RequestOutput，
+        #            放入 queue (AsyncLLM) 或追加到返回列表 (LLMEngine)
+        #
+        # 请求完成后的清理:
+        #   - 流式输入模式: 推迟清理，等待下一段输入到来
+        #   - 普通模式: 从 request_states 移除，更新统计，必要时通知
+        #     EngineCore 中止（如反分词器提前检测到 stop string）
 
         request_outputs: list[RequestOutput | PoolingRequestOutput] = []
         reqs_to_abort: list[str] = []

@@ -65,18 +65,29 @@ class SingleTypeKVCacheManager(ABC):
         self.kv_cache_spec = kv_cache_spec
         self.block_pool = block_pool
         self.enable_caching = enable_caching
+        # [中文] SWA/分块局部注意力的每请求准入上限。
+        # 对于会回收旧块的注意力类型（滑动窗口、分块局部注意力），必须限制
+        # 每个请求同时占用的最大块数，否则多个请求的峰值预留总量可能超过
+        # 块池总容量，导致死锁（参见 issue #39734）。
+        # 对于全注意力等不回收旧块的类型，此值为 None（无上限）。
         self._max_admission_blocks_per_request = max_admission_blocks_per_request
         self.new_block_ids: list[int] = []
 
         # Mapping from request ID to blocks to track the blocks allocated
         # for each request, so that we can free the blocks when the request
         # is finished.
+        # [中文] 请求ID → 块列表的映射。每个请求的 KV cache 物理块由此字典
+        # 管理，请求完成（或中止）时通过此映射找到所有块并释放回块池。
+        # 在整条调度链路中，它是"哪个请求占用了哪些块"的唯一真相来源。
         self.req_to_blocks: defaultdict[str, list[KVCacheBlock]] = defaultdict(list)
 
         # {req_id: The number of cached blocks for this given request}
         # This is used to track the number of cached blocks for each request.
         # This is only used to track the RUNNING requests, we do not track the
         # data for preempted ones.
+        # [中文] 每请求已缓存块数。仅用于 RUNNING 状态的请求。
+        # 它记录了已经写入前缀缓存哈希索引的块数量，使得后续调度时
+        # cache_blocks() 可以跳过已缓存的块，避免重复哈希计算和写入。
         self.num_cached_block: dict[str, int] = {}
 
         self.kv_cache_group_id = kv_cache_group_id
@@ -118,6 +129,13 @@ class SingleTypeKVCacheManager(ABC):
         """
 
         num_required_blocks = cdiv(num_tokens, self.block_size)
+        # [中文] 准入上限逻辑：防止 SWA/分块局部注意力过度预留内存。
+        # 对于会跨 chunk 回收旧块的注意力类型，每个请求实际持有的峰值块数
+        # 远小于其序列长度对应的总块数。此处通过 _max_admission_blocks_per_request
+        # 限制预留量，使其与启动阶段的块池大小估算保持一致。
+        # remove_skipped_blocks() 会在每次 allocate_slots 中先回收旧块，
+        # 因此实际峰值占用 <= 此上限，保证 sum(预留量) <= 块池总量。
+        # 若两者不一致，会重新引入 issue #39734 的死锁或 prefill 阶段 OOM。
         if apply_admission_cap and self._max_admission_blocks_per_request is not None:
             # Recycling-aware specs (SWA, chunked-local) cap the per-request
             # reservation here so admission matches the startup pool sizer
@@ -133,6 +151,10 @@ class SingleTypeKVCacheManager(ABC):
             )
         num_req_blocks = len(self.req_to_blocks.get(request_id, ()))
 
+        # [中文] RUNNING 请求的快速路径：已经在运行的请求不会有新的前缀缓存命中，
+        # 因此只需计算当前需要的块数与已有块数之差。
+        # 注意：投机解码场景下，draft token 可能被拒绝，导致
+        # num_required_blocks < num_req_blocks，此时返回 0。
         if request_id in self.num_cached_block:
             # Fast-path: a running request won't have any new prefix-cache hits.
             assert len(new_computed_blocks) == 0
@@ -159,6 +181,10 @@ class SingleTypeKVCacheManager(ABC):
         # `req_to_blocks`, so only skip the remainder from `new_computed_blocks`.
         num_skipped_new_computed_blocks = max(0, num_skipped_blocks - num_req_blocks)
 
+        # [中文] evictable block 计数：前缀缓存命中的块可能仍在空闲队列中
+        # （ref_cnt == 0），属于"可逐出"候选。当请求 touch 这些块时，
+        # 它们会从空闲队列移除（ref_cnt 变为 1），相当于减少了可用空闲块数。
+        # 因此必须将这部分计入分配需求，否则块池的空闲计数会出现偏差。
         # If a computed block is an eviction candidate (in the free queue and
         # ref_cnt == 0), it will be removed from the free queue when touched by
         # the allocated request, so we must count it in the free-capacity check.
@@ -214,6 +240,9 @@ class SingleTypeKVCacheManager(ABC):
                 num_external_computed_tokens,
             )
 
+        # [中文] 三步流程之第一步：touch 缓存块。
+        # 调用 block_pool.touch() 将前缀缓存命中的块从空闲队列中移除，
+        # 并增加其引用计数，防止它们在后续被其他请求逐出。
         # Touch the computed blocks to make sure they won't be evicted.
         if self.enable_caching:
             self.block_pool.touch(new_computed_blocks)
@@ -222,8 +251,12 @@ class SingleTypeKVCacheManager(ABC):
                 "Computed blocks should be empty when prefix caching is disabled"
             )
 
+        # [中文] 三步流程之第二步（可选）：滑动窗口场景下，被跳过的块用 null 块填充。
+        # null 块是不持有实际 KV 数据的占位块，保证 req_to_blocks 的索引
+        # 与 token 位置一一对应，使后续的块索引计算保持一致。
         # Skip blocks are padded with null blocks.
         req_blocks.extend([self._null_block] * num_skipped_blocks)
+        # [中文] 三步流程之第三步：将剩余的前缀缓存命中的块追加到请求的块列表。
         # Add the remaining computed blocks.
         req_blocks.extend(new_computed_blocks)
         # All cached hits (including skipped nulls) are already cached; mark
@@ -231,6 +264,9 @@ class SingleTypeKVCacheManager(ABC):
         # have a block_hash set.
         self.num_cached_block[request_id] = len(req_blocks)
 
+        # [中文] 三步流程之第四步（可选）：为 KV connector 传入的外部计算 token
+        # 分配新的物理块。外部 token 来自跨节点/跨设备的 KV 缓存传输
+        # （如分布式推理中的 KV 重放），需要本地块池为其分配存储空间。
         if num_external_computed_tokens > 0:
             # Allocate new blocks for external computed tokens.
             allocated_blocks = self.block_pool.get_new_blocks(
@@ -448,6 +484,11 @@ class SingleTypeKVCacheManager(ABC):
             # A typical case is full attention that we never free any token
             # before the request is finished.
             return
+        # [中文] 滑动窗口块移除和 null 块替换。
+        # 对于 SWA 等注意力类型，随着序列推进，早期的块不再被注意力计算需要
+        # （它们已在滑动窗口之外）。此处将这些块释放回块池，并在 req_to_blocks
+        # 中替换为 null 块占位，保持块列表索引与 token 位置的对应关系不变。
+        # 从尾部向头部遍历，遇到已有的 null 块则提前终止（之前的调用已处理过）。
         blocks = self.req_to_blocks[request_id]
         num_skipped_blocks = num_skipped_tokens // self.block_size
         # `num_skipped_tokens` may include tokens that haven't been allocated yet
@@ -583,6 +624,12 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
             # the last matched block.
             sliding_window_contiguous_blocks += 1
 
+        # [中文] 从右到左搜索：只有尾部窗口对 SWA 重要。
+        # 滑动窗口注意力只关注序列尾部的一个窗口范围内的 token，
+        # 因此搜索缓存命中时从最右侧块开始向左扫描。
+        # 一旦找到足够数量的连续命中块（>= sliding_window_contiguous_blocks），
+        # 就可以立即返回，无需继续扫描更左侧的块。
+        # 左侧未命中的位置用 null 块填充，表示这些块不再参与注意力计算。
         # TODO: reduce i by sliding_window_contiguous_blocks when cache miss, to
         # optimize the time complexity from O(max_num_blocks) to
         # O(max_num_blocks / sliding_window_contiguous_blocks +
@@ -594,6 +641,10 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
             for _ in range(len(kv_cache_group_ids))
         )
         block_size = kv_cache_spec.block_size
+        # [中文] 连续块计数：从右向左扫描时维护的连续命中块数。
+        # 只有当连续命中数 >= sliding_window_contiguous_blocks 时，
+        # 才认为找到了有效的缓存命中（SWA 的尾部窗口完整命中）。
+        # 遇到缓存未命中时重置为 0，重新开始计数。
         num_contiguous_blocks = 0
         match_found = False
         # Search from right to left and early stop when a match is found.
@@ -601,6 +652,9 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
             if cached_block := block_pool.get_cached_block(
                 block_hashes[i], kv_cache_group_ids
             ):
+                # [中文] 对齐处理：当 block_size != alignment_tokens 时（混合模型中
+                # 不同注意力层可能使用不同的页大小），首个命中的块必须满足
+                # 对齐约束，否则跳过该块继续向左搜索。
                 # Skip prefix matching check if the block is not aligned with
                 # `alignment_tokens`.
                 if num_contiguous_blocks == 0 and block_size != alignment_tokens:
@@ -852,10 +906,20 @@ class MambaManager(SingleTypeKVCacheManager):
         self, kv_cache_spec: MambaSpec, block_pool: BlockPool, **kwargs
     ) -> None:
         super().__init__(kv_cache_spec, block_pool, **kwargs)
+        # [中文] cached_blocks_this_step: 记录当前调度步骤中被缓存的块哈希。
+        # Mamba 层的状态依赖时序性——同一个 step 内由其他请求刚生成的缓存块
+        # 不能被当前请求复用（因为 Mamba 状态不能跨请求在同一 step 内共享）。
+        # 在 get_num_blocks_to_allocate() 中检查此集合，若命中则返回一个
+        # 超大值使调度器推迟该请求到下一个 step。
         self.cached_blocks_this_step: set[BlockHashWithGroupId] = set()
         self.mamba_cache_mode = kv_cache_spec.mamba_cache_mode
         self.num_speculative_blocks: int = kv_cache_spec.num_speculative_blocks
         if self.mamba_cache_mode == "align":
+            # [中文] align 模式下的 last_state_block_idx: 记录每个请求在上一步
+            # 分配的"状态块"索引。Mamba 的隐状态只需要保留最后一个 token 的，
+            # 因此在 align 模式下，每步只分配 1 个新块用于保存当前步的运行状态，
+            # 而上一步的状态块在此步的 remove_skipped_blocks() 中被释放。
+            # 这种"滚动分配+释放"策略将 Mamba 的块占用量控制在常数级别。
             # Mapping from request ID to the index of the block
             # allocated in the previous step
             self.last_state_block_idx: dict[str, int] = {}
@@ -956,6 +1020,10 @@ class MambaManager(SingleTypeKVCacheManager):
         apply_admission_cap: bool = False,
     ) -> int:
         assert isinstance(self.kv_cache_spec, MambaSpec)
+        # [中文] 防止同一步骤内其他请求的缓存块被复用。
+        # Mamba 层的状态具有时序依赖性：如果一个块是在当前 step 中刚被其他请求
+        # 写入缓存的，其 Mamba 状态可能不适用于当前请求。通过返回一个超出块池
+        # 总量的数字，迫使调度器认为资源不足，将该请求推迟到下一个 step 执行。
         if (
             len(new_computed_blocks) > 0
             and new_computed_blocks[-1].block_hash in self.cached_blocks_this_step
@@ -1049,6 +1117,12 @@ class MambaManager(SingleTypeKVCacheManager):
                 blocks_allocated = request_id in self._allocated_block_reqs
                 # Record the last state block
                 if blocks_allocated:
+                    # [中文] 推测块跨步复用：记录上一步的"状态块"索引。
+                    # 在 align 模式下，每个请求的块布局为：
+                    #   [null块...] [状态块] [推测块1] [推测块2] ...
+                    # 状态块保存当前步的 Mamba 运行状态，推测块为后续步预分配。
+                    # last_state_block_idx 指向倒数第 (1 + num_speculative_blocks) 个块，
+                    # 下一步的 remove_skipped_blocks() 会释放这个旧状态块。
                     # We always save the running state at the last
                     # (1 + num_speculative_blocks) block
                     self.last_state_block_idx[request_id] = (
@@ -1071,6 +1145,10 @@ class MambaManager(SingleTypeKVCacheManager):
                         ]
                     )
 
+                # [中文] 推测块跨步复用：将上一步预分配的推测块挪到新的位置。
+                # 在 align 模式下，上一步分配的推测块可以被当前步复用，
+                # 而不是重新从块池分配。这减少了块池的压力。
+                # 被挪走的原位置替换为 null 块，保持索引一致性。
                 if blocks_allocated:
                     # reuse previous speculative blocks in this step
                     for block_idx in range(
@@ -1205,6 +1283,11 @@ class SinkFullAttentionManager(FullAttentionManager):
         self.sink_blocks = self.block_pool.free_block_queue.popleft_n(num_sink_block)
 
 
+# [中文] KVCacheSpec 类型到管理器类的映射。
+# 每种注意力层类型（全注意力、滑动窗口、分块局部注意力、Mamba 等）
+# 都有对应的具体管理器类，通过此映射表在运行时动态选择。
+# get_manager_for_kv_cache_spec() 使用此映射创建管理器实例，
+# 是整个 KV cache 管理子系统的工厂入口。
 spec_manager_map: dict[type[KVCacheSpec], type[SingleTypeKVCacheManager]] = {
     FullAttentionSpec: FullAttentionManager,
     TQFullAttentionSpec: FullAttentionManager,

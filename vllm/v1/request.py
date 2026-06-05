@@ -137,11 +137,25 @@ class Request:
             else [0] * self.num_prompt_tokens
         )
 
+        # 异步调度（async scheduling）时，调度器可以先于模型执行完成就
+        # 规划下一轮 batch。此时输出 token 尚未生成，用占位符（placeholder）
+        # 预留空间，待模型实际输出后替换。
+        # num_output_placeholders: 本轮已预留但尚未填充的输出 token 数
+        # async_tokens_to_discard: 占位符与实际输出不匹配时需要丢弃的 token 数
         # Used in async scheduling.
         self.num_output_placeholders = 0
         self.async_tokens_to_discard = 0
 
+        # 推测解码（speculative decoding）的草稿 token。
+        # 调度器会将这些 token 连同已确认 token 一起送入模型做一次前向，
+        # 模型并行验证所有草稿 token 是否命中，命中的直接接受，
+        # 未命中的回退重新生成。从而一次前向生成多个 token，提升吞吐。
         self.spec_token_ids: list[int] = []
+
+        # 已经被模型前向计算过的 token 数量。
+        # 调度器用此值判断 prefill 阶段还剩多少 prompt token 需要处理：
+        #   remaining = num_prompt_tokens - num_computed_tokens
+        # 也用于 chunked prefill，将长 prompt 分多个调度轮次处理。
         self.num_computed_tokens = 0
         self.cache_salt: str | None = cache_salt
 
@@ -156,6 +170,11 @@ class Request:
         # trace_headers
         self.trace_headers = trace_headers
 
+        # 标记当前调度轮次是否为 chunked prefill 的中间块（非最后一块）。
+        # 当 prompt 很长时，调度器会将其拆分成多个 chunk 分轮处理。
+        # 中间 chunk 完成后不需要将结果发送给客户端（因为还没有可读的输出），
+        # 且中间 chunk 产生的 KV cache 可能会被驱逐，因此需要此标记来
+        # 告知输出处理器丢弃本轮中间 token，只保留最终 prefill chunk 之后的输出。
         # True if this request is scheduled as a non-final prefill chunk.
         self.is_prefill_chunk = False
 
@@ -163,11 +182,23 @@ class Request:
         # indicates that the output is corrupted
         self.num_nans_in_logits = 0
 
+        # 请求被调度器抢占的累计次数。
+        # 当显存不足时，调度器会抢占低优先级请求，将其 KV cache 释放
+        # 并重新排入等待队列（RUNNING → PREEMPTED → WAITING）。
+        # 每次抢占后此计数器加 1。该值可用于：
+        #   1. 监控/指标：衡量系统抢占频率
+        #   2. 调度公平性：避免同一请求反复被饿死
         # The number of times this request has been preempted by the scheduler.
         self.num_preemptions = 0
 
         self.prefill_stats: PrefillStats | None = PrefillStats()
 
+        # 前缀缓存（prefix caching）的链式块哈希列表。
+        # vLLM 将 token 序列按物理块大小分块，每块计算一个哈希值。
+        # 链式哈希意味着每个块的哈希包含了前驱块的哈希信息，
+        # 这样即使两个请求有相同的前缀内容，只要前面的块不同，哈希也会不同。
+        # 调度器通过比对 block_hashes 来复用已有请求的 KV cache，
+        # 避免重复计算相同前缀的 prefill，显著降低首 token 延迟（TTFT）。
         self.block_hashes: list[BlockHash] = []
         # Store the block hasher without binding self to avoid creating a
         # reference cycle (Request -> partial -> Request) that prevents
@@ -303,6 +334,13 @@ class Request:
         Compare two requests based on priority, arrival time, and request ID.
         Used in priority scheduling.
         """
+        # 优先级调度的比较逻辑，用于在等待队列中排序请求。
+        # 比较级联规则（依次尝试）：
+        #   1. priority（数值越小优先级越高）—— 让紧急请求优先被调度
+        #   2. arrival_time（越早到达越优先）—— 同优先级下保证先来先服务（FCFS）
+        #   3. request_id（字典序）—— 时间戳相同时提供确定性排序
+        #   4. id(self)（内存地址）—— 最终兜底，保证任意两个不同对象可比较
+        # 此方法被调度器用于堆排序（heapq），决定哪些请求优先进入本轮 batch。
         if self.priority != other.priority:
             return self.priority < other.priority
         if self.arrival_time != other.arrival_time:
@@ -314,6 +352,24 @@ class Request:
 
 class RequestStatus(enum.IntEnum):
     """Status of a request."""
+
+    # 请求状态生命周期（由调度器驱动）：
+    #
+    #   正常路径:
+    #     WAITING  →  RUNNING  →  FINISHED_*
+    #     新请求入队   被调度执行    正常/异常结束
+    #
+    #   抢占路径（显存不足时，调度器回收低优先级请求的 KV cache）:
+    #     RUNNING  →  PREEMPTED  →  WAITING  →  RUNNING ...
+    #     正在执行    被抢占释放KV   重新排队      恢复执行
+    #
+    #   结束状态（PREEMPTED 之后的所有枚举值都被视为已结束）:
+    #     FINISHED_STOPPED      — 正常遇到 stop token
+    #     FINISHED_LENGTH_CAPPED — 输出达到 max_tokens
+    #     FINISHED_ABORTED       — 客户端主动取消
+    #     FINISHED_IGNORED       — prompt 超过模型长度上限，直接丢弃
+    #     FINISHED_ERROR         — 执行过程出错
+    #     FINISHED_REPETITION    — 重复惩罚触发终止
 
     WAITING = enum.auto()
     WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR = enum.auto()

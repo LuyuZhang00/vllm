@@ -52,6 +52,14 @@ class BlockHashToBlockMap:
     block tables are append-only.
     NOTE #2: The union type is introduced in order to reduce GC costs
     from the inner dict.
+
+    【联合类型优化说明】
+    大部分情况下，一个 block_hash 只对应一个 KVCacheBlock。如果每次都用 dict 存储，
+    会产生大量只有一个元素的小 dict 对象，增加 GC 负担。
+    因此采用联合类型优化：
+      - 单块时：直接存储 KVCacheBlock 引用（零额外开销）
+      - 多块时（哈希冲突场景）：升级为 dict[int, KVCacheBlock]
+    这是 insert() 三态合并逻辑的动机。
     """
 
     def __init__(self):
@@ -76,6 +84,11 @@ class BlockHashToBlockMap:
         """
         Inserts the KVCacheBlock to the cache
         """
+        # 【三态合并逻辑】
+        # 该方法实现了联合类型的状态机转换：None -> 单块 -> dict
+        # 状态1: key 不存在 -> 直接存入 KVCacheBlock 引用（最常见路径）
+        # 状态2: key 已存在且为单块 -> 哈希冲突，升级为 dict
+        # 状态3: key 已存在且为 dict -> 同 block_id 覆盖，不同则追加
         blocks = self._cache.get(key)
         if blocks is None:
             # When key is not found, attach a single block to the key
@@ -94,6 +107,11 @@ class BlockHashToBlockMap:
         """
         Checks if block_hash exists and pop block_id from the cache
         """
+        # 【pop 边界处理】
+        # 先从缓存中弹出整个 key 对应的值。
+        # 若为单块且 block_id 不匹配（极少情况：同 hash 不同 block_id），
+        # 需要将块放回缓存，返回 None。
+        # 若为 dict，移除目标 block_id 后，若 dict 非空则放回缓存。
         blocks = self._cache.pop(key, None)
         if blocks is None:
             # block_hash not found in the cache
@@ -165,14 +183,25 @@ class BlockPool:
         # Free block queue that constructs and manipulates a doubly linked
         # list of free blocks (including eviction candidates when caching is
         # enabled).
+        # 【空闲块队列初始化】
+        # 所有 KVCacheBlock 初始均放入空闲队列（双向链表），
+        # 之后 null_block 被弹出标记为非空闲，其余块在分配时依次弹出。
         self.free_block_queue = FreeKVCacheBlockQueue(self.blocks)
 
         # Cache for block lookup
+        # 【前缀缓存哈希查找表】
+        # 维护 block_hash -> KVCacheBlock 的映射，是前缀缓存命中的核心数据结构。
+        # 在 cache_full_blocks() 中写入，在 get_cached_block() 中查询。
         self.cached_block_hash_to_block: BlockHashToBlockMap = BlockHashToBlockMap()
 
         # To represent a placeholder block with block_id=0.
         # The ref_cnt of null_block is not maintained, needs special care to
         # avoid freeing it.
+        # 【null_block 概念】
+        # null_block 是一个特殊占位符块，用于滑动窗口注意力（SWA）中被掩码跳过的
+        # 位置。它不承载实际 KV 数据，其 ref_cnt 不参与正常的引用计数管理。
+        # 在 free_blocks() 和 touch() 中均有对 is_null 的特殊过滤，
+        # 以避免意外释放该块。
         self.null_block = self.free_block_queue.popleft()
         self.null_block.is_null = True
 
@@ -247,6 +276,11 @@ class BlockPool:
         new_full_blocks = blocks[num_cached_blocks:num_full_blocks]
         assert len(request.block_hashes) >= num_full_blocks
         assert block_mask is None or len(block_mask) == len(new_full_blocks)
+        # 【块哈希计算流程】
+        # block_hashes 在 Request 创建时就已经按 token 序列预计算好，
+        # 每个 hash 带有 group_id 前缀以区分不同 KV cache 组。
+        # 当不同组的 block_size 不一致时（如 MQA 组 vs MHA 组），
+        # 需要以 hash_block_size 为粒度重新组合为更大的 block_hashes。
         if block_size == self.hash_block_size:
             # Common case.
             block_hashes: BlockHashList = request.block_hashes
@@ -264,6 +298,10 @@ class BlockPool:
         new_hashes: list[ExternalBlockHash] | None = (
             [] if self.enable_kv_cache_events else None
         )
+        # 【block_mask 的作用】
+        # 对于滑动窗口注意力（SWA）等稀疏注意力机制，尾部窗口组只关注最近的
+        # 若干个块，更早的块永远不会被该组命中。block_mask 为 False 的块
+        # 不会写入前缀缓存哈希表，避免污染查找空间。
         for i, blk in enumerate(new_full_blocks):
             # Some blocks may be null or masked out when enabling sparse attention
             # like sliding window attention, or Mamba models with prefix-caching
@@ -373,6 +411,10 @@ class BlockPool:
         Returns:
             True if the block is evicted, False otherwise.
         """
+        # 【驱逐逻辑】
+        # 当一个缓存中的块被重新分配时（在 get_new_blocks 中调用），
+        # 需要先从哈希查找表中移除其旧的 hash 映射，再重置 block_hash。
+        # 这样保证哈希表中不会残留已失效的块引用。
         # Clean up metrics tracking first to prevent leaks
         if self.metrics_collector:
             self.metrics_collector.on_block_evicted(block)
@@ -407,6 +449,11 @@ class BlockPool:
         Args:
             blocks: A list of blocks to touch.
         """
+        # 【前缀缓存命中的关键操作】
+        # 当新请求命中已有前缀缓存时，调用 touch() 增加引用计数。
+        # ref_cnt == 0 的块在空闲队列中（可被驱逐候选），
+        # 需要先从空闲队列移除以防止被驱逐，然后 ref_cnt++。
+        # 这是前缀缓存复用的核心机制：命中 -> touch -> 块被保护。
         for block in blocks:
             # ref_cnt=0 means this block is in the free list (i.e. eviction
             # candidate), so remove it.
@@ -424,6 +471,14 @@ class BlockPool:
             ordered_blocks: A list of blocks to free ordered by their eviction
                 priority.
         """
+        # 【逆序释放语义】
+        # ordered_blocks 通常是从尾部到头部的顺序（尾部块先释放）。
+        # 这样设计的原因：尾部块是最新生成的，前缀块（头部）更可能被其他请求复用。
+        # 先释放尾部块可以保留前缀块的缓存命中机会。
+        #
+        # 【ref_cnt == 0 时才回到空闲队列】
+        # 一个块可能被多个请求共享（前缀缓存复用），只有当所有引用都释放
+        # （ref_cnt 降为 0）后，才将块放回空闲队列，避免提前被其他分配驱逐。
         # Materialize the iterable to allow multiple passes.
         blocks_list = list(ordered_blocks)
         for block in blocks_list:

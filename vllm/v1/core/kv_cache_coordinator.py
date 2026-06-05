@@ -47,6 +47,8 @@ class KVCacheCoordinator(ABC):
         self.max_model_len = max_model_len
         self.enable_caching = enable_caching
 
+        # block_pool 是所有注意力组共享的物理块池，负责 GPU 显存块的分配与回收。
+        # 不同注意力类型（全注意力、滑动窗口等）共享同一个池，避免重复预留显存。
         self.block_pool = BlockPool(
             num_gpu_blocks=kv_cache_config.num_blocks,
             enable_caching=enable_caching,
@@ -55,6 +57,9 @@ class KVCacheCoordinator(ABC):
             metrics_collector=metrics_collector,
         )
 
+        # eagle_group_ids 记录哪些 KV 缓存组参与推测解码（EAGLE）。
+        # 推测解码在生成结束后需要丢弃最后一块，此集合用于标记需要执行该操作的组。
+        # 如果启用 EAGLE 但没有任何组被显式标记，则保守地对所有组生效。
         # KV cache group indices that get the EAGLE last-block drop.
         self.eagle_group_ids: set[int] = {
             i for i, g in enumerate(kv_cache_config.kv_cache_groups) if g.is_eagle_group
@@ -63,6 +68,9 @@ class KVCacheCoordinator(ABC):
         if use_eagle and not self.eagle_group_ids:
             self.eagle_group_ids = set(range(len(kv_cache_config.kv_cache_groups)))
 
+        # single_type_managers: 每种注意力类型（如全注意力、滑动窗口注意力、
+        # 交叉注意力等）各自拥有一个专用管理器，负责该类型下的块分配、缓存查找和释放。
+        # 这样每种注意力可以独立管理其缓存策略，协调器只需遍历即可完成跨类型操作。
         self.single_type_managers = tuple(
             get_manager_for_kv_cache_spec(
                 kv_cache_spec=kv_cache_group.kv_cache_spec,
@@ -110,6 +118,9 @@ class KVCacheCoordinator(ABC):
         Returns:
             The number of blocks to allocate.
         """
+        # 遍历所有注意力类型的管理器，累加需要分配的块数。
+        # 交叉注意力的特殊之处在于：编码器 token 的数量是静态的，不随解码推进而增长，
+        # 因此只需根据编码器输入 token 数一次性分配固定数量的块。
         num_blocks_to_allocate = 0
         for i, manager in enumerate(self.single_type_managers):
             if isinstance(manager, CrossAttentionManager):
@@ -281,6 +292,11 @@ class KVCacheCoordinatorNoPrefixCache(KVCacheCoordinator):
     Does not implement any features related to prefix caching.
     """
 
+    # 禁用前缀缓存时的空实现。当用户关闭 prefix caching 或模型不支持时使用此类。
+    # 它直接调用父类构造并强制 enable_caching=False，跳过所有与缓存命中相关的逻辑。
+    # find_longest_cache_hit 直接返回空结果，get_num_common_prefix_blocks 始终返回 0。
+    # 这避免了在无缓存场景下引入不必要的哈希计算和块查找开销。
+
     def __init__(
         self,
         kv_cache_config: KVCacheConfig,
@@ -327,6 +343,10 @@ class UnitaryKVCacheCoordinator(KVCacheCoordinator):
     case for models with only one KV cache type, e.g., all attention layers use
     full attention or all attention layers use sliding window attention.
     """
+
+    # 单组快速路径：大多数标准模型（如 LLaMA、GPT 等）只有一种注意力类型，
+    # 所有层都使用全注意力或都使用滑动窗口注意力。这种情况下无需跨类型协调，
+    # 直接委托给唯一的 single_type_manager 即可，省去分组和对齐的开销。
 
     def __init__(
         self,
@@ -438,6 +458,16 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         Groups KV cache groups by their spec type for efficient batch processing
         during cache hit lookup.
         """
+
+        # 将相同注意力规格的 KV 缓存组归为一类，方便后续批量处理缓存命中查询。
+        # 归类后进行两个关键排序/计算：
+        # 1. 全注意力排在最前面——全注意力具有下闭性质（downward-closed），
+        #    即如果长度 N 有缓存命中，则任意更短长度也有命中，因此先查全注意力
+        #    能得到一个紧的上界，减少后续组的查找范围。
+        # 2. 计算所有注意力组块大小的最小公倍数（LCM），确保缓存命中长度是所有
+        #    注意力类型块大小的整数倍。这是混合模型对齐的核心：不同注意力类型
+        #    可能有不同块大小（如全注意力 block_size=16，滑动窗口 block_size=4），
+        #    只有 LCM 对齐才能保证每种类型都能完整覆盖命中区域。
         attention_groups: list[
             tuple[KVCacheSpec, list[int], type[SingleTypeKVCacheManager]]
         ] = []
@@ -461,6 +491,8 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             "HybridKVCacheCoordinator requires at least two attention groups."
         )
 
+        # 全注意力排在前面（下闭属性，只缩短不延长）：全注意力的从左到右扫描能
+        # 提供一个紧的初始上界，后续组只需在此范围内进一步缩短，减少查找开销。
         # Put full attention first: its efficient left-to-right scan provides
         # a tighter initial bound, reducing work for subsequent groups.
         self.attention_groups = sorted(
@@ -468,6 +500,10 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             key=lambda x: not isinstance(x[0], FullAttentionSpec),
         )
 
+        # LCM 块大小计算：混合模型中不同注意力类型可能有不同的块大小。
+        # 例如全注意力 block_size=16，滑动窗口 block_size=4，则 LCM=16。
+        # 缓存命中长度必须是 LCM 的整数倍，这样每种注意力类型都能在块边界上
+        # 完整覆盖命中区域。当前不支持部分块缓存命中，因此需要严格对齐。
         # The LCM of the block sizes of all attention types.
         # The cache hit length must be a multiple of the LCM of the block sizes
         # to make sure the cache hit length is a multiple of the block size of
@@ -523,6 +559,24 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                 - The number of tokens of the longest cache hit.
         """
 
+        # 固定点迭代算法：在混合模型中，不同注意力类型对同一候选长度的缓存命中
+        # 可能不同。算法流程：
+        #   1. 从最大候选长度 hit_length 开始
+        #   2. 依次让每种注意力类型查询缓存，每种类型要么接受当前长度，要么缩短
+        #   3. 如果任何类型缩短了长度，则从头重新检查所有类型（因为缩短后的长度
+        #      可能影响之前已通过的类型）
+        #   4. 当一轮迭代中没有任何类型缩短长度时，达到固定点，算法收敛
+        #
+        # 收敛性保证：候选长度单调递减且下界为 0，因此必然终止。
+        #
+        # is_simple_hybrid 快速路径：当只有 2 个注意力组且第一个是全注意力时，
+        # 由于全注意力具有下闭性质，第一次迭代就能确定最终长度，无需循环。
+        #
+        # eagle 验证追踪：EAGLE 推测解码需要多匹配一个块再丢弃最后一块。
+        # 当候选长度缩短时，之前对 EAGLE 组的验证结果可能不再成立，
+        # 因此需要清除 eagle_verified 集合重新验证。每个候选长度下每个
+        # EAGLE 组最多验证一次，避免重复开销。
+
         def _get_block_hashes(kv_cache_spec: KVCacheSpec) -> BlockHashList:
             if kv_cache_spec.block_size == self.hash_block_size:
                 return block_hashes
@@ -534,12 +588,18 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         hit_length = max_cache_hit_length
         hit_blocks_by_group: list[list[KVCacheBlock] | None] = [None] * num_groups
 
+        # is_simple_hybrid 快速路径：当恰好有 2 个注意力组且第一个是全注意力时，
+        # 由于全注意力是下闭的，第一次迭代就能确定上界，第二种注意力只需一次
+        # 查询即可收敛，因此跳出循环，节省迭代开销。
         # Simple hybrid (1 full attn + 1 other): one iteration suffices.
         # Full attn is always first if it exists.
         is_simple_hybrid = len(self.attention_groups) == 2 and isinstance(
             self.attention_groups[0][0], FullAttentionSpec
         )
 
+        # eagle_verified 追踪哪些注意力组的 EAGLE 丢弃已在当前候选长度下验证过。
+        # 每个 EAGLE 组在每个候选长度下最多验证一次（避免重复多匹配+丢弃的开销）。
+        # 当候选长度被其他组缩短时，之前验证的结果可能失效，需要清空重新验证。
         # Attention-group indices whose EAGLE drop is verified at the current
         # ``curr_hit_length``. Each eagle group applies the drop at most once
         # per candidate length (see issue #32802).
@@ -619,6 +679,11 @@ def get_kv_cache_coordinator(
     hash_block_size: int,
     metrics_collector: KVCacheMetricsCollector | None = None,
 ) -> KVCacheCoordinator:
+    # 工厂函数：根据缓存配置选择合适的协调器实现。
+    # 选择逻辑：
+    #   1. 未启用前缀缓存 → KVCacheCoordinatorNoPrefixCache（空缓存命中实现）
+    #   2. 只有一种注意力类型 → UnitaryKVCacheCoordinator（单组快速路径）
+    #   3. 多种注意力类型 → HybridKVCacheCoordinator（需要跨类型对齐和迭代查找）
     if not enable_caching:
         return KVCacheCoordinatorNoPrefixCache(
             kv_cache_config,

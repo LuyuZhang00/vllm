@@ -138,6 +138,11 @@ class KVCacheManager:
         # potential configs we could expose in the future.
         self.prefix_cache_stats = PrefixCacheStats() if log_stats else None
 
+        # 创建 KV 缓存协调器，它是 KVCacheManager 的核心后端，负责：
+        # 1. 管理不同类型的 KV 缓存（如注意力层、滑动窗口、跨注意力等）
+        # 2. 处理前缀缓存的查找与驱逐策略
+        # 3. 协调多组 KV 缓存之间的块分配与释放
+        # 协调器内部封装了 block_pool（块池）、哈希索引等底层资源
         self.coordinator = get_kv_cache_coordinator(
             kv_cache_config=kv_cache_config,
             max_model_len=self.max_model_len,
@@ -166,6 +171,9 @@ class KVCacheManager:
         # overhead.
         #
         # We use nested tuples to ensure the empty KVCacheBlocks is immutable.
+        # 预分配的空 KVCacheBlocks 单例，用于避免频繁创建空对象带来的 GC 开销。
+        # 当请求没有缓存命中（如禁用前缀缓存、或首次计算）时，返回此对象而非新建。
+        # 使用嵌套 tuple 确保不可变性，防止外部意外修改。
         self.empty_kv_cache_blocks = KVCacheBlocks(
             tuple(() for _ in range(self.num_kv_cache_groups))
         )
@@ -203,6 +211,11 @@ class KVCacheManager:
                 - A list of blocks that are computed for the request.
                 - The number of computed tokens.
         """
+        # 前缀缓存查找入口：为请求查找已缓存的 KV 块，避免重复计算。
+        # 流程：1) 检查是否启用缓存且请求允许读取缓存
+        #       2) 调用协调器的 find_longest_cache_hit 做最长前缀匹配
+        #       3) 记录统计信息（命中率、抢占次数等）
+
         # We skip finding the prefix cache hit when prefix caching is
         # disabled or the request is marked as skipping kv cache read
         # (which happens when the request requires prompt logprobs
@@ -216,6 +229,10 @@ class KVCacheManager:
         # the single last token, because allocate_slots() requires
         # num_computed_tokens to be block-size aligned. Removing this limitation
         # could slightly improve performance in the future.
+        # 为什么 max_cache_hit_length = num_tokens - 1：
+        # 最后一个 token 必须重新经过模型前向计算，因为需要它产生的 logits
+        # 来采样下一个输出 token。如果最后一个 token 也命中缓存，模型就无法
+        # 生成 logits，推理将卡住。减 1 确保至少有一个 token 需要重新计算。
         max_cache_hit_length = request.num_tokens - 1
         computed_blocks, num_new_computed_tokens = (
             self.coordinator.find_longest_cache_hit(
@@ -486,6 +503,11 @@ class KVCacheManager:
         Args:
             request: The request to free the blocks.
         """
+        # 请求完成或被抢占时释放其 KV 缓存块。
+        # 释放流程：协调器将请求持有的所有块归还给块池。
+        # 若启用了前缀缓存，尾部块（序列末尾）会被优先驱逐，
+        # 因为头部块（公共前缀）更可能被其他请求复用。
+        # 逆序释放策略能最大化前缀缓存的命中率。
         self.coordinator.free(request.request_id)
 
     def remove_skipped_blocks(
@@ -557,6 +579,13 @@ class KVCacheManager:
             list[int]: The number of common prefix blocks for each kv cache
             group.
         """
+        # 级联注意力（Cascade Attention）的公共前缀计算：
+        # 在分布式推理或多模型场景中，多个请求可能共享相同的系统提示或前缀。
+        # 通过识别所有已分配 KV 缓存的请求共同持有的前缀块，调度器可以：
+        # 1. 将公共前缀的计算结果缓存并复用，减少重复计算
+        # 2. 在多 GPU 间共享公共前缀的 KV 缓存，降低通信开销
+        # 判断逻辑：一个块的引用计数（ref_cnt）等于所有持有 KV 缓存的请求数时，
+        # 说明所有请求都持有该块，即为公共前缀块。
         return self.coordinator.get_num_common_prefix_blocks(running_request_id)
 
     def take_events(self) -> list[KVCacheEvent]:
@@ -612,6 +641,12 @@ class KVCacheManager:
 
     def take_new_block_ids(self) -> list[int]:
         """Drain and return new attention block IDs for zeroing."""
+        # 取出本轮新分配的块 ID，用于清零 GPU 内存。
+        # 当块池从空闲列表中分配新块时，这些块的 GPU 内存中可能残留
+        # 旧数据（来自其他请求的 KV 缓存），如果不清零会导致模型读到
+        # 脏数据，产生错误的注意力计算结果。
+        # 调用方（通常是引擎的执行层）会使用这些 ID 执行 memset(0) 或
+        # 等效的 GPU 内存清零操作，确保新块从干净状态开始写入。
         ids: list[int] = []
         for mgr in self.coordinator.single_type_managers:
             ids.extend(mgr.take_new_block_ids())

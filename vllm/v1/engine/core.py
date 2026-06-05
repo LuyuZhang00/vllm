@@ -102,6 +102,13 @@ class EngineCore:
         executor_fail_callback: Callable | None = None,
         include_finished_set: bool = False,
     ):
+        # 初始化序列遵循严格的依赖顺序:
+        # 1. 插件加载 (load_general_plugins) — 必须最先执行，后续组件可能依赖插件
+        # 2. 模型执行器 (model_executor) — 需要先实例化以进行内存分析
+        # 3. KV 缓存 (_initialize_kv_caches) — 依赖执行器的内存分析结果来分配缓存
+        # 4. 调度器 (scheduler) — 依赖 KV 缓存配置来管理请求调度
+        # 5. 批处理队列 (batch_queue) — 用于流水线并行，消除 pipeline bubble
+
         # plugins need to be loaded at the engine/scheduler level too
         from vllm.plugins import load_general_plugins
 
@@ -188,6 +195,12 @@ class EngineCore:
         # Batch queue for scheduled batches. This enables us to asynchronously
         # schedule and execute batches, and is required by pipeline parallelism
         # to eliminate pipeline bubbles.
+        #
+        # batch_queue 的作用: 流水线并行的批处理队列。
+        # 当 batch_queue_size > 1 时（流水线并行场景），调度和执行可以重叠：
+        # 在等待当前批次 GPU 执行的同时，可以提前调度下一个批次，
+        # 从而消除流水线气泡（pipeline bubble），提高 GPU 利用率。
+        # 队列中每个元素是一个三元组: (采样结果Future, 调度输出, 模型执行Future)
         self.batch_queue_size = self.model_executor.max_concurrent_batches
         self.batch_queue: (
             deque[tuple[Future[ModelRunnerOutput], SchedulerOutput, Future[Any]]] | None
@@ -213,6 +226,10 @@ class EngineCore:
                 hash_block_size, caching_hash_fn
             )
 
+        # step_fn 的选择: 根据是否启用批处理队列选择不同的步进函数。
+        # - step(): 普通模式，调度→执行→采样→更新 串行执行
+        # - step_with_batch_queue(): 流水线并行模式，调度和执行可以重叠，
+        #   通过批处理队列实现异步调度，消除流水线气泡
         self.step_fn = (
             self.step if self.batch_queue is None else self.step_with_batch_queue
         )
@@ -357,6 +374,12 @@ class EngineCore:
         `request_wave`: indicate which wave of requests this is expected to
         belong to in DP case
         """
+        # 请求验证流程:
+        # 1. 验证 request_id 类型必须为字符串
+        # 2. 验证 pooling 任务是否被模型支持（仅对 pooling 模型）
+        # 3. 验证 KV 传输参数与 KV connector 的一致性
+        # 4. 通过验证后将请求提交给调度器
+
         # Validate the request_id type.
         if not isinstance(request.request_id, str):
             raise TypeError(
@@ -383,6 +406,10 @@ class EngineCore:
             )
 
         self.scheduler.add_request(request)
+        # abort_immediately 边界情况:
+        # 某些请求在 KV 传输场景下需要立即中止（例如传输失败或资源不足）。
+        # 虽然请求已提交给调度器，但立即中止可以触发 connector 的
+        # request_finished 钩子，释放预分配的 KV 传输资源，避免资源泄漏。
         if request.abort_immediately:
             # Immediately abort so the connector's request_finished hook runs
             # to free any pre-admission KV-transfer resources.
@@ -459,13 +486,27 @@ class EngineCore:
         Returns tuple of outputs and a flag indicating whether the model
         was executed.
         """
+        # 核心调度循环，每个推理步执行以下流程:
+        # 1. schedule(): 调度器从等待队列中选取请求，分配 KV 缓存块，生成调度输出
+        # 2. execute_model(non_block=True): 异步提交模型前向计算到 GPU，
+        #    non_block=True 表示不等待 GPU 计算完成，立即返回 Future 对象
+        # 3. get_grammar_bitmask(): 在 GPU 执行期间，CPU 端并行计算结构化输出的
+        #    grammar 位图，用于约束 token 采样。这实现了 CPU-GPU 重叠（overlap）
+        # 4. future.result(): 等待 GPU 执行完成，获取模型输出
+        # 5. sample_tokens(): 使用 grammar 位图约束采样，生成输出 token
+        # 6. update_from_output(): 更新调度器状态（完成请求、释放 KV 缓存等）
 
         # Check for any requests remaining in the scheduler - unfinished,
         # or finished and not yet removed from the batch.
         if not self.scheduler.has_requests():
             return {}, False
         scheduler_output = self.scheduler.schedule()
+        # non_block=True: 异步执行，不阻塞当前线程，允许 CPU 在 GPU 计算期间
+        # 执行其他工作（如计算 grammar 位图），实现 CPU-GPU 并行
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
+        # grammar 位图计算与 GPU 执行重叠:
+        # 在 GPU 执行模型前向计算的同时，CPU 端计算结构化输出约束的位图，
+        # 两者并行执行，最大化硬件利用率
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
         with (
             self.log_error_detail(scheduler_output),
@@ -510,6 +551,15 @@ class EngineCore:
         batch in the job queue is finished.
         3. Update the scheduler from the output.
         """
+        # 流水线并行的批处理队列逻辑:
+        # 与普通 step() 的串行模式不同，这里通过批处理队列实现调度和执行的重叠。
+        # 核心思想是: 当队列未满时，优先填充队列（调度新批次）而非等待结果，
+        # 从而让 GPU 始终有工作可做，消除流水线气泡。
+        #
+        # 工作流程:
+        # 1. 如果队列未满 → 调度新批次，提交 GPU 执行，入队，立即返回 None（不等待结果）
+        # 2. 如果队列已满 → 从队列尾部取出最早的结果，等待完成后更新调度器
+        # 3. 这样调度和执行在时间上重叠，GPU 利用率更高
 
         batch_queue = self.batch_queue
         assert batch_queue is not None
@@ -551,6 +601,9 @@ class EngineCore:
             if not deferred_scheduler_output:
                 # Add this step's future to the queue.
                 batch_queue.appendleft((future, scheduler_output, exec_future))
+                # 队列未满时不等待结果: 如果队列还有空位且最早的批次尚未完成，
+                # 直接返回 None 让调用者尽快再次调用本方法来调度更多批次，
+                # 实现"调度优先于等待"的策略，最大化流水线并行度
                 if (
                     model_executed
                     and len(batch_queue) < self.batch_queue_size
@@ -872,6 +925,13 @@ class EngineShutdownState(IntEnum):
 
 class EngineCoreProc(EngineCore):
     """ZMQ-wrapper for running EngineCore in background process."""
+    # 多进程引擎包装器:
+    # 将 EngineCore 运行在独立的后台进程中，通过 ZMQ 消息队列与前端进程通信。
+    # 这种设计的好处:
+    # 1. GIL 释放: ZMQ socket IO 和序列化/反序列化在独立线程中执行，
+    #    释放 GIL 让 GPU 计算与网络 IO 可以重叠
+    # 2. 进程隔离: 引擎崩溃不会影响 API 服务进程
+    # 3. 数据并行: 通过 ZMQ 实现多个 EngineCore 进程间的协调
 
     ENGINE_CORE_DEAD = b"ENGINE_CORE_DEAD"
     addresses: EngineZmqAddresses
@@ -889,6 +949,12 @@ class EngineCoreProc(EngineCore):
         *,
         engine_index: int = 0,
     ):
+        # ZMQ 通信机制:
+        # 使用 ZMQ 作为跨进程通信层，通过 input_queue 和 output_queue
+        # 在 ZMQ 线程和主事件循环之间解耦。
+        # - input_queue: ZMQ 接收线程将请求放入，主循环取出处理
+        # - output_queue: 主循环将结果放入，ZMQ 发送线程取出发送
+        # 这种设计使得 ZMQ socket IO（释放 GIL）与 GPU 计算可以并行执行
         self.input_queue = queue.Queue[tuple[EngineCoreRequestType, Any]]()
         self.output_queue = queue.Queue[tuple[int, EngineCoreOutputs] | bytes]()
         executor_fail_callback = lambda: self.input_queue.put_nowait(
@@ -953,6 +1019,10 @@ class EngineCoreProc(EngineCore):
             # and to overlap some serialization/deserialization with the
             # model forward pass.
             # Threads handle Socket <-> Queues and core_busy_loop uses Queue.
+            # ZMQ 通信的后台线程架构:
+            # - input_thread: 从 ZMQ socket 读取请求，反序列化后放入 input_queue
+            # - output_thread: 从 output_queue 取出结果，序列化后通过 ZMQ socket 发送
+            # 这些线程释放 GIL，使得 ZMQ IO 与 GPU 计算可以真正并行执行
             ready_event = threading.Event()
             input_thread = threading.Thread(
                 target=self.process_input_sockets,

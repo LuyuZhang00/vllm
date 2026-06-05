@@ -34,6 +34,10 @@ logger = init_logger(__name__)
 
 
 class InputProcessor:
+    # InputProcessor 是 vLLM 引擎的输入处理入口，负责将用户传入的原始 prompt
+    # 转换为引擎核心可调度的 EngineCoreRequest 对象。
+    # 它串联了参数校验、分词、多模态特征提取、缓存管理等关键步骤。
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -59,6 +63,9 @@ class InputProcessor:
         self.mm_encoder_cache_size = 0
         self.skip_prompt_length_check = False
         if self.supports_mm_inputs:
+            # MultiModalBudget 根据模型配置和多模态注册表，计算编码器缓存的大小。
+            # 编码器缓存用于存储多模态编码器输出（如图像 embedding），
+            # 这样相同多模态输入可复用编码结果，避免重复计算。
             mm_budget = MultiModalBudget(vllm_config, mm_registry)
             self.mm_encoder_cache_size = mm_budget.encoder_cache_size
             self.skip_prompt_length_check = (
@@ -185,6 +192,11 @@ class InputProcessor:
         mm_hashes: dict[str, list[str]],
         mm_kwargs: dict[str, list],
     ) -> None:
+        # 将已经由外部（如前端）预处理完成的多模态 kwargs 注入缓存。
+        # 场景：当前端已通过 HF 处理器完成了多模态张量的预处理并传输到后端时，
+        # 需要手动将结果写入缓存，以保证缓存命中率统计的准确性，
+        # 并避免后续相同多模态输入的重复处理开销。
+
         """Inject pre-processed mm_kwargs into the processor cache.
 
         Call this when mm_kwargs have already been through the HF processor
@@ -253,6 +265,15 @@ class InputProcessor:
         data_parallel_rank: int | None = None,
         resumable: bool = False,
     ) -> EngineCoreRequest:
+        # 输入预处理主流程，将用户 prompt 转换为引擎核心可调度的 EngineCoreRequest。
+        # 流水线步骤：
+        #   1. 参数校验（SamplingParams / PoolingParams 合法性、LoRA 配置）
+        #   2. 对 Encoder-Decoder 模型，将输入拆分为 encoder 和 decoder 两部分
+        #      （split_enc_dec_input），分别校验，因为编码器和解码器有各自独立的
+        #      序列长度限制和输入格式要求
+        #   3. 分词 / 处理 prompt_embeds
+        #   4. 处理多模态特征：按位置排序、合并、生成唯一标识符
+        #   5. 构建并返回 EngineCoreRequest 对象
         self._validate_params(params, supported_tasks)
         self._validate_lora(lora_request)
 
@@ -436,6 +457,13 @@ class InputProcessor:
         prompt_input: SingletonInput,
         prompt_type: Literal["encoder", "decoder"],
     ) -> None:
+        # 校验单个模型输入（encoder 或 decoder）的合法性，包含三方面：
+        #   1. prompt 长度校验：确保不超过 max_model_len（decoder）
+        #      或 mm_encoder_cache_size（encoder，即多模态编码器缓存上限）
+        #   2. 多模态嵌入大小校验：确保每个模态项的 embedding 数量不超过预分配的
+        #      编码器缓存，避免运行时 OOM
+        #   3. 词汇表校验：取分词器 vocab size 和模型 vocab size 的较大值作为
+        #      有效词汇表范围，兼容 Qwen3 等两者不一致的模型
         model_config = self.model_config
         tokenizer = self.tokenizer
 
