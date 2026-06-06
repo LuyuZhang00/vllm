@@ -620,10 +620,10 @@ DeepSeek V4 是一个 Mixture-of-Experts (MoE) 模型，具有以下特点：
 | 特性 | 值 |
 |------|-----|
 | 模型类型 | MoE + MLA (Multi-head Latent Attention) |
-| 逻辑专家数 | 256 |
+| 逻辑专家数 | 384 |
 | 冗余专家数 | 32 (用于负载均衡) |
-| 物理专家数 | 256 + 32 = 288 |
-| 每 token 激活专家 | 8 (Top-8 路由) |
+| 物理专家数 | 384 + 32 = 416 |
+| 每 token 激活专家 | 6 (Top-6 路由) |
 | KV Cache 格式 | MLA 压缩表示 (576 维/token) |
 | 注意力类型 | MLA + 滑动窗口 (混合) |
 
@@ -727,7 +727,7 @@ DeepSeek V4 的多级多卡推理采用多种并行策略的组合：
 │  └────┬───┘ └────┬───┘ └────┬───┘      └────┬───┘              │
 │       │          │          │                │                   │
 │  Level 2: Expert Parallelism (EP=16 = TP×DP)                    │
-│  每个 GPU 持有 288/16 = 18 个物理专家                             │
+│  每个 GPU 持有 416/16 = 26 个物理专家                             │
 │  All-to-All 通信: DeepEP low_latency                            │
 │                                                                  │
 │  Level 3: Tensor Parallelism (TP=1, 每 DP rank 独立)             │
@@ -814,7 +814,7 @@ MoE 模型的 token 路由通常不均匀，EPLB 动态重分配专家：
 
 EPLB 解决方案:
   复制热点专家: 专家 0 → 专家 0 (GPU 0) + 专家 0' (GPU 1)
-  每个 GPU 持有 288/32 = 9 个物理专家 (含冗余)
+  每个 GPU 持有 416/32 = 13 个物理专家 (含冗余)
 
 配置:
   --eplb-config '{
