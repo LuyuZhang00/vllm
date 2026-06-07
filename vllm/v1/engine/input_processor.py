@@ -1,6 +1,37 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+# =============================================================================
+# 模块概述: vLLM v1 引擎的输入处理器 (Input Processor)
+# =============================================================================
+# 本模块负责将用户传入的原始 prompt 转换为引擎核心可调度的 EngineCoreRequest。
+#
+# 核心组件:
+#   - InputProcessor: 输入处理的主类，串联参数校验、分词、多模态特征提取等步骤
+#   - InputPreprocessor: 底层预处理器，负责实际的分词和输入格式转换
+#
+# 处理流程 (process_inputs):
+#   1. 参数校验: 验证 SamplingParams / PoolingParams 的合法性
+#   2. LoRA 校验: 验证 LoRA 适配器配置
+#   3. 输入预处理: 将 prompt 转换为 token IDs 或 prompt_embeds
+#      - 文本输入: 通过 tokenizer 分词
+#      - 多模态输入: 提取图像/音频特征，生成 mm_features
+#      - Encoder-Decoder 模型: 拆分为 encoder 和 decoder 两部分
+#   4. 平台验证: 调用平台特定的验证逻辑
+#   5. 输入校验: 检查 prompt 长度、词汇表范围等
+#   6. 构建 EngineCoreRequest: 组装所有信息为最终请求对象
+#
+# 多模态处理:
+#   - MultiModalFeatureSpec: 多模态特征规范，包含数据、模态类型、位置、哈希等
+#   - mm_hashes: 用于多模态缓存的唯一标识，相同哈希的特征可以复用
+#   - argsort_mm_positions: 按位置排序多模态特征，确保正确的序列顺序
+#
+# 设计要点:
+#   - process_inputs 在 Input 守护线程中调用，与 GPU 模型前向计算并行执行
+#   - 多模态特征通过哈希进行缓存，避免相同图片的重复编码
+#   - 请求 ID 在此处分配，添加随机后缀确保唯一性
+# =============================================================================
+
 import time
 from collections.abc import Mapping
 from typing import Any, Literal
@@ -265,6 +296,43 @@ class InputProcessor:
         data_parallel_rank: int | None = None,
         resumable: bool = False,
     ) -> EngineCoreRequest:
+        # 输入预处理主流程，将用户 prompt 转换为引擎核心可调度的 EngineCoreRequest。
+        #
+        # 完整流水线:
+        #   步骤 1 - 参数校验:
+        #     验证 SamplingParams / PoolingParams 的合法性，
+        #     包括模型是否支持生成/池化任务、参数值范围等。
+        #
+        #   步骤 2 - LoRA 校验:
+        #     验证 LoRA 适配器配置是否与引擎配置一致。
+        #
+        #   步骤 3 - 输入预处理:
+        #     根据输入类型选择不同的处理路径:
+        #     - EngineInput (已处理): 直接使用，跳过分词
+        #     - PromptType (原始输入): 通过 InputPreprocessor 分词/预处理
+        #     对于 Encoder-Decoder 模型，将输入拆分为 encoder 和 decoder 两部分，
+        #     因为编码器和解码器有各自独立的序列长度限制和输入格式要求。
+        #
+        #   步骤 4 - 平台验证:
+        #     调用平台特定的验证逻辑（如 CUDA 设备检查）。
+        #
+        #   步骤 5 - 采样参数处理:
+        #     克隆 SamplingParams 以避免修改原始对象，
+        #     设置默认 max_tokens、更新 generation config 等。
+        #
+        #   步骤 6 - 多模态特征处理:
+        #     对于多模态输入（图像、音频等）:
+        #     - 按位置排序多模态特征（argsort_mm_positions）
+        #     - 生成唯一标识符（mm_hash）用于缓存
+        #     - 构建 MultiModalFeatureSpec 列表
+        #
+        #   步骤 7 - 输入校验:
+        #     检查 prompt 长度是否超过 max_model_len，
+        #     检查 token ID 是否在词汇表范围内。
+        #
+        #   步骤 8 - 构建 EngineCoreRequest:
+        #     组装所有信息为最终请求对象，包括 token IDs、多模态特征、
+        #     采样参数、到达时间、优先级等。
         # 输入预处理主流程，将用户 prompt 转换为引擎核心可调度的 EngineCoreRequest。
         # 流水线步骤：
         #   1. 参数校验（SamplingParams / PoolingParams 合法性、LoRA 配置）

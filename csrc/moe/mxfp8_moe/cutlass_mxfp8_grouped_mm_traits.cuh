@@ -3,6 +3,14 @@
 // Adapted from SGLang:
 // https://github.com/sgl-project/sglang/blob/ded068a76e00878881d52d5bfb791e0f60d7311b/sgl-kernel/csrc/expert_specialization/es_sm100_mxfp8_blockscaled_traits.cuh
 
+// =============================================================================
+// 中文注释：MXFP8 分组 GEMM CUTLASS 特征定义
+//
+// 本文件定义了 MXFP8 分组矩阵乘法的 CUTLASS 特征（Traits），
+// 包括数据类型、布局、MMA 指令、流水线策略等。
+// 这些特征决定了 CUTLASS 如何组织计算和内存访问。
+// =============================================================================
+
 #pragma once
 
 // Misc

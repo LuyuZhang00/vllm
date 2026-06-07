@@ -1,5 +1,30 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# ===========================================================================
+# 中文注释：本模块是 vLLM V1 引擎中 Mamba 状态管理的核心工具模块。
+#
+# 背景知识：
+#   Mamba 是一种状态空间模型（SSM），与 Transformer 的 KV cache 不同，
+#   Mamba 维护的是"状态张量"（conv 状态和 temporal 状态）。
+#   在 vLLM 的分页缓存机制下，Mamba 的状态也被组织成逻辑块（block），
+#   通过 block table 映射到物理显存中的位置。
+#
+# 本模块的核心功能：
+#   1. preprocess_mamba：在模型前向计算之前，将 Mamba 状态从旧的 block
+#      位置拷贝到新的 block 位置（因为 block 分配可能发生变化）。
+#   2. postprocess_mamba_align_gpu：在投机解码（speculative decoding）场景下，
+#      利用融合的 Triton GPU 内核在 GPU 上完成状态拷贝和后处理，
+#      避免 CPU-GPU 同步开销。
+#   3. 各种 stage_*_to_gpu 函数：将 CPU 端的元数据（如 block 索引、
+#      调度 token 数等）通过 pinned memory 拷贝到 GPU，供 Triton 内核使用。
+#
+# 关键概念：
+#   - Mamba state：包括 conv_state（卷积状态，滑动窗口）和 temporal_state
+#     （时序状态），两者有不同的拷贝逻辑。
+#   - block table：逻辑块到物理块的映射表，与 Transformer 的 KV cache
+#     使用相同的分页管理机制。
+#   - align 模式：Mamba 缓存的一种对齐策略，配合投机解码使用。
+# ===========================================================================
 import dataclasses
 import itertools
 from collections.abc import Callable
@@ -23,6 +48,22 @@ from vllm.v1.worker.lora_model_runner_mixin import GPUInputBatch
 
 
 @triton.jit
+# 中文注释：融合后处理 Triton GPU 内核。
+# 该内核在一个 kernel 中同时完成两件事：(1) 判断是否需要拷贝 Mamba 状态；
+# (2) 如果需要，直接在 GPU 上执行状态拷贝。
+# 这样完全避免了 CPU-GPU 同步，大幅降低了投机解码场景下的延迟。
+#
+# Grid 维度：(num_reqs, num_layers * num_state_types)
+#   - program_id(0) = 请求索引（每个请求一个线程块行）
+#   - program_id(1) = 状态索引（展平的 layer_idx * num_state_types + state_type_idx）
+#
+# 内核执行流程：
+#   Step 1：读取该请求的接受 token 数、当前状态所在 block 索引、
+#           调度 token 数、已计算 token 数、草稿 token 数。
+#   Step 2：计算新的已对齐的已计算 token 数，判断是否需要拷贝。
+#   Step 3：根据 conv 状态或 temporal 状态，计算源地址和目标地址。
+#   Step 4：执行内存拷贝（逐 COPY_BLOCK_SIZE 字节拷贝）。
+#   Step 5：特殊处理 src==dst 的情况，将 num_accepted_tokens 更新为 1。
 def postprocess_mamba_fused_kernel(
     # Decision inputs (per-request)
     num_accepted_tokens_ptr,
@@ -65,6 +106,8 @@ def postprocess_mamba_fused_kernel(
     because the kernel indexes directly into pre-flattened metadata arrays
     using program_id(1). The grid dimensions encode the total state count.
     """
+    # 中文注释：req_idx 标识当前线程处理的是哪个请求。
+    # state_idx 标识当前线程处理的是该请求的哪个 Mamba 状态层/类型。
     req_idx = tl.program_id(0)
     state_idx = tl.program_id(1)
 
@@ -72,13 +115,25 @@ def postprocess_mamba_fused_kernel(
     if req_idx >= num_reqs:
         return
 
-    # Compute decision logic (mirrors postprocess_mamba Python reference)
+    # 中文注释：Step 1 - 读取该请求的关键调度参数。
+    # num_accepted: 投机解码中被接受的 token 数量
+    # src_block_idx: 当前 Mamba 运行状态所在的 block 索引
+    # num_scheduled: 本轮调度的 token 数
+    # num_computed: 已经完成计算的 token 数
+    # num_draft: 草稿 token 数（投机解码中草稿模型生成的候选 token）
     num_accepted = tl.load(num_accepted_tokens_ptr + req_idx)
     src_block_idx = tl.load(mamba_state_idx_ptr + req_idx)
     num_scheduled = tl.load(num_scheduled_tokens_ptr + req_idx)
     num_computed = tl.load(num_computed_tokens_ptr + req_idx)
     num_draft = tl.load(num_draft_tokens_ptr + req_idx)
 
+    # 中文注释：Step 2 - 计算判断是否需要拷贝的逻辑。
+    # num_tokens_running_state：当前运行状态实际覆盖的 token 位置
+    #   = num_computed + num_scheduled - num_draft
+    #   （减去 draft 是因为 draft token 可能被拒绝，状态不应包含它们）
+    # new_num_computed：接受 accept 个 token 后，新的已计算位置
+    # aligned_new_computed：向下对齐到 block_size 边界
+    # 如果对齐后的位置 >= 当前运行状态位置，说明需要将状态拷贝到新 block
     num_tokens_running_state = num_computed + num_scheduled - num_draft
     new_num_computed = num_tokens_running_state + num_accepted - 1
     aligned_new_computed = (new_num_computed // block_size) * block_size
@@ -88,11 +143,15 @@ def postprocess_mamba_fused_kernel(
     if not needs_copy:
         return
 
-    # Compute copy parameters
+    # 中文注释：Step 3 - 计算拷贝参数。
+    # accept_token_bias：目标 block 内的偏移量，表示从源状态的哪个位置开始拷贝
+    # dest_block_idx：目标 block 索引，即新状态应保存到哪个 block
     accept_token_bias = aligned_new_computed - num_tokens_running_state
     dest_block_idx = aligned_new_computed // block_size - 1
 
-    # Load state metadata for this layer/state_type
+    # 中文注释：Step 4 - 加载当前 state_idx 对应的 Mamba 状态元数据。
+    # 这些元数据在 initialize_from_forward_context 中预先计算并存储在 GPU 上，
+    # 因此内核可以直接读取，无需 CPU 参与。
     state_base_addr = tl.load(state_base_addrs_ptr + state_idx)
     state_block_stride = tl.load(state_block_strides_ptr + state_idx)
     state_elem_size = tl.load(state_elem_sizes_ptr + state_idx)
@@ -106,6 +165,9 @@ def postprocess_mamba_fused_kernel(
 
     # block_table_ptrs_ptr holds one pointer per group (each group owns its own
     # block table). Reinterpret as int32* since block ids are int32.
+    # 中文注释：通过 group 索引找到该 group 的 block table 基地址，
+    # 然后用 req_idx * stride 定位到该请求的 block table 行。
+    # 这样可以通过 block table 查到逻辑 block 对应的物理 block 地址。
     group_base_addr = tl.load(block_table_ptrs_ptr + group_idx)
     block_table_typed = group_base_addr.to(tl.pointer_type(tl.int32))
     block_table_base = block_table_typed + req_idx * block_table_stride_req
@@ -113,12 +175,19 @@ def postprocess_mamba_fused_kernel(
     # Widen block ids to int64 before they reach `block_id * state_block_stride`
     # below: state_block_stride can exceed 2**31 bytes for large mamba caches,
     # and Triton would otherwise do the multiply in int32 and wrap.
+    # 中文注释：从 block table 中加载源和目标的物理 block id。
+    # 必须转为 int64，因为 state_block_stride 可能很大（超过 2^31 字节），
+    # int32 乘法会溢出。
     src_block_id = tl.load(block_table_base + src_block_idx).to(tl.int64)
     dest_block_id = tl.load(block_table_base + dest_block_idx).to(tl.int64)
 
     # Compute source and destination addresses based on state type
     # conv_width > 0 means this is a conv state (get_conv_copy_spec logic)
     # conv_width == 0 means this is a temporal state (get_temporal_copy_spec logic)
+    # 中文注释：Step 5 - 根据状态类型（conv / temporal）计算源地址和目标地址。
+    # conv 状态（conv_width > 0）：卷积状态，使用滑动窗口，拷贝时需要考虑
+    #   accept_token_bias 偏移，拷贝部分窗口内容。
+    # temporal 状态（conv_width == 0）：时序状态，拷贝整个 block 的数据。
     is_conv_state = conv_width > 0
 
     if is_conv_state:
@@ -126,6 +195,11 @@ def postprocess_mamba_fused_kernel(
         #   state[block_table[req_idx, src_block_idx],  accept_token_bias:]
         # to
         #   state[block_table[req_idx, dest_block_idx], :conv_width - accept_token_bias]
+        # 中文注释：conv 状态拷贝逻辑：
+        #   源地址 = 状态基地址 + 物理block偏移 + accept_token_bias * inner_size * elem_size
+        #   目标地址 = 状态基地址 + 物理block偏移
+        #   拷贝大小 = (conv_width - accept_token_bias) * inner_size * elem_size
+        # 本质上是将滑动窗口中"未来"的部分拷贝到新 block 的开头。
         src_offset = accept_token_bias.to(tl.int64) * state_inner_size * state_elem_size
         src_addr = state_base_addr + src_block_id * state_block_stride + src_offset
         dst_addr = state_base_addr + dest_block_id * state_block_stride
@@ -140,6 +214,12 @@ def postprocess_mamba_fused_kernel(
         #   state[block_table[req_idx, src_block_idx + accept_token_bias]]
         # to
         #   state[block_table[req_idx, dest_block_idx]]
+        # 中文注释：temporal 状态拷贝逻辑：
+        #   源 block 索引 = src_block_idx + accept_token_bias
+        #   源和目标都是完整的一个 block 数据。
+        #   注意：使用 inner_size * elem_size 作为拷贝大小，而非 state_block_stride，
+        #   因为 state_block_stride 是 page stride（可能包含 padding），
+        #   而实际数据大小是 inner_size * elem_size。
         actual_src_block_idx = src_block_idx + accept_token_bias
         actual_src_block_id = tl.load(block_table_base + actual_src_block_idx).to(
             tl.int64
@@ -155,15 +235,23 @@ def postprocess_mamba_fused_kernel(
     #     if src_block_idx == dest_block_idx: num_accepted_tokens_cpu[i] = 1
     # This runs whether or not the copy below is skipped (it's per-request, so
     # only state_idx == 0 writes).
+    # 中文注释：特殊处理 src==dst 的情况。
+    # 当源 block 和目标 block 相同时，不需要拷贝（数据已在正确位置），
+    # 但需要将 num_accepted_tokens 设为 1（标记为已处理）。
+    # 只让 state_idx==0 的线程执行写入，避免多个线程竞争写同一地址。
     if src_block_idx == dest_block_idx and state_idx == 0:
         tl.store(num_accepted_tokens_out_ptr + req_idx, 1)
 
     # Mirror collect_mamba_copy_meta's early return: src==dst with no token
     # bias means source and destination ranges coincide, so the copy is a
     # no-op.
+    # 中文注释：当 src==dst 且 accept_token_bias==0 时，源和目标完全重叠，
+    # 拷贝是空操作，直接返回。
     if src_block_idx == dest_block_idx and accept_token_bias == 0:
         return
 
+    # 中文注释：Step 6 - 执行内存拷贝。
+    # 按 COPY_BLOCK_SIZE（1024 字节）为单位逐段拷贝，使用 mask 处理尾部不足一块的情况。
     offsets = tl.arange(0, COPY_BLOCK_SIZE)
     for i in range(0, copy_size, COPY_BLOCK_SIZE):
         mask = (i + offsets) < copy_size

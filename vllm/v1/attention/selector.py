@@ -1,5 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+#
+# 整体说明：Attention 后端选择器
+# ===========================================
+# 本文件负责根据当前平台（CUDA/ROCm/XPU 等）和配置参数，选择合适的 Attention 后端实现。
+# 核心流程如下：
+#   1. get_attn_backend() 是主入口函数，被外部调用以获取 attention 后端类。
+#   2. 它先从 vllm 全局配置中收集各种参数（head_size、dtype、block_size 等），
+#      封装为 AttentionSelectorConfig（一个 NamedTuple，便于作为缓存 key）。
+#   3. 然后调用 _cached_get_attn_backend()，该函数使用 @cache 装饰器进行结果缓存，
+#      避免每次调用都重复进行平台检测和后端选择。
+#   4. 在缓存函数内部，通过 current_platform.get_attn_backend_cls() 让平台对象
+#      根据具体配置选择后端类路径，再通过 resolve_obj_by_qualname() 动态导入。
+#   5. 如果选定的后端对 KV cache 布局有特殊要求（如 NHD 或 HND），会通过
+#      set_kv_cache_layout() 设置全局布局。
+#
+# 此外还提供了 get_mamba_attn_backend() 用于选择 Mamba 类（非标准 attention）的后端。
 
 from functools import cache
 from typing import NamedTuple, cast, get_args
@@ -18,6 +34,23 @@ from vllm.v1.attention.backends.registry import (
 logger = init_logger(__name__)
 
 
+# 中文注释：Attention 后端选择器的配置参数集合。
+# 使用 NamedTuple 而非普通 dict 的原因是：NamedTuple 是不可变的且可哈希的，
+# 可以直接作为 @cache 装饰器的函数参数 key，从而实现高效的缓存查找。
+# 这些参数共同决定了应该选择哪个 attention 后端实现：
+#   - head_size: 每个注意力头的维度（如 64、128、256 等）
+#   - dtype: 模型的浮点数据类型（如 float16、bfloat16）
+#   - kv_cache_dtype: KV cache 的数据类型，可能与模型 dtype 不同（如使用 FP8 量化）
+#   - block_size: KV cache 分页管理的块大小，由用户显式指定时才有意义
+#   - use_mla: 是否使用 Multi-head Latent Attention（DeepSeek 风格的压缩 KV）
+#   - has_sink: 是否使用 Sink Attention（保留初始 token 的注意力机制）
+#   - use_sparse: 是否使用稀疏注意力
+#   - use_mm_prefix: 是否使用多模态前缀
+#   - use_per_head_quant_scales: 是否使用逐头量化缩放因子
+#   - attn_type: 注意力类型，默认是 DECODER，也可以是 ENCODER 或 ENCODER_DECODER
+#   - use_non_causal: 是否使用非因果注意力（如 ViT 中的双向注意力）
+#   - use_batch_invariant: 是否要求批处理结果可复现（确定性模式）
+#   - use_kv_connector: 是否使用 KV cache 传输功能（用于分离式 prefill/decode 架构）
 class AttentionSelectorConfig(NamedTuple):
     head_size: int
     dtype: torch.dtype
@@ -51,6 +84,15 @@ class AttentionSelectorConfig(NamedTuple):
         )
 
 
+# 中文注释：获取 Attention 后端类的主入口函数。
+# 这是外部调用者（如 Model Runner 初始化 attention 层时）获取后端实现的入口。
+# 执行流程：
+#   1. 校验 kv_cache_dtype 是否合法（如果指定了的话）。
+#   2. 从全局 vllm_config 中读取 cache_config 和 kv_transfer_config。
+#   3. 如果用户显式指定了 block_size，则记录下来，否则为 None。
+#   4. 将所有参数封装为 AttentionSelectorConfig。
+#   5. 调用 _cached_get_attn_backend() 获取后端类（带缓存）。
+# 返回值是 AttentionBackend 的子类（type，不是实例），由调用方后续实例化。
 def get_attn_backend(
     head_size: int,
     dtype: torch.dtype,
@@ -110,6 +152,15 @@ def get_attn_backend(
     )
 
 
+# 中文注释：带缓存的 attention 后端查找函数。
+# 使用 @cache 装饰器，相同参数组合只会在第一次调用时执行实际的平台检测和后端选择逻辑，
+# 后续调用直接返回缓存结果。这是性能关键路径，因为 attention 后端选择在模型初始化时
+# 会被多个 attention 层反复调用（每个 transformer 层都有自己的 attention）。
+# 内部流程：
+#   1. 通过 current_platform.get_attn_backend_cls() 让当前平台根据配置
+#      返回合适的后端类的全限定名（如 "vllm.v1.attention.backends.flash_attn.FlashAttentionBackend"）。
+#   2. 通过 resolve_obj_by_qualname() 动态导入该类。
+#   3. 如果后端要求特定的 KV cache 布局（如 NHD 或 HND），则设置全局布局。
 @cache
 def _cached_get_attn_backend(
     backend,
@@ -129,7 +180,11 @@ def _cached_get_attn_backend(
         )
     backend = resolve_obj_by_qualname(attention_cls)
 
-    # Adjust kv cache layout if the selected backend requires a specific one
+    # 中文注释：根据选定后端的要求调整 KV cache 的内存布局。
+    # 不同的 attention 后端可能对 KV cache 的维度排列有不同的要求：
+    #   - NHD (NumHeads, HeadDim): 例如 FlashAttention 默认布局
+    #   - HND (Heads, NumTokens, HeadDim): 例如某些 Triton 后端
+    # 如果后端不要求特定布局（返回 None），则使用系统默认布局。
     required_layout = backend.get_required_kv_cache_layout()
     if required_layout is not None:
         from vllm.v1.attention.backends.utils import set_kv_cache_layout
@@ -144,6 +199,9 @@ def _cached_get_attn_backend(
     return backend
 
 
+# 中文注释：获取 Mamba 类注意力后端的入口函数。
+# Mamba 是一种基于状态空间模型（SSM）的序列建模架构，与标准的 Transformer attention 不同。
+# 此函数用于选择 Mamba1、Mamba2、ShortConv、Linear 或 GDN 等非标准注意力后端。
 def get_mamba_attn_backend(
     mamba_type: MambaAttentionBackendEnum,
 ) -> type[AttentionBackend]:
@@ -151,6 +209,9 @@ def get_mamba_attn_backend(
     return _cached_get_mamba_attn_backend(mamba_type)
 
 
+# 中文注释：带缓存的 Mamba 后端查找函数。
+# 与 _cached_get_attn_backend 类似，使用 @cache 避免重复的后端选择逻辑。
+# 如果开启了批处理不变性模式（VLLM_BATCH_INVARIANT），还会检查后端是否支持该特性。
 @cache
 def _cached_get_mamba_attn_backend(
     mamba_type: MambaAttentionBackendEnum,

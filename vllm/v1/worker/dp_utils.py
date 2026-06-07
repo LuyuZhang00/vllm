@@ -1,6 +1,29 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+# ==============================================================================
+# 中文注释：数据并行 (Data Parallel, DP) 协调工具模块
+# ==============================================================================
+#
+# 模块概述：
+#   本模块负责在 vLLM V1 引擎中协调多个数据并行 (DP) rank 之间的批处理决策。
+#   当使用 data parallel 时，每个 DP rank 独立管理一部分请求，但各 rank 需要
+#   通过 all-reduce 通信来统一批处理参数（如 token 数量、是否使用微批处理等），
+#   以确保所有 rank 执行一致的计算步调。
+#
+# 核心功能：
+#   1. DP rank 间同步：通过 all-reduce 交换各 rank 的 token 数量和批处理模式信息。
+#   2. 微批处理 (microbatching/ubatching) 决策：判断所有 rank 是否统一执行微批处理。
+#   3. DP 填充 (DP padding)：当启用 CUDA graph 或微批处理时，将所有 rank 的 token 数
+#      填充到相同的最大值，以确保 CUDA graph 可以在所有 rank 上使用相同的执行图。
+#   4. CUDA graph 模式同步：确保所有 rank 使用一致的 CUDA graph 模式。
+#
+# 关键设计决策：
+#   - 使用 all-reduce 而非广播，因为每个 rank 需要将自己的 token 数告知其他 rank。
+#   - 可选择在 CPU 上执行 all-reduce 以避免引入 GPU 同步点，从而不影响异步调度性能。
+#   - 所有 rank 必须达成一致决策（如是否微批处理），否则会导致死锁或计算错误。
+# ==============================================================================
+
 import torch
 import torch.distributed as dist
 

@@ -19,6 +19,36 @@
  * Adapted from https://github.com/IST-DASLab/marlin
  */
 
+// =============================================================================
+// 中文注释：Marlin MoE WNA16 量化 GEMM 模板实现头文件
+//
+// 本文件包含 Marlin 量化矩阵乘法 kernel 的模板实现。
+// Marlin 是一种高度优化的量化 GEMM 实现，核心设计包括：
+//
+// 1. 权重布局：使用特殊的 4-bit 打包格式（Marlin 格式），使得权重可以
+//    以 128-bit（int4）为单位从全局内存高效加载。
+//
+// 2. 异步预取流水线：使用 cp.async 指令将权重从全局内存异步加载到共享内存，
+//    通过多级流水线（stages）隐藏内存延迟。
+//
+// 3. 分块计算：将矩阵乘法分解为 16x16 的小块，每个 thread block 处理
+//    thread_m_blocks x thread_n_blocks 个 16x16 输出块。
+//
+// 4. 反量化 + 累加：在寄存器中将 4-bit 权重反量化为 fp16/bf16，
+//    然后使用 Tensor Core MMA 指令进行矩阵乘累加。
+//
+// 5. 跨 block 同步：使用 locks 数组实现跨 block 的结果合并，
+//    支持 use_atomic_add 模式避免同步开销。
+//
+// 模板参数说明：
+// - threads: 每个 thread block 的线程数（通常 256）
+// - thread_m_blocks: M 维度的 16x16 块数（batch size 维度）
+// - thread_n_blocks: N 维度的 16x16 块数（输出维度）
+// - thread_k_blocks: K 维度的 16x16 块数（归约维度）
+// - stages: 异步预取流水线级数
+// - group_blocks: 量化组大小（每 group_blocks 个 16x16 块共享一个 scale）
+// =============================================================================
+
 #ifndef MARLIN_NAMESPACE_NAME
   #define MARLIN_NAMESPACE_NAME marlin_moe_wna16
 #endif

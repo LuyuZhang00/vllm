@@ -37,6 +37,8 @@ if TYPE_CHECKING:
 
 
 def _lse_weighted_combine(
+    # CPU 参考实现：LSE 加权合并
+    # 用于测试和验证，纯 PyTorch 实现
     outputs: torch.Tensor,
     lses: torch.Tensor,
     return_lse: bool = False,
@@ -62,14 +64,14 @@ def _lse_weighted_combine(
     """
     N, B, H, D = outputs.shape
 
-    # Handle NaN and inf in LSEs
+    # 处理 LSE 中的 NaN 和 inf
     lses = torch.where(
         torch.isnan(lses) | torch.isinf(lses),
         torch.tensor(float("-inf"), device=lses.device, dtype=lses.dtype),
         lses,
     )
 
-    # Compute max LSE for numerical stability
+    # 计算最大 LSE 以确保数值稳定性
     lse_max, _ = lses.max(dim=0)  # [B, H]
     lse_max = torch.where(
         lse_max == float("-inf"),
@@ -77,7 +79,8 @@ def _lse_weighted_combine(
         lse_max,
     )
 
-    # Compute weights: softmax over the N dimension
+    # 计算权重：在 N 维度上进行 softmax
+    # 根据 LSE 的底数选择 exp 或 exp2
     if is_lse_base_on_e:
         weights = torch.exp(lses - lse_max.unsqueeze(0))  # [N, B, H]
     else:
@@ -90,7 +93,7 @@ def _lse_weighted_combine(
     weight_sum = weights.sum(dim=0, keepdim=True)  # [1, B, H]
     weights = weights / weight_sum.clamp(min=1e-10)  # [N, B, H]
 
-    # Weighted combination: sum over N dimension
+    # 加权合并：在 N 维度上求和
     result = (outputs * weights.unsqueeze(-1)).sum(dim=0)  # [B, H, D]
 
     if return_lse:
@@ -104,6 +107,11 @@ def _lse_weighted_combine(
 
 
 def _dcp_a2a_lse_pack_dim(output_dtype: torch.dtype) -> int:
+    """计算将 fp32 LSE 值打包到输出 dtype 所需的维度数。
+
+    fp16/bf16：需要 2 个维度（每个 16 位）
+    fp32：需要 1 个维度
+    """
     bits = torch.finfo(output_dtype).bits
     if bits == 16:
         return 2
@@ -113,6 +121,8 @@ def _dcp_a2a_lse_pack_dim(output_dtype: torch.dtype) -> int:
 
 
 def _dcp_a2a_send_recv_buffers(
+    # 分配发送和接收缓冲区
+    # 优先使用工作区管理器（避免重复分配），否则回退到 torch.empty
     shape: tuple[int, ...],
     device: torch.device,
     dtype: torch.dtype,
@@ -132,6 +142,9 @@ def _dcp_a2a_send_recv_buffers(
 
 @triton.jit
 def _dcp_a2a_pack_send_kernel(
+    # 打包发送 kernel：将注意力输出和 LSE 值打包到发送缓冲区
+    # 网格维度：(batch, h_per_rank)
+    # 每个程序处理一个 (token, head) 对的打包
     out_ptr,
     lse_ptr,
     send_ptr,
@@ -153,6 +166,7 @@ def _dcp_a2a_pack_send_kernel(
     local_head_idx = tl.program_id(1).to(tl.int64)
     d_offsets = tl.arange(0, HEAD_DIM)
 
+    # 遍历所有 rank，将每个 rank 的输出和 LSE 打包到发送缓冲区
     for rank_idx in tl.static_range(N):
         src_head_idx = rank_idx * H_PER_RANK + local_head_idx
         send_base = (
@@ -161,6 +175,7 @@ def _dcp_a2a_pack_send_kernel(
             + local_head_idx * send_stride_H
         )
 
+        # 复制注意力输出到发送缓冲区
         out_offsets = (
             batch_idx * out_stride_B
             + src_head_idx * out_stride_H
@@ -171,15 +186,18 @@ def _dcp_a2a_pack_send_kernel(
             tl.load(out_ptr + out_offsets),
         )
 
+        # 打包 LSE 值到发送缓冲区（紧跟在输出之后）
         lse_val = tl.load(
             lse_ptr + batch_idx * lse_stride_B + src_head_idx * lse_stride_H
         )
         if LSE_PACK_DIM == 1:
+            # fp32 输出：LSE 直接存储为 1 个 fp32 值
             tl.store(
                 send_ptr + send_base + HEAD_DIM * send_stride_D,
                 lse_val.to(send_ptr.dtype.element_ty),
             )
         else:
+            # fp16/bf16 输出：将 fp32 LSE 拆分为 2 个 16 位值存储
             lse_bits = lse_val.to(tl.uint32, bitcast=True)
             lo = (lse_bits & 0xFFFF).to(tl.uint16)
             hi = ((lse_bits >> 16) & 0xFFFF).to(tl.uint16)
@@ -195,6 +213,9 @@ def _dcp_a2a_pack_send_kernel(
 
 @triton.jit
 def _dcp_a2a_unpack_combine_kernel(
+    # 解包合并 kernel：从接收缓冲区解包输出和 LSE，用 LSE 加权合并
+    # 网格维度：(batch, h_per_rank)
+    # 每个程序处理一个 (token, head) 对的合并
     recv_ptr,
     out_ptr,
     out_lse_ptr,
@@ -217,6 +238,7 @@ def _dcp_a2a_unpack_combine_kernel(
     head_idx = tl.program_id(1).to(tl.int64)
     d_offsets = tl.arange(0, HEAD_DIM)
 
+    # 第一遍：找到所有 rank 的最大 LSE（用于数值稳定性）
     lse_max = -float("inf")
     for rank_idx in tl.static_range(N):
         recv_base = (
@@ -224,16 +246,19 @@ def _dcp_a2a_unpack_combine_kernel(
             + batch_idx * recv_stride_B
             + head_idx * recv_stride_H
         )
+        # 从接收缓冲区解包 LSE 值
         if LSE_PACK_DIM == 1:
             lse_val = tl.load(recv_ptr + recv_base + HEAD_DIM * recv_stride_D).to(
                 tl.float32
             )
         else:
+            # 从 2 个 16 位值重建 fp32 LSE
             lo_raw = tl.load(recv_ptr + recv_base + HEAD_DIM * recv_stride_D)
             hi_raw = tl.load(recv_ptr + recv_base + (HEAD_DIM + 1) * recv_stride_D)
             lo = lo_raw.to(tl.uint16, bitcast=True).to(tl.uint32)
             hi = hi_raw.to(tl.uint16, bitcast=True).to(tl.uint32)
             lse_val = (lo | (hi << 16)).to(tl.float32, bitcast=True)
+        # 处理 NaN 和 inf
         lse_val = tl.where(
             (lse_val != lse_val) | (lse_val == float("inf")),
             -float("inf"),
@@ -241,8 +266,10 @@ def _dcp_a2a_unpack_combine_kernel(
         )
         lse_max = tl.maximum(lse_max, lse_val)
 
+    # 如果所有 LSE 都是 -inf，将 lse_max 设为 0 避免 NaN
     lse_max = tl.where(lse_max == -float("inf"), 0.0, lse_max)
 
+    # 第二遍：计算指数和（用于归一化权重）
     lse_sum = 0.0
     for rank_idx in tl.static_range(N):
         recv_base = (
@@ -275,6 +302,7 @@ def _dcp_a2a_unpack_combine_kernel(
     else:
         global_lse = tl.log2(lse_sum) + lse_max
 
+    # 第三遍：用 LSE 加权合并所有 rank 的输出
     acc = tl.zeros([HEAD_DIM], dtype=tl.float32)
     for rank_idx in tl.static_range(N):
         recv_base = (
@@ -318,6 +346,7 @@ def _dcp_a2a_unpack_combine_kernel(
 
 
 def _dcp_a2a_pack_send(
+    # Python 封装：启动打包发送 kernel
     cp_attn_out: torch.Tensor,
     cp_attn_lse: torch.Tensor,
     send_buffer: torch.Tensor,
@@ -348,6 +377,7 @@ def _dcp_a2a_pack_send(
 
 
 def _dcp_a2a_unpack_combine(
+    # Python 封装：启动解包合并 kernel
     recv_buffer: torch.Tensor,
     head_dim: int,
     lse_pack_dim: int,
@@ -391,6 +421,9 @@ def _dcp_a2a_unpack_combine(
 
 
 def dcp_a2a_lse_reduce(
+    # DCP All-to-All LSE 归约的统一入口函数
+    # 将部分注意力输出和 LSE 值打包，通过 All-to-All 通信交换，
+    # 然后解包并用 LSE 加权合并得到最终输出
     cp_attn_out: torch.Tensor,
     cp_attn_lse: torch.Tensor,
     cp_group: GroupCoordinator,
@@ -418,6 +451,7 @@ def dcp_a2a_lse_reduce(
     """
     world_size = cp_group.world_size
 
+    # 单 rank 时直接返回
     if world_size == 1:
         if return_lse:
             return cp_attn_out, cp_attn_lse
@@ -427,14 +461,17 @@ def dcp_a2a_lse_reduce(
     if H % world_size != 0:
         raise ValueError(f"H={H} must be divisible by DCP world size {world_size}.")
     H_per_rank = H // world_size
+    # 计算 LSE 打包维度（fp16=2, fp32=1）
     lse_pack_dim = _dcp_a2a_lse_pack_dim(cp_attn_out.dtype)
 
+    # 分配发送和接收缓冲区
     send_buffer, recv_buffer = _dcp_a2a_send_recv_buffers(
         (world_size, B, H_per_rank, D + lse_pack_dim),
         device=cp_attn_out.device,
         dtype=cp_attn_out.dtype,
     )
 
+    # 步骤 1：将输出和 LSE 打包到发送缓冲区
     _dcp_a2a_pack_send(
         cp_attn_out,
         cp_attn_lse,
@@ -445,6 +482,8 @@ def dcp_a2a_lse_reduce(
         lse_pack_dim,
     )
 
+    # 步骤 2：执行 All-to-All 通信（异步）
+    # 每个 rank 将自己的数据发送到所有其他 rank，同时接收所有 rank 的数据
     work = dist.all_to_all_single(
         recv_buffer.view(-1),
         send_buffer.view(-1),
@@ -453,6 +492,7 @@ def dcp_a2a_lse_reduce(
     )
     work.wait()
 
+    # 步骤 3：从接收缓冲区解包并用 LSE 加权合并
     return _dcp_a2a_unpack_combine(
         recv_buffer, D, lse_pack_dim, return_lse, is_lse_base_on_e
     )

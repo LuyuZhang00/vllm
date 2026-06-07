@@ -1,4 +1,35 @@
 // copied from https://github.com/ggerganov/llama.cpp/blob/b2899/ggml-cuda/mmq.cu
+
+// =============================================================================
+// 中文注释: GGUF 量化矩阵-矩阵乘法 kernel (MMQ)
+// =============================================================================
+// 本文件实现了量化权重矩阵与量化激活矩阵的乘法 (Matrix-Matrix Multiplication)。
+// 与 mmvq.cuh 中的矩阵-向量乘法不同，这里处理 M > 1 的情况 (prefill 阶段)。
+//
+// 算法流程:
+//   1. 将量化权重矩阵 X 和量化激活矩阵 Y 的 tile 加载到共享内存
+//   2. 在共享内存中进行反量化和点积计算
+//   3. 通过 warp 归约得到部分和，写回全局内存
+//
+// 模板参数:
+//   scalar_t: 输出数据类型
+//   qk: 量化 block 大小
+//   qr: 反量化比率
+//   qi: 每个 int32 中的量化值数量
+//   need_sum: 是否需要计算 sum (某些量化格式需要)
+//   block_q_t: 量化 block 数据结构
+//   mmq_x/mmq_y: tile 大小 (以 warp 为单位)
+//   nwarps: warp 数量
+//   allocate_tiles: 共享内存分配函数
+//   load_tiles: tile 加载函数
+//   vdr: 每次迭代处理的量化值数量
+//   vec_dot: 量化向量点积函数
+//
+// 与 MMVQ 的区别:
+//   - MMVQ (M=1): 每个 warp 处理一行，适合 decode 阶段
+//   - MMQ (M>1): 使用 tile 优化，适合 prefill 阶段
+// =============================================================================
+
 template <typename scalar_t, int qk, int qr, int qi, bool need_sum, typename block_q_t, int mmq_x, int mmq_y, int nwarps,
               allocate_tiles_cuda_t allocate_tiles, load_tiles_cuda_t load_tiles, int vdr, vec_dot_q_mul_mat_cuda_t vec_dot>
 static __device__ __forceinline__ void mul_mat_q(

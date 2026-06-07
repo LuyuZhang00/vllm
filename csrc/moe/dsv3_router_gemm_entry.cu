@@ -18,6 +18,25 @@
  * limitations under the License.
  */
 
+// =============================================================================
+// 中文注释：DeepSeek V3 Router GEMM 入口文件
+//
+// 本文件是 DSV3 Router GEMM 算子的调度入口，负责：
+// 1. 参数校验（维度、数据类型、SM 版本等）
+// 2. 根据 num_tokens（1~16）和 num_experts（256 或 384）分发到对应的
+//    模板实例（router_gemm_kernel_float_output 或 router_gemm_kernel_bf16_output）
+//
+// DSV3 Router GEMM 计算：output = mat_a @ mat_b.T
+//   mat_a: [num_tokens, hidden_dim] in bf16 — token 隐藏状态
+//   mat_b: [num_experts, hidden_dim] in bf16 — 路由权重矩阵
+//   output: [num_tokens, num_experts] in bf16 或 fp32 — 路由得分
+//
+// 设计特点：
+// - 使用编译期模板参数消除运行时开销（kNumTokens, kNumExperts, kHiddenDim）
+// - 通过 LoopUnroller 在编译期展开 num_tokens 的 dispatch 循环
+// - 要求 SM >= 90（Hopper 或更新架构），使用 PDL 优化 kernel 间依赖
+// =============================================================================
+
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <torch/all.h>
@@ -40,6 +59,11 @@ template <typename T, int kNumTokens, int kNumExperts, int kHiddenDim>
 void invokeRouterGemmBf16Output(__nv_bfloat16* output, T const* mat_a,
                                 T const* mat_b, cudaStream_t stream);
 
+// 中文注释：LoopUnroller —— 编译期循环展开模板。
+// 将 num_tokens 的运行时 dispatch 转换为编译期模板特化。
+// LoopUnroller<1, 16, ...> 会在编译期生成 16 个 if-else 分支，
+// 每个分支对应一个 num_tokens 值，调用对应的 kernel 模板实例。
+// 这样每个 kernel 的 kNumTokens 参数都是编译期常量，可以做更多优化。
 template <int kBegin, int kEnd, int kNumExperts, int kHiddenDim>
 struct LoopUnroller {
   static void unroll_float_output(int num_tokens, float* output,
@@ -98,6 +122,13 @@ struct LoopUnroller<kEnd, kEnd, kNumExperts, kHiddenDim> {
   }
 };
 
+// 中文注释：dsv3_router_gemm —— Python 层调用的 DSV3 Router GEMM 入口函数。
+// 参数校验：
+// - hidden_dim 必须为 7168（DeepSeek V3 的隐藏维度）
+// - num_experts 必须为 256（DeepSeek V3）或 384（Kimi K2）
+// - num_tokens 必须在 [1, 16] 范围内（decode 阶段通常只有 1 个 token）
+// - mat_a 和 mat_b 必须为 bf16，output 可以为 fp32 或 bf16
+// - SM 版本必须 >= 90（Hopper 架构）
 void dsv3_router_gemm(at::Tensor& output,       // [num_tokens, num_experts]
                       const at::Tensor& mat_a,  // [num_tokens, hidden_dim]
                       const at::Tensor& mat_b   // [num_experts, hidden_dim]

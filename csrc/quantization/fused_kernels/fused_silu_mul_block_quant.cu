@@ -1,6 +1,29 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+// =============================================================================
+// 模块功能概述: 融合 SiLU 门控 + 分组量化的 CUDA Kernel
+// =============================================================================
+// 本文件实现了 SiLU(gate) * up 的融合计算，并直接输出 per-block 量化结果。
+// 与 activation_kernels.cu 中的 kernel 不同，本文件使用分组量化 (group quantization)，
+// 每个 group 独立计算缩放因子，适用于更细粒度的量化场景。
+//
+// 核心设计:
+//   1. 每个 thread block 处理一个 (token, group) 对
+//   2. grid 维度: (num_tokens, num_groups)，其中 num_groups = hidden_size / group_size
+//   3. block 维度: group_size 个线程，每个线程处理 group 内的一个元素
+//
+// 计算流程 (4 步):
+//   Step 1: 每个线程加载 gate 和 up 对应元素，计算 SiLU(gate) * up
+//   Step 2: 通过 shared memory 归约求 group 内绝对值最大值
+//   Step 3: thread 0 计算量化缩放因子 (scale = max / quant_range)，广播给所有线程
+//   Step 4: 每个线程用缩放因子量化结果，写入全局内存
+//
+// 支持的量化类型: FP8 (E4M3) 和 INT8
+// 支持的 group_size: 64 或 128
+// 支持的缩放因子布局: 行优先或列优先 (通过 is_scale_transposed 模板参数控制)
+// =============================================================================
+
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 
@@ -9,6 +32,7 @@
 
 namespace vllm {
 
+// 中文注释: 每个 thread block 处理一个 (token, group) 对
 // Logic: one thread block per (token, group) pair
 
 template <typename scalar_t, typename scalar_out_t, bool is_scale_transposed,

@@ -1,5 +1,24 @@
 #pragma once
 
+// =============================================================================
+// 中文注释: Machete 预打包权重布局定义
+// =============================================================================
+// 本文件定义了 Machete 的权重预打包内存布局。
+//
+// 预打包布局的设计目标:
+//   1. 将权重矩阵 B 按 PPBlockShape_NK 的 tile 大小分块
+//   2. 每个 tile 内的数据紧凑存储，使得执行 TiledMMA 操作时，
+//      每个线程需要的数据在内存中是连续的
+//   3. 这样从共享内存加载 B 时可以使用更宽的加载指令 (如 128-bit)
+//   4. tile 内的值可能被交错 (interleave) 以优化反量化效率
+//
+// IlvBlkLayoutAuto: 自动选择交错布局
+// PrepackedLayoutB: 预打包布局模板，定义了:
+//   - ElementB: 元素类型
+//   - PPBlockShape_NK: 预打包 tile 的 (N, K) 形状
+//   - 数据在内存中的具体排列方式
+// =============================================================================
+
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <torch/all.h>
@@ -28,6 +47,7 @@ namespace machete {
 
 using namespace cute;
 
+// 中文注释: 自动交错布局标记
 struct IlvBlkLayoutAuto {};
 
 // This defines a prepacked layout for the B matrix, where the matrix is broken

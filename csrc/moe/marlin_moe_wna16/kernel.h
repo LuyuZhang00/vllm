@@ -1,3 +1,23 @@
+// =============================================================================
+// 中文注释：Marlin MoE WNA16 量化 GEMM kernel 头文件
+//
+// 本文件声明了 Marlin MoE WNA16 量化矩阵乘法 kernel 的模板和参数。
+//
+// Marlin 是一种高性能的量化矩阵乘法实现，支持：
+// - 4-bit / 2-bit 权重量化（WNA16）
+// - 分组量化（group_blocks 控制量化组大小）
+// - 零点支持（int 或 float16 类型）
+// - 异步全局内存到共享内存的流水线预取（stages 控制流水线级数）
+//
+// MARLIN_KERNEL_PARAMS 宏定义了 kernel 的所有参数：
+// - A: 激活矩阵（int4 打包）
+// - B: 量化权重矩阵（int4 打包）
+// - C/C_tmp: 输出矩阵 / 临时输出矩阵
+// - scales_ptr/zp_ptr: 量化缩放因子和零点
+// - sorted_token_ids_ptr/expert_ids_ptr: MoE 排序后的 token 和专家 ID
+// - topk_weights_ptr: top-k 权重（可选乘到输出上）
+// - locks: 用于跨 block 同步的锁数组
+// =============================================================================
 
 #ifndef MARLIN_NAMESPACE_NAME
   #define MARLIN_NAMESPACE_NAME marlin_moe_wna16

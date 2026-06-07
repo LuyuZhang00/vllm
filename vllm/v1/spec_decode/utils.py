@@ -1,5 +1,30 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# =============================================================================
+# utils.py - 投机解码工具函数和 Triton kernel 模块
+#
+# 【模块功能概述】
+# 本模块提供了投机解码（Speculative Decoding）中使用的各种工具函数和 GPU kernel。
+# 主要功能包括：
+#   1. EAGLE 自回归步骤中的 slot mapping 和元数据更新（融合 Triton kernel）
+#   2. 投机解码输入准备（计算 token 索引、被拒绝 token 数量等）
+#   3. 下一个 token ID 的准备（处理被丢弃请求、备份 token 等）
+#   4. 通用注意力元数据的扩展（增加 query 长度、更新 slot mapping 等）
+#   5. DFlash 并行草稿生成的输入准备（融合 Triton kernel）
+#   6. 异步投机解码的元数据校正
+#   7. 无条件接受率到条件接受率的转换
+#
+# 【关键设计】
+# - 使用 Triton JIT 编译的 kernel 实现 GPU 上的融合操作，避免多次 kernel launch
+# - 使用预分配的缓冲区避免动态内存分配
+# - 支持 CUDA Graph（通过 PADDING_SLOT_ID 处理 padding 位置）
+# - 所有 kernel 都支持动态 batch 大小
+#
+# 【在推测解码链路中的位置】
+#   Scheduler -> Proposer(EAGLE/DFlash/...) -> 本模块的 kernel 准备输入 ->
+#   Model Runner 执行 forward -> 验证/拒绝 -> 更新元数据
+# =============================================================================
+
 import torch
 
 from vllm.platforms import current_platform
@@ -8,11 +33,20 @@ from vllm.v1.attention.backends.utils import (
     CommonAttentionMetadata,
 )
 
+# 中文注释：padding slot 的特殊 ID，用于标识 KV cache 中不需要写入的位置。
+# 在 slot mapping 中，-1 表示该 token 不需要写入 KV cache（padding 用途）。
+# 这在 CUDA Graph 捕获时特别重要，因为 CUDA Graph 需要固定的 tensor 形状，
+# 但实际 batch 中的 token 数量可能小于最大值，多余的位置用 PADDING_SLOT_ID 填充。
 PADDING_SLOT_ID = -1
 
 
 def next_power_of_2(n: int) -> int:
     """Return the smallest power of 2 >= n."""
+    # 中文注释：计算大于等于 n 的最小 2 的幂。
+    # 在 Triton kernel 中，BLOCK_SIZE 通常需要是 2 的幂，
+    # 此函数用于计算合适的 block 大小。
+    # 算法：先减 1（处理 n 已经是 2 的幂的情况），然后通过位或操作
+    # 将最高位以下的所有位都置为 1，最后加 1 得到下一个 2 的幂。
     if n <= 0:
         return 1
     n -= 1
@@ -51,6 +85,26 @@ def eagle_step_slot_mapping_metadata_kernel(
     - slot_mapping from block table lookup
     - seq_lens += 1, or 1 if position exceeds max
     """
+    # 中文注释：EAGLE 自回归步骤的融合 Triton kernel。
+    #
+    # 【功能】
+    # 在一次 kernel 调用中完成三个操作（减少 kernel launch 开销）：
+    #   1. 更新位置编码：position += 1（如果超过 max_model_len 则 clamp 到 0）
+    #   2. 计算 slot mapping：通过 block table 查找物理 KV cache 地址
+    #   3. 更新序列长度：seq_lens += 1（如果超过 max_model_len 则重置为 1）
+    #
+    # 【启动方式】
+    # 使用 input_batch_size 个线程启动，每个线程处理一个请求。
+    # 超出 batch_size 的线程是 CUDA Graph padding，只写入 PADDING_SLOT_ID。
+    #
+    # 【slot mapping 计算公式】
+    #   block_number = position // block_size  （逻辑 block 索引）
+    #   block_id = block_table[req_idx, block_number]  （物理 block 索引）
+    #   slot_id = block_id * block_size + (position % block_size)  （物理 slot 地址）
+    #
+    # 【为什么需要这个 kernel】
+    # EAGLE 在自回归生成草稿 token 时，每一步都需要更新位置和 slot mapping。
+    # 如果用多个独立 kernel，每次 launch 都有开销；融合后只需一次 launch。
     req_idx = tl.program_id(0)
 
     if req_idx >= batch_size:
@@ -113,6 +167,23 @@ def eagle_step_update_slot_mapping_and_metadata(
         input_batch_size: total batch size including cudagraph padding;
             defaults to batch_size (no padding)
     """
+    # 中文注释：EAGLE 自回归步骤的融合更新函数。
+    #
+    # 【功能】
+    # 调用 eagle_step_slot_mapping_metadata_kernel，在一次 kernel 调用中完成：
+    #   1. 位置更新：position += 1（clamp 到 [0, max_model_len)）
+    #   2. slot mapping 计算：通过 block table 查找物理 KV cache 地址
+    #   3. 序列长度更新：seq_lens += 1
+    #
+    # 【参数说明】
+    # - positions_1d: 当前位置（1D 视图，M-RoPE 时取第一个维度）
+    # - block_table_tensor: 逻辑 block -> 物理 block 的映射表
+    # - seq_lens: 序列长度（原地更新）
+    # - input_batch_size: 包含 CUDA Graph padding 的总 batch 大小
+    #
+    # 【调用时机】
+    # 在 EAGLE 自回归生成草稿 token 的每一步中调用，
+    # 由 SpecDecodeBaseProposer._update_positions_dependent_metadata() 触发。
     batch_size = positions_1d.shape[0]
     if input_batch_size is None:
         input_batch_size = batch_size
@@ -148,6 +219,26 @@ def eagle_prepare_inputs_padded_kernel(
     of draft tokens and the number of valid sampled tokens (which is one more than
     the number of accepted tokens).
     """
+    # 中文注释：EAGLE 填充批次输入准备的融合 Triton kernel。
+    #
+    # 【功能】
+    # 为每个请求计算两个关键值：
+    #   1. token_indices_to_sample: 新采样 token 在扩展序列中的位置索引
+    #   2. num_rejected_tokens: 被拒绝的草稿 token 数量
+    #
+    # 【计算逻辑】
+    # 假设某个请求有 N 个草稿 token，验证后接受 A 个（包含新采样的 1 个）：
+    #   - num_rejected = N + 1 - A  （N 个草稿 + 1 个 bonus - A 个有效）
+    #   - index_to_sample = query_end - num_rejected
+    #     （从序列末尾回退 num_rejected 个位置，就是新采样 token 的位置）
+    #
+    # 【cu_num_draft_tokens 的特殊格式】
+    # cu_num_draft_tokens 是"包含式"累积和（第一个元素就是第一个值，不是 0），
+    # 所以需要特殊处理 req_idx == 0 的情况。
+    #
+    # 【调用时机】
+    # 由 SpecDecodeBaseProposer.prepare_inputs_padded() 调用，
+    # 在投机解码验证阶段之前计算需要采样的位置。
     req_idx = tl.program_id(axis=0)
     if req_idx >= num_reqs:
         return
@@ -196,6 +287,29 @@ def eagle_prepare_next_token_padded_kernel(
     "last accepted token" from the sampled tokens, or the backup token if no
     tokens were accepted or if the request is marked as discarded.
     """
+    # 中文注释：EAGLE 填充批次下一个 token ID 准备的融合 Triton kernel。
+    #
+    # 【功能】
+    # 为每个请求计算两个值：
+    #   1. next_token_ids: 下一个要输入给草稿模型的 token ID
+    #   2. valid_sampled_tokens_count: 有效采样 token 的数量（包含被接受的草稿 + 新采样的）
+    #
+    # 【处理逻辑】
+    # 对于每个请求：
+    #   - 如果被标记为丢弃（is_discarded）：使用 backup token，有效计数为 0
+    #   - 否则：遍历采样 token 序列，统计有效 token 数量（值在 [0, vocab_size) 范围内）
+    #     - 如果有有效 token：取最后一个有效 token 作为 next_token_id
+    #     - 如果没有有效 token：使用 backup token
+    #
+    # 【为什么需要 backup token】
+    # 当一个请求的所有草稿 token 都被拒绝，且没有新采样到 token 时，
+    # 需要一个回退 token 来保证草稿模型有输入。backup token 通常是
+    # 该请求在推测解码之前的最后一个已知 token。
+    #
+    # 【valid_sampled_tokens_count 的含义】
+    # 它等于被接受的草稿 token 数 + 1（新采样的 token）。
+    # 例如：草稿 token = [A, B, C]，验证后 A 和 B 被接受，C 被拒绝，
+    # 新采样 D，则 valid_count = 3（A, B, D）。
     req_idx = tl.program_id(axis=0)
     if req_idx >= num_reqs:
         return
@@ -247,6 +361,25 @@ def compute_new_slot_mapping(
     num_new_tokens: int,
     max_model_len: int,
 ):
+    # 中文注释：为扩展后的序列计算新的 slot mapping。
+    #
+    # 【功能】
+    # 当投机解码需要扩展每个请求的 query 长度（增加 bonus token 和 parallel drafting token）时，
+    # 需要为这些新 token 计算 slot mapping（逻辑位置 -> 物理 KV cache 地址）。
+    #
+    # 【计算流程】
+    # 1. 为每个 token 确定它属于哪个请求（req_indices）
+    # 2. 将位置 clamp 到 [0, max_model_len-1] 范围内
+    # 3. 通过 block table 查找物理 block id：
+    #    block_number = position // block_size
+    #    block_id = block_table[req_idx, block_number]
+    # 4. 计算 slot = block_id * block_size + (position % block_size)
+    # 5. 将超出 max_model_len 的位置标记为 PADDING_SLOT_ID
+    # 6. 将被拒绝的 token 标记为 PADDING_SLOT_ID（避免写入 KV cache）
+    #
+    # 【调用时机】
+    # 由 SpecDecodeBaseProposer.set_inputs_first_pass() 中的"需要额外输入槽位"路径调用，
+    # 用于草稿模型和并行草稿生成模式。
     batch_size, n_blocks_per_req = cad.block_table_tensor.shape
     req_indices = torch.arange(batch_size, device=cad.query_start_loc.device)
     req_indices = torch.repeat_interleave(
@@ -284,6 +417,24 @@ def extend_all_queries_by_N(
     extend each sequence by N tokens and predict all tokens in one pass.
     The slot mapping is computed externally, as it requires more information.
     """
+    # 中文注释：扩展所有请求的 query 长度，增加 N 个 token。
+    #
+    # 【功能】
+    # 创建一个新的 CommonAttentionMetadata，其中：
+    #   - 每个请求的 query 长度增加 N
+    #   - 每个请求的序列长度增加 N
+    #   - 总 token 数增加 batch_size * N
+    #   - 使用外部计算的新 slot mapping
+    #
+    # 【使用场景】
+    # 并行草稿生成（parallel drafting）中，每个请求需要额外 N 个 slot
+    # 来容纳 bonus token 和 mask token。此函数将这些额外 slot 正确地
+    # 注入到注意力元数据中。
+    #
+    # 【query_start_loc 的更新方式】
+    # 原始: [0, q1, q1+q2, q1+q2+q3]
+    # 更新后: [0, q1+N, q1+q2+2N, q1+q2+q3+3N]
+    # 即第 i 个请求的起始位置偏移 i*N，因为前面 i 个请求各增加了 N 个 token。
     cad = common_attn_metadata
     # query start loc must be increased by [+0, +N, +2N, ..., +batch_size * N]
     new_query_start_loc = cad.query_start_loc + N * arange[: len(cad.query_start_loc)]
@@ -334,6 +485,28 @@ def copy_and_expand_eagle_inputs_kernel(
     speculative decoding. This kernel handles padding slots and parallel drafting
     tokens, if enabled.
     """
+    # 中文注释：EAGLE 投机解码的输入复制和扩展融合 Triton kernel。
+    #
+    # 【功能】
+    # 将 target model 的输入（token_ids、positions）复制到草稿模型的输入缓冲区，
+    # 同时插入额外的 token（bonus token、parallel drafting mask token、rejected token padding）。
+    #
+    # 【输出布局】（每个请求）
+    # [0, num_valid_tokens): 从 target model 复制的有效 token
+    # [num_valid_tokens]: bonus token（target model 采样的下一个 token）
+    # (num_valid_tokens, num_valid_tokens + num_padding_slots): parallel drafting mask token
+    # [num_valid_tokens + num_padding_slots, total_output): rejected token padding
+    #
+    # 【shift_input_ids 的含义】
+    # 当 shift_input_ids=True 时（EAGLE 方法），输入 token 需要左移一位：
+    #   原始: [a1, b1, b2, c1, c2, c3]
+    #   移位后: [b1, b2, c1, c2, c3, c3]（最后一个 token 会被 next_token 替换）
+    # 这是因为 EAGLE 的草稿模型需要预测"下一个"token，所以输入要比 target 提前一步。
+    #
+    # 【2D 网格启动】
+    # grid = (batch_size, num_blocks)
+    # - 第一维：每个请求一个 program
+    # - 第二维：每个请求的 token 分成多个 block 处理（支持 prefill 的长序列）
     request_idx = tl.program_id(axis=0)
     token_batch_idx = tl.program_id(axis=1)
 
@@ -495,6 +668,28 @@ def copy_and_expand_dflash_inputs_kernel(
          buffers via block_table lookup.
       5. Writes token_indices_to_sample for the mask (speculative) tokens.
     """
+    # 中文注释：DFlash 第一轮输入准备的融合 Triton kernel。
+    #
+    # 【功能】
+    # 为每个请求完成以下操作：
+    #   1. 复制 context positions（target model 的位置编码）
+    #   2. 计算 query positions（last_target_pos + 1 + offset）
+    #   3. 生成 query input_ids：[next_token, mask_token, mask_token, ...]
+    #   4. 通过 block table 计算 context 和 query 的 slot mapping
+    #   5. 记录 token_indices_to_sample（mask token 的位置索引）
+    #
+    # 【DFlash 的 token 分类】
+    # - Context token: target model 的 hidden states，投影为 K/V
+    # - Query token: bonus token（next_token）+ mask token（speculative positions）
+    #
+    # 【2D 网格启动】
+    # grid = (batch_size, num_blocks)
+    # - 第一维：每个请求一个 program
+    # - 第二维：每个请求的 token 分成多个 block 处理
+    #
+    # 【HAS_NUM_REJECTED 的含义】
+    # 在 padded 模式下，ctx_end 包含了被拒绝的 token。
+    # 需要用 num_rejected 来找到最后一个被接受的 context 位置。
     req_idx = tl.program_id(axis=0)
     block_idx = tl.program_id(axis=1)
 
@@ -577,6 +772,23 @@ def update_num_computed_tokens_for_batch_change(
     Requests that had drafts: corrected = prev_gpu + valid_count.
     New requests or non-draft (e.g. prefills): use CPU value directly.
     """
+    # 中文注释：校正异步投机解码中 num_computed_tokens 的漂移。
+    #
+    # 【背景】
+    # 在异步投机解码中，Scheduler 和 Model Runner 在不同的进程中运行。
+    # 当 batch 中的请求集合发生变化（新增、移除、重排序）时，
+    # GPU 上的 num_computed_tokens 可能与 CPU 上的不同步。
+    #
+    # 【校正逻辑】
+    # - 对于参与过投机解码的请求（prev_drafts > 0）：
+    #   corrected = prev_computed + valid_count
+    #   （prev_computed 是上一步的已计算 token 数，valid_count 是本轮接受的 token 数）
+    # - 对于新请求或未参与投机解码的请求：
+    #   直接使用 CPU 上的值（cpu_num_computed_tokens）
+    #
+    # 【为什么需要 clamp(min=0)】
+    # 新请求的 prev_positions 为 -1（表示不在上一步的 batch 中），
+    # clamp 到 0 避免索引越界。
     # Clamp because prev_positions can be -1 for new requests
     gather_indices = prev_positions.clamp(min=0)
 
@@ -599,4 +811,20 @@ def update_num_computed_tokens_for_batch_change(
 def unconditional_to_conditional_rates(rates: list[float]) -> list[float]:
     """Convert per-position unconditional rates to per-position conditional
     rates for the early-terminating rejection loop (c_i = p_i / p_{i-1})."""
+    # 中文注释：将无条件接受率转换为条件接受率。
+    #
+    # 【背景】
+    # 在投机解码的 rejection sampling 中，每个位置的接受率是"无条件"的，
+    # 即"位置 i 的 token 被接受的概率"。但在 early-terminating rejection loop 中，
+    # 需要的是"条件"接受率，即"在前面所有 token 都被接受的前提下，位置 i 也被接受的概率"。
+    #
+    # 【转换公式】
+    # c_i = p_i / p_{i-1}
+    # 其中 p_i 是位置 i 的无条件接受率，c_i 是条件接受率。
+    # 例如：p = [0.9, 0.6, 0.3]
+    #       c = [0.9, 0.6/0.9, 0.3/0.6] = [0.9, 0.667, 0.5]
+    #
+    # 【使用场景】
+    # 用于 rejection sampling 中的 early stopping：如果某个位置的条件接受率很低，
+    # 可以提前终止验证，避免不必要的计算。
     return [p / q if q > 0.0 else 0.0 for p, q in zip(rates, [1.0, *rates[:-1]])]

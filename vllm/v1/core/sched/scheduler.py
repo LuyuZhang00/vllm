@@ -1,5 +1,51 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""vLLM V1 调度器模块 (vllm/v1/core/sched/scheduler.py)
+
+本模块实现了 vLLM V1 引擎的核心调度器（Scheduler），是整个推理引擎的"大脑"。
+
+核心设计理念：
+    V1 调度器不区分 prefill 和 decode！每个请求只有两个关键数字：
+    - num_computed_tokens: 已经计算了多少 token
+    - num_tokens_with_spec: 总共需要计算多少 token（含推测解码 token）
+    调度器的目标就是缩小这两个数字之间的差距。
+
+调度流程（每步调用一次 schedule()）：
+    Phase 1 - 调度 RUNNING 请求：
+        这些请求已经在运行队列中，通常是 decode 请求（每步 1 个 token），
+        但也可能是未完成的 prefill 请求（分块预填充场景）。
+        核心逻辑：计算 num_new_tokens = 待处理 - 已计算，分配 KV 块。
+        若分配失败，抢占最低优先级请求释放 KV 块后重试。
+
+    Phase 2 - 调度 WAITING 请求：
+        前提：Phase 1 没有发生抢占（避免颠簸）。
+        核心逻辑：
+        1. 查找前缀缓存（get_computed_blocks）
+        2. 如果有 KVConnector，查询外部缓存（远程 KV）
+        3. 计算 num_new_tokens = num_tokens - num_computed_tokens
+        4. 分块预填充：截断到 token_budget
+        5. 分配 KV 块，分配成功则移入 running 队列
+        6. 分配失败则停止调度（不抢占等待请求）
+
+token_budget / max_num_batched_tokens 的作用：
+    token_budget 是本步可以调度的最大 token 总数。它限制了单步的计算量，
+    防止单步处理过多 token 导致 GPU 计算时间过长或显存溢出。
+    Phase 1 和 Phase 2 共享同一个 token_budget。
+
+prefix cache 命中如何影响调度：
+    当请求首次进入 Phase 2 时，调用 get_computed_blocks() 查找已缓存的块。
+    命中的块不需要重新计算，num_computed_tokens 直接跳到命中位置。
+    例如：prompt 有 1000 个 token，prefix cache 命中了前 800 个，
+    则 num_computed_tokens = 800，num_new_tokens = 200。
+
+preemption 触发条件：
+    Phase 1 中，如果 allocate_slots() 返回 None（KV 块不足），则触发抢占。
+    抢占策略：
+    - FCFS: 从 running 队列末尾弹出（最后到达的请求先被抢占）
+    - PRIORITY: 选择优先级最低且到达最晚的请求
+    被抢占的请求：释放 KV 块，状态变为 PREEMPTED，放回等待队列头部。
+"""
+
 import itertools
 import time
 from collections import defaultdict, deque
@@ -474,9 +520,11 @@ class Scheduler(SchedulerInterface):
         #
         # 这些请求已经在 running 队列中，通常是 decode 请求 (每步 1 个 token)
         # 但也可能是未完成的 prefill 请求 (分块预填充场景)
+        # 异步调度时，可能有 num_output_placeholders > 0 (占位符 token)
         #
         # 对每个请求:
-        #   1. 计算需要的新 token 数 = num_tokens_with_spec - num_computed_tokens
+        #   1. 计算需要的新 token 数 = num_tokens_with_spec + num_output_placeholders
+        #      - num_computed_tokens
         #   2. 分配 KV 块
         #   3. 如果分配失败，抢占最低优先级的请求，释放其 KV 块，重试
         # ================================================================
@@ -1150,13 +1198,28 @@ class Scheduler(SchedulerInterface):
 
     def _preempt_request(self, request: Request, timestamp: float) -> None:
         """Preempt a request and put it back to the waiting queue.
-        
+
         抢占一个请求并将其放回等待队列。
 
         NOTE: The request should be popped from the running queue outside of this
         method.
         注意：请求应该在此方法外部从运行队列中弹出。
-        
+
+        抢占流程：
+        1. 验证请求当前状态为 RUNNING（只有运行中的请求才能被抢占）
+        2. 释放请求占用的 KV 缓存块（kv_cache_manager.free）
+        3. 释放请求占用的编码器缓存（encoder_cache_manager.free）
+        4. 将请求状态设为 PREEMPTED
+        5. 重置 num_computed_tokens 为 0（下次调度时需要重新查找前缀缓存）
+        6. 清除推测解码的草稿 token（被抢占后草稿无效）
+        7. 增加抢占计数（用于统计和日志）
+        8. 将请求插入等待队列头部（下次调度时优先恢复）
+
+        为什么重置 num_computed_tokens 为 0：
+            被抢占的请求释放了所有 KV 缓存块，下次调度时需要重新查找
+            前缀缓存来确定哪些 token 可以复用。如果不重置，调度器会
+            错误地认为这些 token 已经计算完成，导致分配不足的 KV 块。
+
         Args:
             request: 要抢占的请求
             timestamp: 抢占时间戳
@@ -1180,9 +1243,27 @@ class Scheduler(SchedulerInterface):
     def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
         """
         在调度完成后更新请求状态。
-        
+
         该方法在调度步骤完成后调用，用于更新请求的计算令牌数量等状态。
-        
+
+        更新内容：
+        1. 推进每个已调度请求的 num_computed_tokens：
+           - 调度时 scheduler_output 包含原始调度 token 数（用于构造输入）
+           - 调度后立即推进 num_computed_tokens，使得：
+             * 下一步调度时，该请求的已计算 token 数是正确的
+             * 如果请求还有剩余 token 未计算，可以立即在下一步再次调度
+           - 如果推测 token 被拒绝，num_computed_tokens 会在 update_from_output 中回退
+
+        2. 标记请求是否为 prefill 块：
+           - is_prefill_chunk = num_computed_tokens < num_tokens + num_output_placeholders
+           - 用于判断是否需要应用结构化输出约束
+
+        3. 快照路由专家块 ID：
+           - 在前向传播前拍摄块 ID 快照
+           - 防止异步调度中并发 schedule() 释放块导致的数据丢失
+
+        4. 清除已完成请求 ID 集合（为下一步做准备）
+
         Args:
             scheduler_output: 调度输出对象
         """
@@ -1238,11 +1319,25 @@ class Scheduler(SchedulerInterface):
         Updates the waiting session with the next streaming update.
 
         Discards the last sampled output token from the prior input chunk.
-        
+
         使用下一个流式更新更新等待中的会话。
-        
-        丢弃先前输入块中最后采样的输出令牌。
-        
+
+        流式输入会话的生命周期：
+        1. 第一次 add_request() 创建会话，状态为 WAITING
+        2. 调度器处理完第一个输入块后，请求生成输出 token
+        3. 请求完成（生成 EOS 或达到最大长度），状态变为 WAITING_FOR_STREAMING_REQ
+        4. 第二次 add_request() 携带新的输入块，调用此方法更新会话
+        5. 重复 2-4 直到流式输入结束
+
+        更新内容：
+        1. 丢弃上一个输入块中最后采样的输出 token（因为它可能不完整）
+        2. 保留已计算的输出 token（作为下一个输入块的上下文）
+        3. 将保留的输出 token 追加到 prompt_token_ids
+        4. 处理多模态特征的位置偏移
+        5. 追加新输入块的 token
+        6. 更新块哈希（用于前缀缓存）
+        7. 更新 prompt 长度和到达时间
+
         Args:
             session: 等待中的请求会话
             update: 流式更新数据
@@ -1295,16 +1390,32 @@ class Scheduler(SchedulerInterface):
     ) -> CachedRequestData:
         """
         构建已缓存请求的数据结构。
-        
+
         将运行中和恢复的请求转换为 CachedRequestData 对象，包含调度所需的所有信息。
-        
+
+        数据结构设计说明：
+        - req_ids: 所有请求的 ID 列表（顺序与后续列表对齐）
+        - resumed_req_ids: 被抢占后恢复的请求 ID 集合
+          - 不在集合中的请求：new_block_ids 追加到现有块 ID（正常增量）
+          - 在集合中的请求：new_block_ids 替换现有块 ID（抢占后重新分配）
+        - new_token_ids: 仅用于流水线并行（PP），非 PP 场景为空
+        - all_token_ids: 未在上一步调度的请求的完整 token ID（用于 KV 连接器）
+        - new_block_ids: 新分配的 KV 缓存块 ID
+        - num_computed_tokens: 已计算的 token 数
+        - num_output_tokens: 已输出的 token 数（含异步占位符）
+
+        为什么区分 running_reqs 和 resumed_reqs：
+            running_reqs 是连续运行的请求，其 block_ids 是追加式的（增量更新）。
+            resumed_reqs 是被抢占后恢复的请求，其旧的 block_ids 已被释放，
+            需要用新分配的 block_ids 完全替换（而非追加）。
+
         Args:
             running_reqs: 运行中的请求列表
             resumed_reqs: 恢复的请求列表
             num_scheduled_tokens: 每个请求调度的令牌数量
             spec_decode_tokens: 推测解码令牌
             req_to_new_blocks: 请求到新分配块的映射
-            
+
         Returns:
             CachedRequestData: 已缓存请求的数据结构
         """
@@ -1373,44 +1484,33 @@ class Scheduler(SchedulerInterface):
         Determine which encoder inputs need to be scheduled in the current step,
         and update `num_new_tokens` and encoder token budget accordingly.
 
-        An encoder input will be scheduled if:
-        - Its output tokens overlap with the range of tokens being computed
-        in this step, i.e.,
-        [num_computed_tokens, num_computed_tokens + num_new_tokens).
-        - It is not already computed and stored in the encoder cache.
-        - It is not exist on remote encoder cache (via ECConnector)
-        - There is sufficient encoder token budget to process it.
-        - The encoder cache has space to store it.
-
-        If an encoder input cannot be scheduled due to cache or budget
-        limitations, the method adjusts `num_new_tokens` to schedule only the
-        decoder tokens up to just before the unschedulable encoder input.
-
-        Note that num_computed_tokens includes both locally cached
-        blocks and externally cached blocks (via KVConnector).
-        
         确定当前步骤需要调度哪些编码器输入，并相应更新 `num_new_tokens` 和编码器令牌预算。
-        
-        编码器输入将被调度的条件：
-        - 其输出令牌与当前步骤计算的令牌范围重叠，即
-          [num_computed_tokens, num_computed_tokens + num_new_tokens)
-        - 尚未计算并存储在编码器缓存中
-        - 不存在于远程编码器缓存中（通过 ECConnector）
-        - 有足够的编码器令牌预算来处理它
-        - 编码器缓存有空间存储它
-        
-        如果由于缓存或预算限制无法调度编码器输入，该方法会调整 `num_new_tokens`，
-        只调度到无法调度的编码器输入之前的解码器令牌。
-        
-        注意：num_computed_tokens 包括本地缓存块和外部缓存块（通过 KVConnector）。
-        
+
+        编码器输入调度的核心逻辑（多模态模型，如视觉语言模型）：
+            多模态请求包含两类 token：
+            1. 文本 token：由 decoder 处理
+            2. 编码器占位 token：对应图像/音频等输入，需要先由编码器处理
+               编码器输出（如视觉 embedding）会替换占位 token 的 KV 缓存
+
+        调度条件（编码器输入需要被处理的条件）：
+        1. 其输出 token 与本步计算范围 [num_computed_tokens, num_computed_tokens + num_new_tokens) 重叠
+        2. 尚未计算并存储在编码器缓存中
+        3. 不存在于远程编码器缓存中（通过 ECConnector）
+        4. 有足够的编码器令牌预算来处理它
+        5. 编码器缓存有空间存储它
+
+        预算不足时的处理：
+            如果编码器缓存已满或预算耗尽，该方法会截断 num_new_tokens，
+            只调度到无法调度的编码器输入之前的 decoder token。
+            这确保了编码器输入和其对应的 decoder token 在同一步中被处理。
+
         Args:
             request: 请求对象
             num_computed_tokens: 已计算的令牌数量
             num_new_tokens: 新令牌数量
             encoder_compute_budget: 编码器计算预算
-            shift_computed_tokens: 计算令牌偏移量
-            
+            shift_computed_tokens: 计算令牌偏移量（EAGLE 推测解码使用）
+
         Returns:
             tuple: (编码器输入索引列表, 更新后的新令牌数, 更新后的编码器预算, 外部加载编码器输入列表)
         """
@@ -1592,16 +1692,35 @@ class Scheduler(SchedulerInterface):
     ) -> dict[int, EngineCoreOutputs]:
         """
         根据模型运行器的输出更新请求状态。
-        
+
         处理模型执行结果，更新请求的状态（如添加采样令牌、标记完成等），
         并生成引擎核心输出。
-        
+
+        这是调度循环的核心方法之一，每次模型前向传播后调用。
+
+        处理流程：
+        1. 提取模型输出：采样 token、logprobs、pooler 输出、CUDA Graph 统计等
+        2. 处理 KV 连接器输出：识别加载失败的无效块，截断受影响请求的计算进度
+        3. 存储路由专家数据（MoE 模型的专家路由信息）
+        4. 遍历每个已调度的请求：
+           a. 提取生成的 token ID（采样结果）
+           b. 处理推测解码：计算接受/拒绝的 token 数，调整 num_computed_tokens
+           c. 释放编码器输入（已处理的多模态输入）
+           d. 追加生成的 token 并检查停止条件
+           e. 处理结构化输出的语法验证
+           f. 提取路由专家数据（用于返回给客户端）
+           g. 生成 EngineCoreOutput（包含新 token、logprobs、完成原因等）
+        5. 从运行队列中移除已停止的请求
+        6. 处理 KV 连接器的传输完成事件
+        7. 收集并发布 KV 缓存事件
+        8. 返回按客户端索引分组的引擎核心输出
+
         Args:
             scheduler_output: 调度器输出对象
             model_runner_output: 模型运行器输出对象
-            
+
         Returns:
-            dict[int, EngineCoreOutputs]: 按序列组索引分组的引擎核心输出字典
+            dict[int, EngineCoreOutputs]: 按客户端索引分组的引擎核心输出字典
         """
         sampled_token_ids = model_runner_output.sampled_token_ids
         # 采样的令牌 ID
@@ -1984,6 +2103,11 @@ class Scheduler(SchedulerInterface):
         # Append generated tokens and check for stop. Note that if
         # a request is still being prefilled, we expect the model runner
         # to return empty token ids for the request.
+        # 将模型生成的 token 追加到请求的输出中，并检查停止条件。
+        # 流程：逐个追加 token，每追加一个就检查一次停止条件。
+        # 如果触发停止，截断后续 token（del new_token_ids[num_new:]）。
+        # 注意：prefill 阶段的请求不会生成新 token（模型只处理 prompt），
+        # 此时 new_token_ids 为空列表。
         stopped = False
         for num_new, output_token_id in enumerate(new_token_ids, 1):
             request.append_output_token_ids(output_token_id)
@@ -2112,9 +2236,29 @@ class Scheduler(SchedulerInterface):
     def add_request(self, request: Request) -> None:
         """
         添加请求到调度器。
-        
+
         如果请求已存在，则处理流式更新；否则将请求加入等待队列。
-        
+
+        请求添加流程：
+        1. 检查请求是否已存在（通过 request_id 查找）
+        2. 如果已存在（流式输入场景）：
+           - 创建 StreamingUpdate 对象
+           - 如果请求正在等待下一个输入块（WAITING_FOR_STREAMING_REQ），
+             立即调用 _update_request_as_session() 开始处理
+           - 否则将更新加入 streaming_queue 等待后续处理
+        3. 如果不存在（新请求）：
+           - 如果是可恢复请求（resumable），初始化 streaming_queue
+           - 将请求加入等待队列（waiting 或 skipped_waiting）
+           - 将请求注册到 self.requests 字典
+           - 通知 KV Connector 有新请求
+           - 记录排队事件（用于性能统计）
+
+        流式输入场景说明：
+            某些应用场景（如实时对话）需要分块发送输入，而不是一次性发送完整 prompt。
+            第一次调用 add_request() 创建请求，后续调用携带新的输入块。
+            每个输入块处理完成后，请求回到 WAITING_FOR_STREAMING_REQ 状态，
+            等待下一个输入块或完成信号。
+
         Args:
             request: 要添加的请求对象
         """
@@ -2159,17 +2303,28 @@ class Scheduler(SchedulerInterface):
         Returns:
             Tuple of (req_id, client_index) for requests that were aborted. Will not
             include any that were already finished.
-            
+
         处理来自调度器外部的完成信号。
-        
-        例如，当客户端断开连接时，API 服务器可以中止请求。
-        
-        如果 request_ids 为 None，则所有请求都将被完成。
-        
+
+        触发场景：
+        1. 客户端断开连接，API 服务器中止请求
+        2. 前端进程在反 tokenize 后检测到停止字符串
+        3. 管理员手动取消请求
+
+        处理流程（两遍扫描）：
+        第一遍：收集需要移除的请求，分为两类：
+            - running 状态的请求：从 self.running 列表中移除
+            - waiting 状态的请求：从 self.waiting 和 self.skipped_waiting 中移除
+        第二遍：设置请求状态，释放资源：
+            - 设置 finished_status（FINISHED_ABORTED 等）
+            - 调用 _free_request() 释放 KV 缓存和编码器缓存
+            - 对于 WAITING_FOR_REMOTE_KVS 状态的请求，需要特殊处理：
+              如果 KV 传输尚未完成，需要延迟释放块（delay_free_blocks=True）
+
         Args:
             request_ids: 要完成的请求 ID 列表，为 None 时完成所有请求
             finished_status: 请求的完成状态
-            
+
         Returns:
             被中止请求的 (req_id, client_index) 元组列表。不包含已完成的请求。
         """
@@ -2227,13 +2382,26 @@ class Scheduler(SchedulerInterface):
     ) -> dict[str, Any] | None:
         """
         释放已完成请求的资源。
-        
+
         释放编码器缓存、记录完成状态，并根据需要释放 KV 缓存块。
-        
+
+        释放流程：
+        1. 调用 KV Connector 的 finished 回调，可能返回需要延迟释放的标志
+           （P/D 分离场景：KV 缓存需要先发送给 decode 节点，再释放）
+        2. 释放编码器缓存（多模态模型的视觉/音频编码器输出）
+        3. 将请求 ID 加入 finished_req_ids 集合（通知 worker 释放缓存状态）
+        4. 如果不需要延迟释放，立即释放 KV 缓存块并从请求字典中删除
+        5. 返回 KV 传输参数（如果有），用于通知客户端传输状态
+
+        delay_free_blocks 的使用场景：
+        - P/D 分离：prefill 节点需要将 KV 缓存发送给 decode 节点后再释放
+        - 异步 KV 传输：KV 缓存正在异步传输中，不能立即释放
+        - 通常情况下 delay_free_blocks=False，请求完成后立即释放
+
         Args:
             request: 要释放的请求对象
             delay_free_blocks: 是否延迟释放块（用于异步 KV 传输）
-            
+
         Returns:
             KV 传输参数（如果有）
         """
@@ -2297,16 +2465,29 @@ class Scheduler(SchedulerInterface):
         preempted and moved to the waiting queue.
         Otherwise, this method will only reset the KV prefix cache when there
         is no running requests taking KV cache.
-        
+
         重置 KV 前缀缓存。
-        
-        如果 reset_running_requests 为 True，所有运行中的请求将被抢占并移动到等待队列。
-        否则，此方法仅在没有运行中的请求占用 KV 缓存时重置 KV 前缀缓存。
-        
+
+        使用场景：
+        1. RLHF 训练流程：模型权重更新后，旧的 KV 缓存不再有效
+        2. 基准测试：需要重置缓存状态以获得准确的性能数据
+        3. 模型热更新：在线服务中更新模型权重
+
+        重置流程（当 reset_running_requests=True 时）：
+        1. 逆序遍历 running 队列，逐个抢占请求
+           - 逆序是为了恢复时保持 FIFO 顺序
+           - 抢占会释放所有 KV 缓存块，使块池的引用计数归零
+        2. 清除异步调度的占位符（async_tokens_to_discard）
+           - 强制抢占时，已发出但未返回的输出帧需要被丢弃
+        3. 清除上一步调度的请求 ID 缓存（prev_step_scheduled_req_ids）
+           - 因为强制抢占+恢复在同一 step 内发生，需要清除旧的调度记录
+        4. 调用 kv_cache_manager.reset_prefix_cache() 清除哈希索引
+        5. 如果 reset_connector=True，同时重置 KV Connector 的缓存
+
         Args:
             reset_running_requests: 是否抢占所有运行中的请求
             reset_connector: 是否重置连接器缓存
-            
+
         Returns:
             是否成功重置
         """
@@ -2393,15 +2574,31 @@ class Scheduler(SchedulerInterface):
     ) -> SchedulerStats | None:
         """
         生成调度器统计信息。
-        
+
         收集并返回调度器的运行状态统计，包括请求数量、KV 缓存使用情况、前缀缓存统计等。
-        
+
+        收集的统计信息包括：
+        1. 请求统计：运行中请求数、等待中请求数、跳过的等待请求数
+        2. KV 缓存统计：使用率（已用块数 / 总块数）
+        3. 前缀缓存统计：命中率、命中 token 数、抢占次数
+        4. KV 连接器统计：远程缓存命中率、传输延迟等
+        5. 推测解码统计：接受率、草稿 token 数、有效 token 数
+        6. CUDA Graph 统计：图捕获次数、执行时间等
+        7. 性能统计：每步的计算时间、通信时间等
+        8. KV 缓存淘汰事件：块的生命周期、空闲时间、重用间隔
+
+        统计信息的用途：
+        - 监控系统健康状态
+        - 优化调度策略（如调整 token_budget、max_num_seqs）
+        - 调试性能问题（如缓存命中率低、抢占频繁）
+        - 生成性能报告
+
         Args:
             spec_decoding_stats: 推测解码统计
             kv_connector_stats: KV 连接器统计
             cudagraph_stats: CUDA Graph 统计
             perf_stats: 性能统计
-            
+
         Returns:
             SchedulerStats 对象，如果未启用日志则返回 None
         """
@@ -2743,8 +2940,26 @@ class Scheduler(SchedulerInterface):
         """
         Handle requests affected by invalid KV cache blocks.
 
+        处理因无效 KV 缓存块而受影响的请求。
+
+        背景：KV Connector（如 P/D 分离场景）从远程加载 KV 缓存时，
+        某些块可能加载失败（网络错误、数据损坏等）。这些块包含"无效数据"，
+        如果不处理会导致模型读到错误的 KV 值，产生错误的推理结果。
+
+        处理策略（由 recompute_kv_load_failures 配置控制）：
+        1. recompute（默认）：截断请求的 num_computed_tokens 到第一个无效块之前，
+           触发重新计算。这是一种"降级"策略，用额外计算换取正确性。
+        2. fail：直接终止受影响的请求，返回 FINISHED_ERROR 状态。
+
+        处理流程：
+        1. 扫描异步加载的请求（WAITING_FOR_REMOTE_KVS 状态）
+        2. 扫描同步加载的请求（RUNNING 状态）
+        3. 对每个请求，检查其已分配的块是否在 invalid_block_ids 中
+        4. 如果是，将 num_computed_tokens 截断到该块之前
+        5. 收集需要驱逐的块（包括无效块和下游依赖块）
+
         Returns:
-            Set of affected request IDs to skip in update_from_output main loop.
+            受影响的请求 ID 集合（需要在 update_from_output 主循环中跳过）
         """
         should_fail = not self.recompute_kv_load_failures
 

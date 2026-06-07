@@ -1,3 +1,32 @@
+// =============================================================================
+// 中文注释：MoE Token 排列/反排列算子实现文件
+//
+// 本文件实现了 MoE 推理中的 token 排列（permute）和反排列（unpermute）操作。
+//
+// 背景：MoE 模型中，每个 token 可能被路由到不同的专家。为了高效地进行
+// 专家计算，需要将 token 按专家重新排列，使得同一个专家的 token 连续存放，
+// 从而可以批量处理。计算完成后再还原原始顺序。
+//
+// 核心流程：
+// 1. moe_permute（排列）：
+//    a. 使用 CUB radix sort 将 (expert_id, token_index) 对排序。
+//    b. 计算每个专家的 token 数量前缀和（expert_first_token_offset）。
+//    c. 将输入 token 按排序后的顺序复制到 permuted_input。
+//    d. 记录逆排列索引 inv_permuted_idx，用于后续 unpermute。
+//
+// 2. moe_unpermute（反排列）：
+//    a. 根据 inv_permuted_idx 将专家输出还原到原始 token 顺序。
+//    b. 按 topk_weights 加权求和，得到最终 MoE 层输出。
+//
+// 依赖：
+// - CubKeyValueSorter：CUB radix sort 封装
+// - sortAndScanExpert：排序 + 前缀和计算
+// - expandInputRowsKernelLauncher：token 排列 kernel
+// - finalizeMoeRoutingKernelLauncher：token 反排列 + 加权求和 kernel
+//
+// 注意：需要 CUDA >= 12.0 才能使用 moe_permute 功能。
+// =============================================================================
+
 #include <c10/core/ScalarType.h>
 #include <torch/all.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -36,6 +65,22 @@ int64_t moe_permute_sort_workspace_size(int64_t num_expanded_rows,
       CubKeyValueSorter::getWorkspaceSize(num_expanded_rows, n_expert));
 }
 
+// 中文注释：moe_permute_impl —— MoE token 排列的核心实现。
+// 输入：
+//   input: [n_token, hidden] — 原始 token 隐藏状态
+//   topk_ids: [n_token, topk] — 每个 token 选中的专家 ID
+//   token_expert_indices: [n_token, topk] — 每个 token 的专家索引
+//   expert_map: [n_expert] — 可选的专家映射（用于 expert parallelism）
+// 输出：
+//   permuted_input: [permuted_size, hidden] — 按专家排列后的 token
+//   expert_first_token_offset: [n_local_expert + 1] — 每个专家的 token 起始偏移
+//   inv_permuted_idx: [n_token, topk] — 逆排列索引（用于 unpermute）
+//   permuted_idx: [permute_size] — 排列后的 token 索引
+//
+// 流程：
+// 1. 如果有 expert_map，先预处理 topk_ids（将全局专家 ID 映射为本地 ID）。
+// 2. 调用 sortAndScanExpert 进行 radix sort + 前缀和计算。
+// 3. 调用 expandInputRowsKernelLauncher 将 input 按排序顺序复制到 permuted_input。
 void moe_permute_impl(
     const torch::Tensor& input,                      // [n_token, hidden]
     const torch::Tensor& topk_ids,                   // [n_token, topk]
@@ -142,6 +187,14 @@ void moe_permute_with_scratch(
                    topk_ids_for_sort);
 }
 
+// 中文注释：moe_unpermute —— MoE token 反排列函数。
+// 将专家输出还原到原始 token 顺序，并按 topk_weights 加权求和。
+// 输入：
+//   permuted_hidden_states: [n_token * topk, hidden] — 专家输出（已排列）
+//   topk_weights: [n_token, topk] — 每个 token 的 top-k 权重
+//   inv_permuted_idx: [n_token, topk] — 逆排列索引（由 moe_permute 生成）
+// 输出：
+//   hidden_states: [n_token, hidden] — 最终 MoE 层输出
 void moe_unpermute(
     const torch::Tensor& permuted_hidden_states,  // [n_token * topk, hidden]
     const torch::Tensor& topk_weights,            // [n_token, topk]
@@ -174,6 +227,10 @@ void moe_unpermute(
   });
 }
 
+// 中文注释：shuffleInputRowsKernel —— 行重排 kernel。
+// 根据 dst2src_map 映射表，将输入矩阵的行按指定顺序复制到输出矩阵。
+// 用于 MoE 中将 token 按专家顺序重排。
+// 每个 block 处理一行，每个线程处理多个元素（128-bit 向量化加载）。
 template <typename T>
 __global__ void shuffleInputRowsKernel(const T* input,
                                        const int32_t* dst2src_map, T* output,

@@ -2,6 +2,29 @@
 
 #include "core/registration.h"
 
+// =============================================================================
+// 中文注释: GPTQ Marlin 权重重排 kernel
+// =============================================================================
+// 本文件实现了将 GPTQ 格式的量化权重转换为 Marlin 内部格式的 kernel。
+//
+// 为什么需要重排:
+//   - GPTQ 使用列优先的量化格式存储权重
+//   - Marlin 使用特定的 tile 布局以最大化 Tensor Core 利用率
+//   - 直接在 Marlin kernel 中处理 GPTQ 格式会降低性能
+//
+// 重排流程:
+//   1. 从全局内存读取 GPTQ 格式的权重 tile
+//   2. 如果有 perm (列重排索引)，应用列重排
+//   3. 将权重按 Marlin 的 tile 布局写回全局内存
+//
+// 支持的格式:
+//   - 4-bit/8-bit 权重 (通过 num_bits 模板参数)
+//   - 可选的列重排 (has_perm)
+//   - 8-bit 激活模式 (is_a_8bit)
+//
+// 使用多阶段异步流水线 (repack_stages=8) 进行优化
+// =============================================================================
+
 namespace marlin {
 
 template <int const num_threads, int const num_bits, bool const has_perm,

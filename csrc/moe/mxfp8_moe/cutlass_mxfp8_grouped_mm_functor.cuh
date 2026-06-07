@@ -3,6 +3,18 @@
 // Adapted from SGLang:
 // https://github.com/sgl-project/sglang/blob/ded068a76e00878881d52d5bfb791e0f60d7311b/sgl-kernel/csrc/expert_specialization/es_sm100_mxfp8_blockscaled_functor.cuh
 
+// =============================================================================
+// 中文注释：MXFP8 分组 GEMM CUTLASS Functor
+//
+// 本文件定义了 MXFP8 分组矩阵乘法的 CUTLASS Functor，
+// 负责计算每个专家的指针偏移、步长和布局信息。
+//
+// 主要 Functor：
+// - CutlassMxfp8GroupedMmOffsetFunctor：计算每个专家的输入/输出指针偏移
+// - CutlassMxfp8GroupedMmLayoutFunctor：计算 blockscale 的布局
+// - CutlassMxfp8GroupedMmStrideFunctor：计算矩阵步长
+// =============================================================================
+
 #pragma once
 #include <cuda.h>
 

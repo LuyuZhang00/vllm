@@ -1,3 +1,29 @@
+// =============================================================================
+// 中文注释：MoE Top-K Softmax/Sigmoid 路由 kernel 实现文件
+//
+// 本文件实现了 MoE (Mixture of Experts) 模型中的路由(Routing)机制核心 CUDA kernel。
+// 路由是 MoE 的关键步骤：对每个 token，根据 gating output（模型最后一层线性层的输出）
+// 计算每个专家的概率分布，然后选出 top-k 个专家及其权重。
+//
+// 核心算法流程：
+// 1. moeSoftmax kernel —— 对每个 token 的 [num_experts] 维向量做 softmax 归一化。
+//    使用数值稳定的 max-subtract 技巧防止 exp 溢出。
+// 2. moeSigmoid kernel —— 对每个 token 的 [num_experts] 维向量做 sigmoid 激活。
+// 3. moeTopK kernel —— 在 softmax/sigmoid 结果上选出 top-k 个最大值及其索引。
+//    使用 CUB BlockReduce 进行高效的 block 内归约。
+// 4. topkGating kernel —— 融合版本，将 softmax/sigmoid + top-k 合并到一个 kernel 中。
+//    利用 warp 内 shuffle 操作进行 butterfly reduction，避免 shared memory 通信。
+//    针对专家数为 2 的幂次（1, 2, 4, ..., 512）做了模板特化优化。
+//
+// 设计亮点：
+// - 通过编译期模板参数（VPT, NUM_EXPERTS, WARPS_PER_CTA 等）消除运行时开销。
+// - 多行打包到一个 warp 处理，充分利用 warp 内并行性。
+// - 支持 FP32/BF16/FP16 输入类型，通过向量化加载提升内存带宽利用率。
+// - 支持 correction_bias（校正偏置），用于 DeepSeek V2 等模型的路由微调。
+// - 支持 expert parallelism：通过 start_expert/end_expert 过滤本节点不负责的专家。
+//
+// 代码来源：改编自 NVIDIA TensorRT-LLM 的 MoE kernel 实现。
+// =============================================================================
 /*
  * Adapted from https://github.com/NVIDIA/TensorRT-LLM/blob/v0.7.1/cpp/tensorrt_llm/kernels/mixtureOfExperts/moe_kernels.cu
  * Copyright (c) 2024, The vLLM team.
@@ -40,6 +66,9 @@ namespace vllm {
 namespace moe {
 
 /// Aligned array type
+// 中文注释：对齐数组类型，用于向量化内存加载。
+// 通过 alignas 确保数组起始地址满足对齐要求，从而可以安全使用
+// 128-bit 向量化加载指令（如 LDG.128），显著提升内存带宽利用率。
 template <
     typename T,
     /// Number of elements in the array
@@ -736,6 +765,10 @@ void topkGatingKernelLauncher(
 } // namespace vllm
 
 
+// 中文注释：dispatch_topk_launch —— Top-K 路由 kernel 的类型分发函数。
+// 根据 gating_output 的数据类型（float/half/bfloat16）和 topk_indices 的索引类型
+// （int/uint32/int64），分发到对应的 topkGatingKernelLauncher 模板实例。
+// 这样可以支持多种数据类型的组合，同时保持 kernel 的模板特化优化。
 template<typename ComputeType, vllm::moe::ScoringFunc SF>
 void dispatch_topk_launch(
     torch::Tensor& gating_output,

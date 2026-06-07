@@ -2,6 +2,20 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """
 Define KV connector functionality mixin for model runners.
+
+KV 连接器功能混入模块
+====================
+本模块为 ModelRunner 提供 KV 缓存传输相关的功能，主要用于支持跨节点的 KV 缓存传输场景。
+
+核心功能：
+1. KV 缓存传输管理 - 协调 KV 缓存的发送和接收操作
+2. 连接器生命周期管理 - 在模型执行过程中管理 KV 连接器的状态
+3. 统一 KV 缓存布局 - 优化多层 KV 缓存的内存布局以支持高效传输
+
+典型使用场景：
+- 分离式 Prefill/Decode 架构：Prefill 节点计算完成后将 KV 缓存传输到 Decode 节点
+- KV 缓存备份和恢复：在分布式环境中实现 KV 缓存的持久化
+- 跨节点 KV 缓存共享：多个节点间共享已计算的 KV 缓存数据
 """
 
 from collections.abc import Generator

@@ -18,6 +18,23 @@
  * limitations under the License.
  */
 
+// =============================================================================
+// 中文注释：DeepSeek V3 Router GEMM kernel（float32 输出版本）
+//
+// 本文件实现了 DSV3 Router GEMM 的 float32 输出版本。
+// 计算 output = mat_a @ mat_b.T，其中 output 为 float32。
+//
+// 线程组织：
+// - 每个 block 处理一个专家列（blockIdx.x = expert index）
+// - 每个 warp 处理 hidden_dim 的一部分
+// - kBlockSize=128 线程，kNumWarps=4 个 warp
+//
+// 优化要点：
+// - 使用 PTX fma.rn.f32x2 指令进行 float2 向量化 FMA
+// - 使用 bf16_uint4_to_float8 批量 bf16->float 转换
+// - 使用 griddepcontrol 实现 PDL 优化
+// =============================================================================
+
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
 
@@ -26,7 +43,9 @@
 
 #include "dsv3_router_gemm_utils.h"
 
-// Custom FMA implementation using PTX assembly instructions
+// 中文注释：fma —— 使用 PTX 汇编实现的 float2 融合乘加（FMA）操作。
+// 利用 fma.rn.f32x2 指令一次性处理 2 个 float 的乘加，比两次标量 FMA 更高效。
+// 这是 DSV3 Router GEMM kernel 的性能关键路径。
 __device__ __forceinline__ void fma(float2& d, float2 const& a, float2 const& b,
                                     float2 const& c) {
   asm volatile("fma.rn.f32x2 %0, %1, %2, %3;\n"
@@ -36,7 +55,9 @@ __device__ __forceinline__ void fma(float2& d, float2 const& a, float2 const& b,
                  "l"(reinterpret_cast<uint64_t const&>(c)));
 }
 
-// Convert 8 bfloat16 values from a uint4 to float array - optimized conversion
+// 中文注释：bf16_uint4_to_float8 —— 将 uint4（128-bit）中的 bf16 值转换为 float 数组。
+// uint4 包含 8 个 bf16 值，逐个转换为 float 后存入 dst。
+// 用于从全局内存加载 bf16 权重后转换为 float 进行累加，避免精度损失。
 template <int VPT>
 __device__ __forceinline__ void bf16_uint4_to_float8(uint4 const& vec,
                                                      float* dst) {

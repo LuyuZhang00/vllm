@@ -46,6 +46,21 @@
 // if scales were initially on the device, and caused torch.compile graph
 // breaks when moving scales to the CPU.
 //
+// 中文注释：本文件实现了 CUTLASS 2.x（SM80/SM89 等 pre-Hopper 架构）GEMM 的
+// 自定义 epilogue visitor。功能与 broadcast_load_epilogue_c3x.hpp 相同
+// （行/列/标量广播），但使用 CUTLASS 2.x 的 threadblock visitor API。
+//
+// CUTLASS 2.x 与 3.x epilogue 的主要区别：
+//   - 2.x 使用 threadblock 级别的 visitor，通过 ThreadMap 分区
+//   - 3.x 使用 warp-specialized 的 producer-consumer 模型
+//   - 2.x 通过 begin_epilogue() 加载数据，visit() 返回片段
+//   - 3.x 通过 begin()/begin_loop()/visit() 三阶段处理
+//
+// 定义了三个 visitor：
+//   1. VisitorRowOrScalarBroadcast：行向量或标量广播
+//   2. VisitorRowOrZeroBroadcast：行向量或零广播（用于可选的 bias）
+//   3. VisitorColOrScalarBroadcast：列向量或标量广播
+//
 #pragma once
 
 // Turn off clang-format for the entire file to keep it close to upstream
@@ -60,6 +75,9 @@ namespace cutlass::epilogue::threadblock {
 using namespace cute;
 using namespace detail;
 
+// 中文注释：CUTLASS 2.x 的行向量或标量广播 visitor。
+// 通过 ThreadMap 将行向量分配给线程，每个线程负责行向量的一部分。
+// row_broadcast=true 时从全局内存加载行向量，row_broadcast=false 时用标量填充。
 template<
   class ThreadMap,
   class Element,
@@ -128,6 +146,9 @@ struct VisitorRowOrScalarBroadcast {
     int n;
 
     // This function is modified from VisitorRowBroadcast
+    // 中文注释：epilogue 开始时的回调。根据 row_broadcast 标志决定：
+    //   - true：从全局内存按向量化加载行向量数据到寄存器（带边界谓词保护）
+    //   - false：用标量值填充向量化的寄存器
     CUTLASS_DEVICE void
     begin_epilogue() {
       clear(tC_rRow);
@@ -160,6 +181,7 @@ struct VisitorRowOrScalarBroadcast {
       }
     }
 
+    // 中文注释：visit 回调，返回当前迭代/行/列对应的行向量片段，供外层计算使用。
     template <class ElementAccumulator, int FragmentSize>
     CUTLASS_DEVICE auto // returns an Array
     visit(int iter_idx, int row_idx, int column_idx, int frg_idx,
@@ -169,6 +191,8 @@ struct VisitorRowOrScalarBroadcast {
     }
   };
 
+  // 中文注释：构造回调对象。使用 ThreadMap 将行向量分区到各线程，
+  // 创建全局内存张量和对应的寄存器张量，以及边界检查用的坐标张量。
   template <class ProblemShape>
   CUTLASS_DEVICE auto
   get_callbacks(
@@ -211,6 +235,9 @@ struct VisitorRowOrScalarBroadcast {
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
 // This is a modified RowBroadcast that will broadcast 0 if ptr_row is null
+// 中文注释：行向量或零广播 visitor。与 VisitorRowOrScalarBroadcast 类似，
+// 但当 ptr_row 为 nullptr 时广播零值（而非标量）。
+// 用于可选的 bias 参数：如果 bias 不存在（nullptr），则视为零偏置。
 template<
   class ThreadMap,
   class Element,
@@ -361,6 +388,9 @@ struct VisitorRowOrZeroBroadcast {
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
 // Column vector broadcast
+// 中文注释：CUTLASS 2.x 的列向量或标量广播 visitor。
+// 用于加载 per-token 的缩放因子（沿 M 维/行方向不同）。
+// col_broadcast=true 时从全局内存加载列向量，col_broadcast=false 时用标量填充。
 template<
   class ThreadMap,
   class Element,

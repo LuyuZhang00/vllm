@@ -3,6 +3,24 @@
 // Adapted from SGLang:
 // https://github.com/sgl-project/sglang/blob/ded068a76e00878881d52d5bfb791e0f60d7311b/sgl-kernel/csrc/expert_specialization/es_sm100_mxfp8_blockscaled_group_quant.cu
 
+// =============================================================================
+// 中文注释：MXFP8 专家量化 kernel 入口文件
+//
+// 本文件实现了 MoE 模型中将激活量化为 MXFP8 格式的 kernel。
+// 在专家计算之前，需要将 bf16/fp16 的激活量化为 FP8，并计算对应的 blockscale 因子。
+//
+// 输入：
+//   input: [num_tokens, k] — 激活（bf16/fp16）
+//   problem_sizes: [num_experts, 3] — 每个专家的 (m, n, k) 尺寸
+//   expert_offsets: [num_experts] — 每个专家在 token 维度上的偏移
+//   blockscale_offsets: [num_experts] — 每个专家在 blockscale 维度上的偏移
+// 输出：
+//   quant_output: 量化后的 FP8 激活
+//   scale_factor: 每个 128 元素块的缩放因子
+//
+// 要求：SM >= 100（Blackwell 架构），k 必须对齐到 128。
+// =============================================================================
+
 #include <torch/all.h>
 
 #include "mxfp8_experts_quant.cuh"

@@ -1,3 +1,15 @@
+// =============================================================================
+// 中文注释：MoE 数据类型分发宏
+//
+// 本文件定义了 MoE kernel 中用于数据类型分发的宏和模板：
+//
+// 1. MOE_DISPATCH(TYPE, ...) —— 根据 PyTorch 的 ScalarType 分发到对应的
+//    CUDA 数据类型（float, half, bfloat16, fp8_e5m2, fp8_e4m3, uint8）。
+//    用于 moe_permute/unpermute kernel 中支持多种输入数据类型。
+//
+// 2. ScalarType2CudaType<> —— 模板特化，将 PyTorch ScalarType 映射为 CUDA 类型。
+// =============================================================================
+
 #pragma once
 #include <cuda_fp8.h>
 #define MOE_SWITCH(TYPE, ...)                                     \

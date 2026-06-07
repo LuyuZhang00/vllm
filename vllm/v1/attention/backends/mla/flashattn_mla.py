@@ -1,5 +1,28 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""
+FlashAttention MLA 注意力后端模块。
+
+本模块实现了基于 FlashAttention v3 的 MLA（Multi-Latent Attention）注意力后端，
+主要用于 NVIDIA Hopper（SM90）GPU 上的 DeepSeek 模型推理。
+
+核心特性：
+1. 使用 FlashAttention v3 的 MLA 专用内核（flash_attn_varlen_func）
+2. 支持 CUDA Graph 加速
+3. 支持 DCP（Distributed Context Parallelism）分布式上下文并行
+4. 支持 FA3 调度器元数据预计算
+5. 支持 batch invariance（批量不变性）
+
+架构概述：
+- FlashAttnMLABackend: 后端定义
+- FlashAttnMLAMetadataBuilder: 元数据构建器
+- FlashAttnMLAImpl: 注意力实现
+
+与其他 MLA 后端的区别：
+- 使用 FlashAttention v3 而非专用 MLA 内核
+- 支持 CUDA Graph 的完整捕获
+- 将 q_nope 作为 q_v 传递给 FlashAttention，实现 MLA 的低秩分解注意力
+"""
 
 from dataclasses import dataclass
 from typing import ClassVar
@@ -41,6 +64,12 @@ logger = init_logger(__name__)
 
 
 class FlashAttnMLABackend(MLACommonBackend):
+    """
+    FlashAttention MLA 注意力后端。
+
+    定义了后端的基本属性和支持的配置。
+    仅支持 SM90（Hopper）GPU，且需要 FlashAttention 支持 MLA。
+    """
     supported_dtypes: ClassVar[list[torch.dtype]] = [torch.float16, torch.bfloat16]
     supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
         "auto",
@@ -50,6 +79,7 @@ class FlashAttnMLABackend(MLACommonBackend):
 
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
+        """支持的块大小：16 的倍数。"""
         return [MultipleOf(16)]
 
     @staticmethod
@@ -58,6 +88,7 @@ class FlashAttnMLABackend(MLACommonBackend):
 
     @classmethod
     def supports_batch_invariance(cls) -> bool:
+        """支持批量不变性。"""
         return True
 
     @staticmethod
@@ -70,6 +101,7 @@ class FlashAttnMLABackend(MLACommonBackend):
 
     @classmethod
     def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
+        """仅支持 SM90（Hopper）GPU。"""
         return capability.major == 9
 
     @classmethod
@@ -84,6 +116,7 @@ class FlashAttnMLABackend(MLACommonBackend):
         use_sparse: bool,
         device_capability: DeviceCapability,
     ) -> str | None:
+        """检查 FlashAttention 是否支持 MLA。"""
         if not flash_attn_supports_mla():
             return "FlashAttention MLA not supported on this device"
         return None
@@ -91,22 +124,36 @@ class FlashAttnMLABackend(MLACommonBackend):
 
 @dataclass
 class FlashAttnMLADecodeMetadata(MLACommonDecodeMetadata):
-    query_start_loc: torch.Tensor
-    max_query_len: int
-    max_seq_len: int
-    scheduler_metadata: torch.Tensor | None = None
-    max_num_splits: int = 0
+    """
+    FlashAttention MLA decode 元数据。
+
+    包含 FlashAttention v3 所需的 decode 元数据。
+    """
+    query_start_loc: torch.Tensor  # query 起始位置
+    max_query_len: int  # 最大 query 长度
+    max_seq_len: int  # 最大序列长度
+    scheduler_metadata: torch.Tensor | None = None  # FA3 调度器元数据
+    max_num_splits: int = 0  # 最大分割数（用于 CUDA Graph）
 
 
 @dataclass
 class FlashAttnMLAMetadata(MLACommonMetadata[FlashAttnMLADecodeMetadata]):
+    """FlashAttention MLA 的完整元数据。"""
     pass
 
 
 class FlashAttnMLAMetadataBuilder(MLACommonMetadataBuilder[FlashAttnMLAMetadata]):
+    """
+    FlashAttention MLA 的元数据构建器。
+
+    负责构建 FlashAttention v3 所需的元数据，包括：
+    1. FA3 调度器元数据预计算
+    2. CUDA Graph 兼容的缓冲区管理
+    3. 支持将小 prefill 与 decode 一起处理（reorder_batch_threshold=512）
+    """
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
     query_len_support: ClassVar[QueryLenSupport] = QueryLenSupport.VARLEN
-    reorder_batch_threshold: int = 512  # process small prefills with decode pathway
+    reorder_batch_threshold: int = 512  # 将小 prefill 与 decode 一起处理
 
     def __init__(
         self,
@@ -124,7 +171,7 @@ class FlashAttnMLAMetadataBuilder(MLACommonMetadataBuilder[FlashAttnMLAMetadata]
             FlashAttnMLAMetadata,
             supports_dcp_with_varlen=(interleave_size == 1),
         )
-        self.max_num_splits = 0  # No upper bound on the number of splits.
+        self.max_num_splits = 0  # 分割数无上限
         self.fa_aot_schedule = get_flash_attn_version() == 3
 
         self.use_full_cuda_graph = (
@@ -133,11 +180,10 @@ class FlashAttnMLAMetadataBuilder(MLACommonMetadataBuilder[FlashAttnMLAMetadata]
         self.max_cudagraph_size = self.compilation_config.max_cudagraph_capture_size
 
         if self.use_full_cuda_graph and self.fa_aot_schedule:
-            # FA3 scheduler_metadata size: 1 + round_up(batch_size, 4) * 4
-            # The +1 is for the tile_count_semaphore (synchronization).
-            # The 4 slots per batch element (num_prepare_batch_vectors) are:
+            # FA3 scheduler_metadata 大小：1 + round_up(batch_size, 4) * 4
+            # +1 是 tile_count_semaphore（同步用）。
+            # 每 batch 元素的 4 个 slot（num_prepare_batch_vectors）是：
             #   prepare_varlen + dynamic_split + sort_batches + head_swizzle
-            # See: https://github.com/vllm-project/flash-attention/blob/5824e6e/hopper/flash_api.cpp#L664-L671  # noqa: E501
             max_batch_size = max(
                 vllm_config.scheduler_config.max_num_seqs,
                 self.max_cudagraph_size or 0,
@@ -147,9 +193,8 @@ class FlashAttnMLAMetadataBuilder(MLACommonMetadataBuilder[FlashAttnMLAMetadata]
                 dtype=torch.int32,
                 device=self.device,
             )
-            # When using cuda graph, we need to set the upper bound of the
-            # number of splits so that large enough intermediate buffers are
-            # pre-allocated during capture.
+            # 使用 cuda graph 时，需要设置分割数的上限，以便在捕获期间
+            # 预分配足够大的中间缓冲区。
             self.max_num_splits = (
                 vllm_config.attention_config.flash_attn_max_num_splits_for_cuda_graph
             )
@@ -167,6 +212,11 @@ class FlashAttnMLAMetadataBuilder(MLACommonMetadataBuilder[FlashAttnMLAMetadata]
         causal,
         max_num_splits,
     ):
+        """
+        为 decode 计算 FA3 调度器元数据。
+
+        仅在 FA3 可用时调用 get_scheduler_metadata。
+        """
         if self.fa_aot_schedule:
             return get_scheduler_metadata(
                 batch_size=num_reqs,
@@ -195,10 +245,19 @@ class FlashAttnMLAMetadataBuilder(MLACommonMetadataBuilder[FlashAttnMLAMetadata]
         num_decode_tokens: int,
         dcp_tot_seq_lens_device: torch.Tensor | None,
     ) -> FlashAttnMLADecodeMetadata:
+        """
+        构建 decode 部分的元数据。
+
+        流程：
+        1. 计算最大 query 长度
+        2. 确定是否使用 CUDA Graph 以及分割数
+        3. 计算 FA3 调度器元数据
+        4. 如果使用 CUDA Graph，将调度器元数据复制到持久化缓冲区
+        """
         query_lens_cpu = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
         max_query_len = query_lens_cpu.max().item()
 
-        # For Flash Attention MLA + full cudagraph
+        # 对于 Flash Attention MLA + 完整 cudagraph
         max_num_splits = 0
         if (
             self.use_full_cuda_graph
@@ -209,6 +268,8 @@ class FlashAttnMLAMetadataBuilder(MLACommonMetadataBuilder[FlashAttnMLAMetadata]
             # usage, because the intermediate buffers of size [num_splits,
             # num_heads, num_tokens, head_size] are allocated. Therefore,
             # we only set num_splits when using cuda graphs.
+            # 设置 num_splits > 1 可能增加内存使用，因为中间缓冲区会被分配。
+            # 因此，只在使用 cuda graphs 时设置 num_splits。
             max_num_splits = self.max_num_splits
 
         if envs.VLLM_BATCH_INVARIANT:
@@ -226,7 +287,7 @@ class FlashAttnMLAMetadataBuilder(MLACommonMetadataBuilder[FlashAttnMLAMetadata]
 
         if self.use_full_cuda_graph and scheduler_metadata is not None:
             n = scheduler_metadata.shape[0]
-            # Ensure the persistent buffer is large enough
+            # 确保持久化缓冲区足够大
             assert n <= self.scheduler_metadata.shape[0], (
                 f"Scheduler metadata size {n} exceeds buffer size "
                 f"{self.scheduler_metadata.shape[0]}"
@@ -236,6 +297,7 @@ class FlashAttnMLAMetadataBuilder(MLACommonMetadataBuilder[FlashAttnMLAMetadata]
             # metadata to guarantee the correctness. Otherwise, some thread
             # blocks may use the invalid scheduler metadata and overwrite the
             # output buffer.
+            # 应该将调度器元数据的其余部分清零以保证正确性。
             self.scheduler_metadata[n:] = 0
             scheduler_metadata = self.scheduler_metadata[:n]
 
@@ -253,6 +315,12 @@ class FlashAttnMLAMetadataBuilder(MLACommonMetadataBuilder[FlashAttnMLAMetadata]
 
 
 class FlashAttnMLAImpl(MLACommonImpl[FlashAttnMLAMetadata]):
+    """
+    FlashAttention MLA 注意力的具体实现。
+
+    使用 FlashAttention v3 的 MLA 专用内核执行注意力计算。
+    将 MLA 的 q_nope 作为 q_v 传递给 FlashAttention，实现低秩分解注意力。
+    """
     can_return_lse_for_decode: bool = True
 
     def __init__(
@@ -267,7 +335,7 @@ class FlashAttnMLAImpl(MLACommonImpl[FlashAttnMLAMetadata]):
         logits_soft_cap: float | None,
         attn_type: str,
         kv_sharing_target_layer_name: str | None,
-        # MLA Specific Arguments
+        # MLA 特有参数
         **mla_args,
     ) -> None:
         super().__init__(
@@ -313,6 +381,19 @@ class FlashAttnMLAImpl(MLACommonImpl[FlashAttnMLAMetadata]):
         attn_metadata: FlashAttnMLAMetadata,
         layer: AttentionLayer,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """
+        Decode 注意力的前向传播。
+
+        MLA 注意力计算流程：
+        1. 将 q 拆分为 q_nope（无 RoPE 部分）和 q_pe（RoPE 部分）
+        2. 将 KV 缓存拆分为 kv_c_cache（压缩 KV）和 k_pe_cache（RoPE K）
+        3. 调用 flash_attn_varlen_func：
+           - q = q_pe（RoPE 部分作为 Q）
+           - k = k_pe_cache（RoPE 部分作为 K）
+           - v = kv_c_cache（压缩 KV 作为 V）
+           - q_v = q_nope（无 RoPE 部分作为 Q_V，用于 MLA 的低秩分解）
+        4. 返回注意力输出和可选的 LSE
+        """
         assert kv_c_and_k_pe_cache.numel() > 0
         assert attn_metadata.decode is not None
 
@@ -332,13 +413,15 @@ class FlashAttnMLAImpl(MLACommonImpl[FlashAttnMLAMetadata]):
         # NOTE(matt): During CUDA graph capture, max_query_len can be 0, but the
         # kernel uses this to calculate grid dimensions. Ensure it's at least 1
         # to prevent invalid grid configuration during graph capture.
+        # 在 CUDA Graph 捕获期间，max_query_len 可能为 0，但内核使用它来计算 grid 维度。
+        # 确保至少为 1 以防止无效的 grid 配置。
         max_seqlen_q = max(attn_metadata.decode.max_query_len, 1)
 
         attn_out = flash_attn_varlen_func(
             q=q_pe,
-            k=k_pe_cache.unsqueeze(-2),  # Add head dim of 1
-            v=kv_c_cache.unsqueeze(-2),  # Add head dim of 1
-            q_v=q_nope,
+            k=k_pe_cache.unsqueeze(-2),  # 添加 head 维度 1
+            v=kv_c_cache.unsqueeze(-2),  # 添加 head 维度 1
+            q_v=q_nope,  # MLA 的低秩分解：q_nope 作为 q_v
             max_seqlen_q=max_seqlen_q,
             cu_seqlens_q=attn_metadata.decode.query_start_loc,
             max_seqlen_k=attn_metadata.decode.max_seq_len,
@@ -347,7 +430,7 @@ class FlashAttnMLAImpl(MLACommonImpl[FlashAttnMLAMetadata]):
             softmax_scale=self.scale,
             causal=True,
             return_softmax_lse=self.need_to_return_lse_for_decode,
-            fa_version=3,  # only version 3 is supported
+            fa_version=3,  # 只支持版本 3
             scheduler_metadata=attn_metadata.decode.scheduler_metadata,
             num_splits=attn_metadata.decode.max_num_splits,
             cp_world_size=self.dcp_world_size,
@@ -357,8 +440,8 @@ class FlashAttnMLAImpl(MLACommonImpl[FlashAttnMLAMetadata]):
 
         if self.need_to_return_lse_for_decode:
             o, lse = attn_out
-            # FA returns LSE in shape [ H, B ] but DCP wants [ B, H ]
-            return o, lse.transpose(0, 1)  # [ H, B ] -> [ B, H ]
+            # FA 返回 LSE 形状为 [H, B]，但 DCP 需要 [B, H]
+            return o, lse.transpose(0, 1)  # [H, B] -> [B, H]
         else:
             o = attn_out
             return o, None

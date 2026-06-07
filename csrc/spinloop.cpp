@@ -1,3 +1,33 @@
+// =============================================================================
+// 文件：spinloop.cpp
+// 模块：硬件优化的自旋等待（Spinloop）模块
+// =============================================================================
+//
+// 【模块功能概述】
+// 本模块实现了一个高性能的自旋等待机制，用于 vLLM 内部的进程间/线程间同步。
+// 它通过调用 Python 回调函数来检查某个条件是否满足，如果未满足则继续等待。
+//
+// 【核心设计理念】
+// 1. 传统自旋等待（busy-wait）会持续占用 CPU 资源，导致功耗浪费和 CPU 过热。
+// 2. 本模块利用 AMD CPU 的 MONITORX/MWAITX 指令，让 CPU 在等待期间进入低功耗状态，
+//    当被监控的内存地址被修改时，CPU 会自动唤醒，从而显著降低功耗。
+// 3. 对于不支持 MONITORX/MWAITX 的 CPU（如 Intel、ARM），回退到普通的自旋等待，
+//    但会插入 PAUSE（x86）或 YIELD（ARM）指令来提示 CPU 当前处于忙等待状态。
+//
+// 【应用场景】
+// 主要用于 vLLM 的多进程架构中，例如：
+// - EngineCore 进程等待 Worker 完成某项操作
+// - 异步任务之间的低延迟同步
+// 相比传统的 sleep/poll 方式，自旋等待可以实现更低的延迟。
+//
+// 【使用方式】
+// Python 层调用：spinloop.spinloop(buffer, callback, timeout)
+//   - buffer：需要监控的内存缓冲区（bytes/bytearray）
+//   - callback：回调函数，返回 True 表示条件满足，退出等待
+//   - timeout：超时时间（秒），可选
+//
+// =============================================================================
+
 #include <Python.h>
 
 extern "C" {
@@ -5,6 +35,10 @@ extern "C" {
 #include <stdbool.h>
 #include <time.h>
 
+// 【平台相关头文件】
+// x86/x86_64 平台需要以下头文件：
+//   - cpuid.h：用于查询 CPU 特性（如是否支持 MONITORX/MWAITX）
+//   - mwaitxintrin.h：提供 _mm_monitorx() 和 _mm_mwaitx() 内联函数
 #if defined(__i386__) || defined(__x86_64__)
   #include <cpuid.h>
   #include <mwaitxintrin.h>

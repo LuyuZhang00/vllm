@@ -19,6 +19,23 @@
  * Adapted from https://github.com/IST-DASLab/marlin
  */
 
+// =============================================================================
+// 中文注释：Marlin MoE WNA16 量化 GEMM 操作入口文件
+//
+// 本文件实现了 Marlin MoE WNA16 量化矩阵乘法的 Python 层入口。
+// 包含 permute_cols_kernel（列排列 kernel）和 moe_wna16_marlin_gemm 的调度逻辑。
+//
+// Marlin 的核心思想：
+// - 使用特殊的权重布局（Marlin 格式），使得量化权重可以高效地从全局内存加载
+// - 通过异步预取流水线（stages）隐藏内存延迟
+// - 使用 int4 打包的权重格式，最大化内存带宽利用率
+// - 支持分组量化和零点，适应不同的量化方案
+//
+// 与 moe_wna16.cu 的区别：
+// - moe_wna16.cu 使用自定义的反量化 + FMA 实现
+// - marlin_moe_wna16 使用 Marlin 的高度优化实现，性能更好但灵活性稍差
+// =============================================================================
+
 #ifndef MARLIN_NAMESPACE_NAME
   #define MARLIN_NAMESPACE_NAME marlin_moe_wna16
 #endif

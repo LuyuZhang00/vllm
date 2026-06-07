@@ -1,5 +1,33 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""KV 缓存管理器模块 (vllm/v1/core/kv_cache_manager.py)
+
+本模块实现了 vLLM v1 的 KV 缓存管理器（KVCacheManager），是调度器与底层
+KV 缓存存储之间的核心抽象层。
+
+架构位置：
+    Scheduler <-> KVCacheManager <-> KVCacheCoordinator <-> BlockPool
+                                    (本模块)              (协调器)      (块池)
+
+核心职责：
+1. 为调度器提供简洁的 KV 块分配/释放接口，隐藏底层多注意力组的复杂性
+2. 管理前缀缓存的查找逻辑，返回已缓存的块和命中长度
+3. 协调多个 KV 缓存组（如全注意力 + 滑动窗口注意力）的块分配
+4. 处理推测解码、外部 KV 传输等高级场景的块管理
+
+与调度器的交互流程：
+1. Scheduler 调用 get_computed_blocks(request) 查询前缀缓存命中
+2. Scheduler 调用 allocate_slots(request, num_new_tokens) 分配新块
+   - 内部调用 coordinator 分配物理块
+   - 处理前缀缓存命中的块追加
+   - 处理外部 KV 传输的块分配
+3. 请求完成后 Scheduler 调用 free(request) 释放所有块
+
+关键设计决策：
+- KVCacheBlocks 是调度器与管理器之间的接口类型，封装了多组 KV 块
+- empty_kv_cache_blocks 单例避免频繁创建空对象的 GC 开销
+- 协调器（coordinator）封装了不同注意力类型的管理器，管理器只需遍历即可
+"""
 
 import itertools
 from collections.abc import Sequence

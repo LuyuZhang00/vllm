@@ -3,6 +3,29 @@
 // Adapted from SGLang:
 // https://github.com/sgl-project/sglang/blob/ded068a76e00878881d52d5bfb791e0f60d7311b/sgl-kernel/csrc/expert_specialization/es_sm100_mxfp8_blockscaled_group_quant.cuh
 
+// =============================================================================
+// 中文注释：MXFP8 专家量化 kernel 实现
+//
+// 本文件实现了将 bf16/fp16 激活量化为 MXFP8 格式的 CUDA kernel。
+//
+// MXFP8 量化方案：
+// - 每个 128x128 的块（BLOCK_M x BLOCK_K）独立量化
+// - 每个 32 元素的子块共享一个缩放因子（scale factor）
+// - 缩放因子使用 E8M0 格式（8-bit 指数，无尾数）
+//
+// kernel 线程组织：
+// - THREAD_BLOCK_SIZE = 128 线程
+// - BLOCK_M = 128, BLOCK_K = 128
+// - 每个线程处理 16 个元素（ValLayout = 1x16）
+//
+// 核心步骤：
+// 1. 从全局内存加载 fp16/bf16 激活到寄存器
+// 2. 计算每个 32 元素子块的最大绝对值
+// 3. 计算缩放因子：scale = max_abs / FP8_MAX
+// 4. 将激活乘以 scale 的倒数，量化为 FP8
+// 5. 将 FP8 激活和缩放因子写入全局内存
+// =============================================================================
+
 #pragma once
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>

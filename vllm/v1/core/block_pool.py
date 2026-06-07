@@ -1,5 +1,34 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""KV 缓存块池模块 (vllm/v1/core/block_pool.py)
+
+本模块实现了 vLLM v1 的 KV 缓存块池（BlockPool），是 KV 缓存管理的底层基础设施。
+
+核心职责：
+1. 管理 GPU 上所有 KV 缓存物理块的分配和回收
+2. 维护前缀缓存哈希查找表，支持高效的缓存命中查询
+3. 实现 LRU 驱逐策略，决定哪些缓存块可以被回收复用
+4. 管理引用计数，确保被多个请求共享的缓存块不被提前释放
+
+核心数据结构：
+- blocks: 所有 KVCacheBlock 对象的数组（按 block_id 索引）
+- free_block_queue: 双向链表实现的空闲块队列（LRU 顺序）
+- cached_block_hash_to_block: block_hash -> KVCacheBlock 的哈希查找表
+- null_block: 特殊占位块，用于滑动窗口中被跳过的位置
+
+块的生命周期：
+1. 初始状态：所有块在 free_block_queue 中（ref_cnt=0）
+2. 分配：get_new_blocks() 从队列头部弹出，ref_cnt 设为 1
+3. 缓存命中：touch() 将块从空闲队列移除，ref_cnt++
+4. 释放：free_blocks() 减少 ref_cnt，归 0 时放回空闲队列尾部
+5. 驱逐：当块从空闲队列头部被分配时，若仍有缓存哈希，先清除再复用
+
+设计要点：
+- 双向链表支持 O(1) 的中间移除（touch 场景：缓存命中需从空闲队列移除块）
+- 逆序释放策略：尾部块先释放，头部前缀块保留，最大化缓存命中率
+- null_block 是不占用实际 KV 数据的占位符，不参与正常的引用计数管理
+"""
+
 from collections.abc import Iterable, Sequence
 from typing import Any
 

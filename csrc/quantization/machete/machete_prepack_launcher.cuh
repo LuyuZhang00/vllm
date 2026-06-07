@@ -1,11 +1,35 @@
 #pragma once
 
+// =============================================================================
+// 中文注释: Machete 权重预打包启动器
+// =============================================================================
+// 本文件实现了 Machete 的权重预打包 (prepack) 功能。
+//
+// 为什么需要预打包:
+//   - Machete 使用 CUTLASS 的 GEMM 框架，要求权重按特定的内存布局存储
+//   - 预打包将原始量化权重转换为 CUTLASS 所需的内部布局
+//   - 预打包在模型加载时一次性完成，运行时直接使用打包后的权重
+//
+// 预打包流程:
+//   1. 从 PyTorch 张量提取权重数据指针
+//   2. 转置权重矩阵 (从 (packed_K, N) 到 (N, packed_K))
+//   3. 调用预打包 kernel 将权重按 PPBlockShape_NK 的 tile 大小重新排列
+//   4. 返回打包后的权重张量
+//
+// PrepackBArgs 结构体:
+//   B: 待打包的量化权重张量
+//   a_type: 激活数据类型 (用于确定打包策略)
+//   b_type: 权重量化类型
+//   maybe_group_scales_type: 可选的 group 缩放因子类型
+// =============================================================================
+
 #include "machete_prepack_kernel.cuh"
 #include "cutlass_extensions/torch_utils.hpp"
 #include "core/scalar_type.hpp"
 
 namespace machete {
 
+// 中文注释: 预打包参数结构体
 struct PrepackBArgs {
   torch::Tensor const& B;
   at::ScalarType a_type;

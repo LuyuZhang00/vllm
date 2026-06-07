@@ -1,4 +1,29 @@
 // copied from https://github.com/ggerganov/llama.cpp/blob/b2899/ggml-common.h
+
+// =============================================================================
+// 中文注释: GGUF 量化格式公共定义
+// =============================================================================
+// 本文件定义了 GGUF (GGML Universal Format) 量化格式的数据结构和常量。
+// GGUF 是 llama.cpp 使用的量化格式，支持多种量化精度 (Q4_0, Q4_1, Q5_0 等)。
+//
+// 量化格式说明:
+//   - 每种格式将连续的 QK 个浮点值量化为一个 block
+//   - 每个 block 包含: 量化值 (qs) + 缩放因子 (d) + 可选的零点 (min)
+//   - QK: 每个 block 的元素数量 (通常是 32 或 256)
+//   - QR: 反量化比率 (QK / 反量化前的值数量)
+//   - QI: 每个 block 中 32-bit 整数的数量
+//
+// 常量说明:
+//   - QK_K = 256: K-quant 格式的 block 大小
+//   - K_QUANTS_PER_ITERATION = 2: 每次迭代处理的 K-quant 数量
+//   - WARP_SIZE_GGUF = 32: warp 大小
+//   - K_SCALE_SIZE = 12: K-quant 缩放因子大小
+//   - CUDA_DEQUANTIZE_BLOCK_SIZE = 256: 反量化 kernel 的 block 大小
+//   - CUDA_QUANTIZE_BLOCK_SIZE = 256: 量化 kernel 的 block 大小
+//   - GGML_CUDA_DMMV_X = 32: dequant mul mat vec 的 X 维度
+//   - GGML_CUDA_MMV_Y = 1: matrix mul vec 的 Y 维度
+// =============================================================================
+
 #define QK_K 256
 #define K_QUANTS_PER_ITERATION 2
 #define WARP_SIZE_GGUF 32

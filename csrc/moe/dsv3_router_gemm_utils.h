@@ -18,6 +18,14 @@
  * limitations under the License.
  */
 
+// =============================================================================
+// 中文注释：DeepSeek V3 Router GEMM 工具函数
+//
+// 本文件提供 DSV3 Router GEMM 所需的辅助函数。
+// getSMVersion() 获取当前 GPU 的 SM 版本号（如 SM90 返回 90），
+// 用于在运行时判断是否支持特定的 PTX 指令（如 griddepcontrol）。
+// =============================================================================
+
 #pragma once
 
 #include <ATen/cuda/CUDAContext.h>

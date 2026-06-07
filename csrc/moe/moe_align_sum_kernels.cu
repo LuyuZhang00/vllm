@@ -1,3 +1,26 @@
+// =============================================================================
+// 中文注释：MoE Token 分组对齐与求和 kernel 实现文件
+//
+// 本文件实现了 MoE 推理中的两个关键前置步骤：
+// 1. moe_align_block_size —— 将 token 按专家分组并对齐到 block_size 边界。
+//    这是 Triton fused_moe kernel 的前置步骤，确保每个专家的 token 数量
+//    是 block_size 的倍数，避免边界检查开销。
+// 2. moe_sum —— 将多个专家的输出按 top-k 权重加权求和。
+//
+// moe_align_block_size 的核心算法：
+// 1. 统计每个专家被分配到多少个 token（使用 atomicAdd）。
+// 2. 对每个专家的 token 数向上对齐到 block_size 的倍数。
+// 3. 计算前缀和，确定每个专家在排序后数组中的起始位置。
+// 4. 将 token 索引按专家分组写入 sorted_token_ids。
+// 5. 填充 expert_ids（每个 block 对应的专家 ID）。
+//
+// 支持的变体：
+// - 标准版：用于单 batch 的 token 分组对齐。
+// - batched 版：用于 multi-step scheduling 的批量 token 分组对齐。
+// - LoRA 版：在 MoE + LoRA 场景下，按 (LoRA ID, Expert ID) 双重分组。
+// - small_batch_expert 版：针对小 batch + 小专家数的优化路径。
+// =============================================================================
+
 #include <torch/all.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -19,6 +42,13 @@ namespace batched_moe_align_block_size {
 // Note num_threads needs to be 1024 for BlockScan Reduction in the kernel.
 static constexpr int32_t num_threads = 1024;
 static constexpr int32_t num_blocks = 1;
+// 中文注释：batched_moe_align_block_size_kernel —— 批量版本的 token 分组对齐 kernel。
+// 用于 multi-step scheduling 等场景，一次处理多个 micro-batch 的 token 分配。
+// 每个线程负责一个 batch，计算该 batch 的 token 在全局排序后数组中的位置。
+// 算法：
+// 1. 每个 batch 的 token 数向上对齐到 block_size。
+// 2. 使用 BlockScan 计算前缀和，确定每个 batch 在全局数组中的偏移。
+// 3. 将 token 索引写入 sorted_ids，将 batch ID 写入 block_ids。
 __global__ void batched_moe_align_block_size_kernel(
     int32_t const num_batches, int32_t const max_tokens_per_batch,
     int32_t const block_size, int32_t const* __restrict__ batch_num_tokens,
@@ -78,6 +108,19 @@ __global__ void batched_moe_align_block_size_kernel(
 }
 }  // namespace batched_moe_align_block_size
 
+// 中文注释：_moe_align_block_size —— 核心的 token 分组对齐 device 函数。
+// 被 moe_align_block_size_kernel 和 moe_lora_align_block_size_kernel 调用。
+//
+// 算法流程：
+// 1. 使用 shared memory 统计每个专家的 token 数（atomicAdd）。
+// 2. 使用 CUB BlockScan 计算前缀和，每个专家的 token 数向上对齐到 block_size。
+// 3. 根据前缀和填充 expert_ids（每个 block 对应的专家 ID）。
+// 4. 另一半线程（blockIdx.x % 2）负责初始化 sorted_token_ids。
+//
+// 两个 threadblock 协作：
+// - blockIdx.x % 2 == 0：统计专家计数 + 对齐 + 填充 expert_ids
+// - blockIdx.x % 2 == 1：初始化 sorted_token_ids 为 numel（哨兵值）
+// 后续由 count_and_sort_expert_tokens_kernel 填充实际的 token 索引。
 template <typename scalar_t>
 __device__ void _moe_align_block_size(
     const scalar_t* __restrict__ topk_ids,
@@ -180,6 +223,12 @@ __device__ void _moe_align_block_size(
   }
 }
 
+// 中文注释：_moe_align_block_size_small_batch_expert
+// —— 针对小 batch（numel < 1024）+ 小专家数（<=64）的优化版本。
+// 将 token 计数、前缀和计算、token 排序合并到一个 kernel 中，
+// 避免了额外的 count_and_sort_expert_tokens_kernel 调用。
+// 使用线程分组：fill_threads 个线程负责初始化 sorted_token_ids，
+// 其余线程负责统计和排序。
 template <typename scalar_t, int32_t fill_threads>
 __device__ void _moe_align_block_size_small_batch_expert(
     const scalar_t* __restrict__ topk_ids,
@@ -288,6 +337,9 @@ __device__ void _moe_align_block_size_small_batch_expert(
   }
 }
 
+// 中文注释：_count_and_sort_expert_tokens —— 统计每个专家的 token 并按专家分组排序。
+// 使用 atomicAdd 将每个 token 的全局索引写入其对应专家的位置。
+// 此函数在 _moe_align_block_size 之后调用，负责填充 sorted_token_ids 的实际值。
 template <typename scalar_t>
 __device__ void _count_and_sort_expert_tokens(
     const scalar_t* __restrict__ topk_ids,
@@ -346,6 +398,12 @@ __global__ void count_and_sort_expert_tokens_kernel(
       max_num_tokens_padded, nullptr, 0, topk_num, has_expert_map);
 }
 
+// 中文注释：moe_sum_kernel —— MoE 输出求和 kernel。
+// 将多个专家的输出按 top-k 维度求和，得到最终 MoE 层输出。
+// 输入形状：[num_tokens, topk, hidden_size]
+// 输出形状：[num_tokens, hidden_size]
+// 每个 block 处理一个 token，每个线程处理 hidden_size 中的一个或多个元素。
+// 通过模板参数 TOPK（2/3/4）实现编译期循环展开，避免运行时开销。
 template <typename scalar_t, int TOPK>
 __global__ void moe_sum_kernel(
     scalar_t* __restrict__ out,          // [..., d]
@@ -490,6 +548,21 @@ __global__ void moe_lora_align_block_size_small_batch_expert_kernel(
 }  // namespace moe
 }  // namespace vllm
 
+// 中文注释：moe_align_block_size —— Python 层调用的 token 分组对齐入口函数。
+// 输入：
+//   topk_ids: [num_tokens, topk] — 每个 token 选中的专家 ID
+//   num_experts: 专家总数
+//   block_size: 分块大小（通常为 Triton kernel 的 BLOCK_SIZE_M）
+//   maybe_expert_map: 可选的专家映射表（用于 expert parallelism）
+// 输出：
+//   sorted_token_ids: [max_num_tokens_padded] — 按专家分组排序后的 token 索引
+//   experts_ids: [max_num_m_blocks] — 每个 block 对应的专家 ID
+//   num_tokens_post_pad: [1] — padding 后的总 token 数
+//
+// 调度逻辑：
+// 1. 如果 numel < 1024 且 num_experts <= 64，使用 small_batch_expert 优化路径。
+// 2. 否则使用标准路径：先调用 moe_align_block_size_kernel 统计和对齐，
+//    再调用 count_and_sort_expert_tokens_kernel 排序 token。
 // taken from
 // https://github.com/sgl-project/sglang/blob/8b5f83ed3b7d2a49ad5c5cd5aa61c5d502f47dbc
 void moe_align_block_size(torch::Tensor topk_ids, int64_t num_experts,
@@ -613,6 +686,9 @@ void batched_moe_align_block_size(int64_t max_tokens_per_batch,
       num_tokens_post_pad.data_ptr<int32_t>());
 }
 
+// 中文注释：moe_sum —— Python 层调用的 MoE 输出求和入口函数。
+// 将多个专家的输出按 top-k 维度求和。
+// 根据 topk 值（2/3/4）分发到对应的模板实例，topk > 4 时回退到 at::sum_out。
 void moe_sum(torch::Tensor& input,   // [num_tokens, topk, hidden_size]
              torch::Tensor& output)  // [num_tokens, hidden_size]
 {

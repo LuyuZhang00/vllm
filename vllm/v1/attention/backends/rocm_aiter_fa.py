@@ -1,6 +1,25 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Attention layer with AiterFlashAttention."""
+# ROCm AITER FlashAttention 后端模块。
+#
+# AITER (AMD Instinct Training and Efficient Rendering) 是 AMD 提供的
+# 高性能 GPU 计算库，专为 AMD Instinct 系列 GPU（如 MI300X）优化。
+# 本模块使用 AITER 的 FlashAttention 实现来替代 NVIDIA 的 flash_attn。
+#
+# 关键特性：
+# 1. 仅支持 AMD MI3xx 系列 GPU（如 MI300X）
+# 2. 支持 decode、prefill 和 extend（分块 prefill）三种模式
+# 3. 支持滑动窗口注意力（Sliding Window Attention）
+# 4. 支持 FP8 量化 KV 缓存（SHUFFLE 和 NHD 两种布局）
+# 5. 支持 RoPE 与 KV 缓存更新的融合操作
+# 6. 支持 CUDA Graph（UNIFORM_BATCH 模式）
+#
+# 内存布局：
+# - 标准布局 (NHD): [num_blocks, block_size, num_kv_heads, head_dim]
+# - SHUFFLE 布局: 优化的交错布局，提高缓存局部性
+#
+# 支持的 KV 缓存数据类型：auto, float16, bfloat16, fp8, fp8_e4m3, fp8_e5m2
 
 from dataclasses import dataclass
 from typing import ClassVar
@@ -39,9 +58,11 @@ if current_platform.is_rocm():
     from vllm.triton_utils import tl, triton
 
     def block_size(x, head_dim):
+        """计算 Triton 内核的块大小。取元素大小相关的上限和 head_dim 的下一个 2 的幂的最小值。"""
         return min(65536 // x.element_size(), triton.next_power_of_2(head_dim))
 
     def num_programs(total_tokens):
+        """计算 Triton 程序数量。取 token 总数和计算单元数的最小值。"""
         return min(total_tokens, num_compute_units())
 
     @triton.jit
@@ -165,6 +186,14 @@ if current_platform.is_rocm():
         kv_cache_layout: str,
         total_tokens: int,
     ):
+        """从 KV 缓存中收集（gather）K/V 数据到连续的张量中。
+
+        这是分块 prefill（extend）路径中的关键操作：将分散在
+        分页 KV 缓存中的 K/V 数据收集到连续的缓冲区中，
+        以便后续的注意力计算。
+
+        支持两种缓存布局：NHD 和 SHUFFLE。
+        """
         assert kv_cache_layout in ["NHD", "SHUFFLE"], (
             "kv_cache_layout only supports NHD, SHUFFLE"
         )
@@ -317,48 +346,57 @@ logger = init_logger(__name__)
 
 @dataclass
 class AiterFlashAttentionDecodeMetadata:
-    max_query_len: int
+    """Decode 注意力的元数据。"""
+    max_query_len: int  # decode 请求的最大查询长度（通常为 1）
 
 
 @dataclass
 class AiterFlashAttentionPrefillMetadata:
-    max_query_len: int
-    max_seq_len: int
-    query_start_loc: torch.Tensor
+    """Prefill 注意力的元数据。"""
+    max_query_len: int  # prefill 请求的最大查询长度
+    max_seq_len: int  # prefill 请求的最大序列长度
+    query_start_loc: torch.Tensor  # 查询的累积序列长度
 
 
 @dataclass
 class AiterChunkSlidingWindowMetadata:
-    swa_cu_seqlens: torch.Tensor
-    swa_seq_starts: torch.Tensor
-    swa_token_to_batch: torch.Tensor
-    swa_max_seqlens: int
-    swa_total_tokens: int
-    swa_workspace: torch.Tensor
+    """滑动窗口注意力的分块元数据。"""
+    swa_cu_seqlens: torch.Tensor  # 滑动窗口内的累积序列长度
+    swa_seq_starts: torch.Tensor  # 每个请求的滑动窗口起始位置
+    swa_token_to_batch: torch.Tensor  # token 到批次索引的映射
+    swa_max_seqlens: int  # 滑动窗口内的最大序列长度
+    swa_total_tokens: int  # 滑动窗口内的总 token 数
+    swa_workspace: torch.Tensor  # 用于收集 K/V 的工作空间
 
 
 @dataclass
 class AiterChunkContextMetadata:
-    workspace: torch.Tensor
-    cu_seq_lens_chunk: torch.Tensor
-    chunk_starts: torch.Tensor
-    token_to_batch: torch.Tensor
-    max_seq_lens: list[int]
-    num_chunks: int
-    total_token_per_batch: list[int]
-    swa_metadata: AiterChunkSlidingWindowMetadata | None
+    """分块上下文（extend）的元数据。"""
+    workspace: torch.Tensor  # 收集 K/V 的工作空间缓冲区
+    cu_seq_lens_chunk: torch.Tensor  # 每个分块的累积序列长度
+    chunk_starts: torch.Tensor  # 每个分块在序列中的起始位置
+    token_to_batch: torch.Tensor  # token 到批次索引的映射
+    max_seq_lens: list[int]  # 每个分块的最大序列长度
+    num_chunks: int  # 分块数量
+    total_token_per_batch: list[int]  # 每个分块的总 token 数
+    swa_metadata: AiterChunkSlidingWindowMetadata | None  # 滑动窗口元数据（可选）
 
 
 @dataclass
 class AiterFlashAttentionChunkPrefillMetadata:
-    max_query_len: int
-    max_seq_len: int
-    query_start_loc: torch.Tensor
-    chunk_context_metadata: AiterChunkContextMetadata
+    """分块 prefill（extend）的元数据。"""
+    max_query_len: int  # 最大查询长度
+    max_seq_len: int  # 最大序列长度
+    query_start_loc: torch.Tensor  # 查询的累积序列长度
+    chunk_context_metadata: AiterChunkContextMetadata  # 分块上下文元数据
 
 
 @dataclass
 class AiterFlashAttentionMetadata:
+    """AiterFlashAttention 的完整元数据，包含所有注意力计算所需的信息。
+
+    包含三种模式的元数据：decode、prefill、extend（分块 prefill）。
+    """
     # NOTE(sang): Definition of context_len, query_len, and seq_len.
     # |---------- N-1 iteration --------|
     # |---------------- N iteration ---------------------|
@@ -366,31 +404,40 @@ class AiterFlashAttentionMetadata:
     # |---------- context_len ----------|
     # |-------------------- seq_len ---------------------|
     #                                   |-- query_len ---|
+    #
+    # context_len: 之前迭代中已经处理过的 token 数量
+    # seq_len:     总序列长度（context_len + query_len）
+    # query_len:   当前迭代新处理的 token 数量
 
-    num_actual_tokens: int  # Number of tokens excluding padding.
-    query_start_loc: torch.Tensor
-    max_seq_len: int
-    seq_lens: torch.Tensor
-    slot_mapping: torch.Tensor
-    block_table: torch.Tensor
-    causal: bool
+    num_actual_tokens: int  # 实际 token 数（不含填充）
+    query_start_loc: torch.Tensor  # 查询的累积序列长度
+    max_seq_len: int  # 批次中最长的序列长度
+    seq_lens: torch.Tensor  # 每个请求的总序列长度
+    slot_mapping: torch.Tensor  # token 到缓存槽的映射
+    block_table: torch.Tensor  # 块表，用于从分页缓存中查找 KV
+    causal: bool  # 是否使用因果掩码
 
     # prefill and decode split
-    num_decodes: int
-    num_decode_tokens: int
-    num_prefills: int
-    num_extends: int
-    num_extend_tokens: int
+    # decode、prefill、extend 的分离信息
+    num_decodes: int  # decode 请求数
+    num_decode_tokens: int  # decode token 总数
+    num_prefills: int  # prefill 请求数
+    num_extends: int  # extend（分块 prefill）请求数
+    num_extend_tokens: int  # extend token 总数
 
+    # 各模式的专用元数据
     decode_metadata: AiterFlashAttentionDecodeMetadata | None
     prefill_metadata: AiterFlashAttentionPrefillMetadata | None
     extend_metadata: AiterFlashAttentionChunkPrefillMetadata | None
 
     # For cascade attention.
+    # 是否使用级联注意力（用于长公共前缀优化）
     use_cascade: bool
 
     # Only for fp8 shuffle layout kv cache, we allocate kv_scale for each layer
     # since we might integrate per token quant for kv cache in the future.
+    # 仅用于 FP8 SHUFFLE 布局的 KV 缓存。为每层分配 kv_scale，
+    # 因为未来可能集成每 token 量化的 KV 缓存。
     k_scale: dict[str, torch.Tensor] | None
     v_scale: dict[str, torch.Tensor] | None
 
@@ -398,6 +445,11 @@ class AiterFlashAttentionMetadata:
 class AiterFlashAttentionMetadataBuilder(
     AttentionMetadataBuilder[AiterFlashAttentionMetadata]
 ):
+    """AiterFlashAttention 的元数据构建器。
+
+    负责从调度器输出构建 AiterFlashAttentionMetadata。
+    处理 decode、prefill、extend（分块 prefill）三种模式的元数据。
+    """
     _cudagraph_support = AttentionCGSupport.UNIFORM_BATCH
 
     def __init__(
@@ -407,6 +459,13 @@ class AiterFlashAttentionMetadataBuilder(
         vllm_config: VllmConfig,
         device: torch.device,
     ):
+        """初始化元数据构建器。
+
+        主要工作：
+        1. 获取模型的头数、头维度等配置
+        2. 检查滑动窗口注意力配置
+        3. 初始化 extend 工作空间缓冲区
+        """
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
 
         self.model_config = vllm_config.model_config
@@ -708,7 +767,11 @@ class AiterFlashAttentionMetadataBuilder(
 
 
 class AiterFlashAttentionBackend(AttentionBackend):
+    """AiterFlashAttention 后端的主类，定义后端能力和工厂方法。"""
+
+    # 支持的数据类型
     supported_dtypes: ClassVar[list[torch.dtype]] = [torch.float16, torch.bfloat16]
+    # 支持的 KV 缓存数据类型
     supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
         "auto",
         "float16",
@@ -725,6 +788,9 @@ class AiterFlashAttentionBackend(AttentionBackend):
         query_start_loc (not encoder seq lens) and causal=True, both of
         which are incorrect for cross-attention layers.
         """
+        # 仅支持 DECODER 类型。不支持 ENCODER_DECODER，因为 prefill 路径
+        # 使用的 cu_seqlens_k 设置为 decoder 的 query_start_loc（而非 encoder
+        # 的序列长度），且 causal=True，这对交叉注意力层是不正确的。
         return attn_type in (AttentionType.DECODER,)
 
     @staticmethod
@@ -776,6 +842,12 @@ class AiterFlashAttentionBackend(AttentionBackend):
 
 
 class AiterFlashAttentionImpl(AttentionImpl):
+    """AiterFlashAttention 的注意力实现类。
+
+    处理 decode、prefill 和 extend（分块 prefill）三种注意力模式。
+    使用 ROCm AITER 库的 flash_attn_varlen_func 和 paged_attention 内核。
+    """
+
     def __init__(
         self,
         num_heads: int,
@@ -789,6 +861,20 @@ class AiterFlashAttentionImpl(AttentionImpl):
         attn_type: AttentionType = AttentionType.DECODER,
         kv_sharing_target_layer_name: int | None = None,
     ) -> None:
+        """初始化 AiterFlashAttentionImpl。
+
+        Args:
+            num_heads: Q 的注意力头数
+            head_size: 头维度
+            scale: 注意力缩放因子
+            num_kv_heads: KV 的头数
+            alibi_slopes: ALiBi 注意力的斜率
+            sliding_window: 滑动窗口大小（None 表示无窗口）
+            kv_cache_dtype: KV 缓存数据类型
+            logits_soft_cap: logits 软上限
+            attn_type: 注意力类型
+            kv_sharing_target_layer_name: KV 缓存共享的目标层名
+        """
         self.num_heads = num_heads
         self.head_size = head_size
         self.scale = float(scale)
@@ -832,6 +918,11 @@ class AiterFlashAttentionImpl(AttentionImpl):
         k_scale: float,
         v_scale: float,
     ):
+        """处理滑动窗口注意力的 extend（分块 prefill）路径。
+
+        从 KV 缓存中收集滑动窗口范围内的 K/V 数据，
+        然后使用 flash_attn_varlen_func 执行注意力计算。
+        """
         assert attn_metadata.extend_metadata is not None
         assert attn_metadata.extend_metadata.chunk_context_metadata is not None
         chunked_metadata = attn_metadata.extend_metadata.chunk_context_metadata
@@ -898,6 +989,16 @@ class AiterFlashAttentionImpl(AttentionImpl):
         k_scale: torch.Tensor,
         v_scale: torch.Tensor,
     ):
+        """Extend（分块 prefill）的前向传播。
+
+        处理流程：
+        1. 如果有滑动窗口，调用 extend_for_sliding_window
+        2. 否则：
+           a. 先对当前批次的新 token 执行因果注意力
+           b. 从 KV 缓存中分块收集已缓存的 K/V
+           c. 对每个分块执行非因果注意力
+           d. 使用 merge_attn_states 合并所有分块的结果
+        """
         if self.sliding_window[0] != -1:
             self.extend_for_sliding_window(
                 attn_metadata,

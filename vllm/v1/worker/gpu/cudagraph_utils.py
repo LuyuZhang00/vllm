@@ -1,5 +1,33 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+"""
+CUDA Graph 管理工具模块。
+
+本模块实现了 vLLM v1 引擎的 CUDA Graph 捕获和回放功能。
+CUDA Graph 可以将一系列 CUDA 操作预录为一个图，后续只需回放该图即可，
+避免了 CPU 端的内核启动开销，显著提升推理性能。
+
+核心概念：
+1. CUDA Graph 模式：
+   - NONE: 不使用 CUDA Graph（eager 模式）
+   - FULL: 完整 CUDA Graph，整个前向传播被捕获为一个图
+   - PIECEWISE: 分段 CUDA Graph，支持将不同形状的子图分别捕获
+
+2. 批次执行描述符（BatchExecutionDescriptor）：
+   - 描述一个批次的形状（token 数、请求数）和 CUDA Graph 模式
+   - 用于在捕获和运行时进行形状匹配
+
+3. 统一 token 计数（uniform_token_count）：
+   - 当批次中所有请求的 token 数相同时，记录该值
+   - 用于匹配专用的解码 CUDA Graph
+
+主要组件：
+1. CudaGraphManager - 通用的 CUDA Graph 管理器
+2. ModelCudaGraphManager - 模型专用的 CUDA Graph 管理器（管理隐藏状态）
+3. CapturedAttentionState - 捕获的注意力状态
+4. BatchExecutionDescriptor - 批次执行描述符
+"""
 from collections import defaultdict
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -34,14 +62,28 @@ logger = init_logger(__name__)
 
 
 class CapturedAttentionState(NamedTuple):
+    """CUDA Graph 捕获时的注意力状态。
+
+    属性:
+        attn_metadata: 捕获时的注意力元数据（PIECEWISE 模式下为 None）
+        slot_mappings: 每层的 slot 映射字典
+    """
     attn_metadata: dict[str, Any] | None
     slot_mappings: dict[str, torch.Tensor]
 
 
 @dataclass(frozen=True)
 class BatchExecutionDescriptor:
-    """Describes the shape of the batch and CG mode to run; this is used to make shape
-    matches between the capture and runtime."""
+    """描述批次形状和 CUDA Graph 模式的不可变数据类。
+
+    用于在 CUDA Graph 捕获和运行时之间进行形状匹配。
+
+    属性:
+        cg_mode: CUDA Graph 模式（NONE/FULL/PIECEWISE）
+        num_tokens: 批次中的 token 总数
+        num_reqs: 批次中的请求数（PIECEWISE 模式下为 None，表示不需要请求填充）
+        uniform_token_count: 统一的每请求 token 数（用于匹配专用解码图）
+    """
 
     cg_mode: CUDAGraphMode
     num_tokens: int
@@ -55,6 +97,22 @@ def _is_compatible(
     num_tokens: int,
     uniform_token_count: int | None,
 ) -> bool:
+    """检查批次执行描述符是否与给定的批次参数兼容。
+
+    兼容性条件：
+    1. uniform_token_count 匹配（或描述符不关心此值）
+    2. 请求数不超过描述符的最大请求数（或描述符不关心此值）
+    3. token 数不超过描述符的最大 token 数
+
+    参数:
+        desc: 待检查的批次执行描述符
+        num_reqs: 实际请求数
+        num_tokens: 实际 token 数
+        uniform_token_count: 实际的统一 token 计数
+
+    返回:
+        bool: 是否兼容
+    """
     # desc.uniform_token_count=None (PIECEWISE) can handle any uniform_token_count
     # desc.num_reqs=None means no request padding needed (PIECEWISE)
     return (
@@ -72,9 +130,18 @@ def get_uniform_token_count(
     num_tokens: int,
     max_query_len: int,
 ) -> int | None:
-    """
-    Return the uniform token count if batch is uniform, else None.
-    A batch is uniform if all requests have the same number of tokens.
+    """判断批次是否为"统一"批次，并返回统一的 token 计数。
+
+    统一批次是指批次中所有请求拥有相同数量的 token。
+    这在纯解码阶段很常见（每个请求恰好 1 个 token）。
+
+    参数:
+        num_reqs: 请求数量
+        num_tokens: token 总数
+        max_query_len: 最大查询长度
+
+    返回:
+        int | None: 统一的每请求 token 数，非统一时返回 None
     """
     if (max_query_len == num_tokens // num_reqs) and (
         num_tokens == max_query_len * num_reqs
@@ -84,6 +151,23 @@ def get_uniform_token_count(
 
 
 class CudaGraphManager:
+    """通用的 CUDA Graph 管理器。
+
+    负责：
+    1. 初始化候选的 CUDA Graph 描述符列表
+    2. 捕获 CUDA Graph
+    3. 根据批次形状调度合适的 CUDA Graph
+    4. 回放 CUDA Graph
+
+    属性:
+        vllm_config: vLLM 全局配置
+        device: 计算设备
+        max_num_reqs: 最大请求数
+        cudagraph_mode: CUDA Graph 模式
+        decode_query_len: 解码阶段的查询长度（通常为 1 + num_spec_steps）
+        graphs: 已捕获的 CUDA Graph 字典
+    """
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -110,14 +194,24 @@ class CudaGraphManager:
         self._graphs_captured = False
         self._candidates: list[list[BatchExecutionDescriptor]] = []
         self._capture_descs: dict[CUDAGraphMode, list[BatchExecutionDescriptor]] = {}
-        # adjust the cudagraph sizes to be a multiple of the uniform decode query length
+        # 调整 CUDA Graph 捕获大小，使其为统一解码查询长度的倍数
         self.compilation_config.adjust_cudagraph_sizes_for_spec_decode(
             self.decode_query_len, self.tp_size
         )
         self._init_candidates()
 
     def _init_candidates(self) -> None:
-        """Build priority-ordered candidate lists for each token count."""
+        """构建按优先级排序的候选 CUDA Graph 描述符列表。
+
+        对于每个 token 数，创建候选描述符列表。在运行时，通过匹配
+        token 数快速找到兼容的 CUDA Graph。
+
+        流程：
+        1. 遍历所有需要捕获的大小
+        2. 为解码模式（统一 token 计数）创建专用描述符
+        3. 为混合模式（任意 token 分布）创建通用描述符
+        4. 构建从 token 数到候选列表的映射
+        """
         capture_sizes = self.compilation_config.cudagraph_capture_sizes
         if not (self.cudagraph_mode and capture_sizes):
             return
@@ -132,7 +226,7 @@ class CudaGraphManager:
         descs_by_mode = defaultdict(list)
 
         for num_tokens in capture_sizes:
-            # Capture uniform decode specfifc graphs if required
+            # 如果需要独立的解码路径，捕获统一解码专用图
             #  (i.e. separate decode routine)
             if (
                 separate_decode_routine
@@ -149,9 +243,8 @@ class CudaGraphManager:
                 descs_by_token_count[num_tokens].append(desc)
 
             if mixed_mode:
-                # for PIECEWISE graphs there is no limit on requests when replaying
-                # i.e. no request padding is needed
-                # so we leave it as None
+                # 对于 PIECEWISE 图，回放时没有请求数限制
+                # （即不需要请求填充），所以设为 None
                 num_reqs = (
                     min(num_tokens, self.max_num_reqs)
                     if mixed_mode == CUDAGraphMode.FULL
@@ -168,6 +261,7 @@ class CudaGraphManager:
         if not descs_by_token_count:
             return
 
+        # 构建从 token 数到候选描述符列表的映射
         sorted_padded = sorted(descs_by_token_count.keys())
         self._candidates = [[] for _ in range(sorted_padded[-1] + 1)]
 
@@ -177,11 +271,13 @@ class CudaGraphManager:
                 self._candidates[i] = descs_by_token_count[cg_size]
             current_range_start = cg_size + 1
 
+        # 按模式对描述符排序（从大到小）
         for mode, descs in descs_by_mode.items():
             descs.sort(key=lambda d: d.num_tokens, reverse=True)
             self._capture_descs[mode] = descs
 
     def needs_capture(self) -> bool:
+        """检查是否需要捕获 CUDA Graph。"""
         return len(self._capture_descs) > 0
 
     @torch.inference_mode()
@@ -193,11 +289,18 @@ class CudaGraphManager:
         ],
         progress_bar_desc: str = "Capturing CUDA graphs",
     ) -> dict[BatchExecutionDescriptor, CapturedAttentionState]:
-        """Capture CUDA graphs.
+        """捕获 CUDA Graph。
 
-        Args:
-            create_forward_fn: Factory that prepares inputs (OUTSIDE graph) and
-                returns a tuple of (forward_fn, captured_attn_state).
+        捕获顺序：先 PIECEWISE，再 FULL。PIECEWISE 有更大的激活张量，
+        所以 FULL 的激活张量应该能适配图池中已分配的缓冲区。
+
+        参数:
+            create_forward_fn: 工厂函数，在图外部准备输入并返回
+                (forward_fn, captured_attn_state) 元组
+            progress_bar_desc: 进度条描述文本
+
+        返回:
+            dict: 描述符 -> 捕获的注意力状态
         """
         captured_attn_states: dict[
             BatchExecutionDescriptor, CapturedAttentionState
@@ -214,13 +317,13 @@ class CudaGraphManager:
                 if is_global_first_rank():
                     descs = tqdm(descs, desc=f"{progress_bar_desc} ({mode.name})")
                 for desc in descs:
-                    # Prepare inputs and get forward function
+                    # 在图外部准备输入并获取前向函数
                     forward_fn, attn_state = create_forward_fn(desc)
 
-                    # Warmup
+                    # 预热运行
                     forward_fn(CUDAGraphMode.NONE)
 
-                    # Capture
+                    # 捕获
                     logger.debug(
                         "CG Capture: mode=%s, batch_desc=%s", desc.cg_mode.name, desc
                     )
@@ -228,25 +331,24 @@ class CudaGraphManager:
                         captured_attn_states[desc] = attn_state
                         forward_fn(CUDAGraphMode.PIECEWISE)
                     else:
-                        # Capture with fresh attention state. The warmup
-                        # attention state is discarded because some backends
-                        # (e.g. FlashMLA) perform lazy initializations that
-                        # must be captured in the graph.
+                        # 使用全新的注意力状态捕获。预热时的注意力状态被丢弃，
+                        # 因为某些后端（如 FlashMLA）执行延迟初始化，
+                        # 这些初始化必须被捕获到图中。
                         forward_fn, attn_state = create_forward_fn(desc)
                         captured_attn_states[desc] = attn_state
                         assert desc not in self.graphs, (
                             f"Graph already captured for {desc}"
                         )
                         graph = torch.cuda.CUDAGraph()
-                        # Sync offloader's copy stream before capture.
-                        # Ensure any pre-capture prefetches from offloader are complete.
+                        # 在捕获前同步 offloader 的拷贝流。
+                        # 确保捕获前的所有预取操作已完成。
                         get_offloader().sync_prev_onload()
                         with torch.cuda.graph(graph, self.pool):
                             forward_fn(CUDAGraphMode.NONE)
-                            # Join offloader's copy stream after forward to avoid
-                            # unjoined stream error. The last layer's start_prefetch
-                            # forks copy_stream, but wait_prefetch only happens in
-                            # the next forward pass.
+                            # 前向传播后加入 offloader 的拷贝流以避免
+                            # 未加入流的错误。最后一层的 start_prefetch
+                            # 会分叉 copy_stream，但 wait_prefetch 只在
+                            # 下一次前向传播时发生。
                             get_offloader().join_after_forward()
                         self.graphs[desc] = graph
                         compilation_counter.num_cudagraph_captured += 1
@@ -259,7 +361,19 @@ class CudaGraphManager:
         num_tokens: int,
         uniform_token_count: int | None,
     ) -> BatchExecutionDescriptor:
-        """Find matching cudagraph descriptor from priority-ordered candidates."""
+        """根据批次参数查找匹配的 CUDA Graph 描述符。
+
+        从优先级排序的候选列表中找到第一个兼容的描述符。
+        如果没有匹配，返回 NONE 模式（eager 执行）。
+
+        参数:
+            num_reqs: 请求数量
+            num_tokens: token 数量
+            uniform_token_count: 统一的每请求 token 数
+
+        返回:
+            BatchExecutionDescriptor: 匹配的描述符
+        """
         if self._graphs_captured and 0 < num_tokens < len(self._candidates):
             for desc in self._candidates[num_tokens]:
                 if _is_compatible(desc, num_reqs, num_tokens, uniform_token_count):
@@ -269,7 +383,17 @@ class CudaGraphManager:
         )
 
     def run_fullgraph(self, desc: BatchExecutionDescriptor):
-        """Replay a captured FULL cudagraph."""
+        """回放捕获的 FULL CUDA Graph。
+
+        在回放前同步 offloader——当从 eager/piecewise 切换到 full cudagraph
+        时（如 prefill -> decode），这是必需的。之前的 eager 迭代的
+        start_prefetch 可能已在 copy_stream 上排队了 H2D 拷贝，
+        而图的捕获事件无法感知这些拷贝。不执行此同步可能导致回放时
+        覆盖仍在传输中的静态缓冲区。
+
+        参数:
+            desc: 批次执行描述符
+        """
         assert desc.cg_mode == CUDAGraphMode.FULL, (
             f"Expected FULL mode, got {desc.cg_mode}"
         )
@@ -285,7 +409,19 @@ class CudaGraphManager:
 
 
 class ModelCudaGraphManager(CudaGraphManager):
-    """CudaGraphManager with model-specific capture and hidden state management."""
+    """模型专用的 CUDA Graph 管理器。
+
+    在 CudaGraphManager 基础上增加了模型特定的功能：
+    1. 管理隐藏状态（hidden states）的存储和切片
+    2. 管理辅助隐藏状态（auxiliary hidden states）
+    3. 管理中间张量（用于流水线并行的非最后阶段）
+
+    属性:
+        hidden_states: FULL CUDA Graph 使用的隐藏状态缓冲区
+        aux_hidden_states: 辅助隐藏状态缓冲区列表
+        use_aux_hidden_state_outputs: 是否使用辅助隐藏状态输出
+        intermediate_tensors: 流水线并行非最后阶段的中间张量
+    """
 
     def __init__(
         self,
@@ -314,7 +450,23 @@ class ModelCudaGraphManager(CudaGraphManager):
         use_aux_hidden_state_outputs: bool = False,
         progress_bar_desc: str = "Capturing CUDA graphs",
     ) -> dict[BatchExecutionDescriptor, CapturedAttentionState]:
-        """Capture CUDA graphs for model forward pass."""
+        """为模型前向传播捕获 CUDA Graph。
+
+        参数:
+            model: 模型实例
+            model_state: 模型状态
+            input_buffers: 输入缓冲区
+            intermediate_tensors: 流水线并行的中间张量
+            block_tables: 块表管理器
+            attn_groups: 注意力组列表
+            kv_cache_config: KV 缓存配置
+            has_lora: 是否使用 LoRA
+            use_aux_hidden_state_outputs: 是否使用辅助隐藏状态
+            progress_bar_desc: 进度条描述文本
+
+        返回:
+            dict: 描述符 -> 捕获的注意力状态
+        """
         self.use_aux_hidden_state_outputs = use_aux_hidden_state_outputs
 
         def create_forward_fn(
@@ -331,13 +483,14 @@ class ModelCudaGraphManager(CudaGraphManager):
                 else None
             )
 
+            # 准备模型输入
             model_inputs = {
                 "input_ids": input_buffers.input_ids[:num_tokens],
                 "positions": input_buffers.positions[:num_tokens],
                 **model_state.prepare_dummy_inputs(num_reqs, num_tokens),
             }
             if not self.is_first_pp_rank:
-                # Update for non-first PP ranks.
+                # 非第一个 PP 排名不需要 input_ids
                 model_inputs["input_ids"] = None
                 model_inputs["inputs_embeds"] = None
                 assert intermediate_tensors is not None
@@ -373,12 +526,12 @@ class ModelCudaGraphManager(CudaGraphManager):
                     model_output = model(**model_inputs)
 
                 if cg_mode == CUDAGraphMode.PIECEWISE:
-                    # PW CUDA graph internally handles the model outputs.
-                    # No need to keep track of the hidden states.
+                    # PW CUDA graph 内部处理模型输出。
+                    # 无需跟踪隐藏状态。
                     return None
 
                 if self.is_last_pp_rank:
-                    # Last PP rank (common case).
+                    # 最后一个 PP 排名（常见情况）
                     if self.use_aux_hidden_state_outputs:
                         hidden_states, aux_hidden_states = model_output
                     else:
@@ -394,7 +547,7 @@ class ModelCudaGraphManager(CudaGraphManager):
                     for i, aux in enumerate(aux_hidden_states):
                         self.aux_hidden_states[i][:num_tokens] = aux
                 else:
-                    # Non-last PP rank.
+                    # 非最后的 PP 排名
                     assert isinstance(model_output, IntermediateTensors)
                     intermediate_tensors = model_output
                     if self.intermediate_tensors is None:
@@ -411,7 +564,14 @@ class ModelCudaGraphManager(CudaGraphManager):
     def run_fullgraph(
         self, desc: BatchExecutionDescriptor
     ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]] | IntermediateTensors:
-        """Replay a captured FULL cudagraph and return hidden states."""
+        """回放捕获的 FULL CUDA Graph 并返回隐藏状态。
+
+        参数:
+            desc: 批次执行描述符
+
+        返回:
+            模型输出（隐藏状态、隐藏状态+辅助状态、或中间张量）
+        """
         super().run_fullgraph(desc)
         if not self.is_last_pp_rank:
             assert self.intermediate_tensors is not None
@@ -434,6 +594,23 @@ def prepare_inputs_to_capture(
     kv_cache_config: KVCacheConfig,
     skip_attn: bool = False,
 ) -> CapturedAttentionState:
+    """为 CUDA Graph 捕获准备输入数据。
+
+    创建虚拟的输入批次、块表和 slot 映射，用于图捕获时的形状和地址固定。
+
+    参数:
+        num_reqs: 请求数量
+        num_tokens: token 数量
+        model_state: 模型状态
+        input_buffers: 输入缓冲区
+        block_tables: 块表管理器
+        attn_groups: 注意力组列表
+        kv_cache_config: KV 缓存配置
+        skip_attn: 是否跳过注意力元数据准备
+
+    返回:
+        CapturedAttentionState: 捕获的注意力状态
+    """
     input_batch = InputBatch.make_dummy(num_reqs, num_tokens, input_buffers)
     input_block_tables = block_tables.get_dummy_block_tables(num_reqs)
     slot_mappings = block_tables.get_dummy_slot_mappings(num_tokens)

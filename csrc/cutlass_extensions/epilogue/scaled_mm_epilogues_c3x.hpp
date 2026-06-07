@@ -20,6 +20,35 @@
    as well as a static prepare_args function that constructs an
    EVTCompute::Arguments struct.
 */
+/*
+   中文注释：本文件定义了用于量化矩阵乘法（Scaled Matrix Multiplication）的
+   SM90 epilogue 函数集合，类似于 PyTorch 的 torch.scaled_mm。
+
+   核心概念 - Epilogue Visitor Tree (EVT)：
+     CUTLASS 3.x 使用树形结构的 epilogue visitor 来组织后处理操作。
+     每个节点是一个计算操作（如乘法、加法），叶子节点是数据加载操作。
+     例如 ScaledEpilogue 的计算树为：
+       D = ScaleA * (ScaleB * Accumulator)
+           Compute1
+           ├── ScaleA (列广播加载)
+           └── Compute0
+               ├── ScaleB (行广播加载)
+               └── Accumulator (从寄存器获取)
+
+   支持的 epilogue 类型（按复杂度递增）：
+     1. TrivialEpilogue：无后处理，直接输出
+     2. ScaledEpilogue：D = a_scale * (b_scale * Accum)
+     3. ScaledEpilogueBias：D = a_scale * (b_scale * Accum) + bias
+     4. ScaledEpilogueColumnBias：同上，但 bias 是列向量（用于稀疏 GEMM）
+     5. ScaledEpilogueBiasAzp：带 per-tensor 非对称零点修正
+     6. ScaledEpilogueBiasAzpToken：带 per-token 非对称零点修正
+     7. ScaledEpilogueArray：group GEMM 使用的数组版缩放
+
+   支持的量化模式：
+     - 对称量化（zero_point = 0）：只需 scale
+     - 非对称量化（zero_point != 0）：需要 scale + azp（激活零点）
+     - per-tensor / per-token / per-channel 的任意组合
+*/
 
 namespace vllm::c3x {
 
@@ -31,12 +60,16 @@ using TensorType = torch::Tensor;
 
 using namespace cute;
 
+// 中文注释：恒等函数，不做任何变换。
 template <typename T>
 struct identity {
   CUTLASS_HOST_DEVICE
   T operator()(T lhs) const { return lhs; }
 };
 
+// 中文注释：平凡（trivial）epilogue，不做任何后处理。
+// 仅将累加器（accumulator）的类型截断/转换为目标类型 ElementD 后输出。
+// 用于不需要缩放、偏置等操作的场景。
 template <typename ElementAcc, typename ElementD, typename TileShape>
 struct TrivialEpilogue {
  private:
@@ -59,6 +92,14 @@ struct TrivialEpilogue {
  * This class provides the common load descriptors for the
  * ScaledEpilogue[...] classes
  */
+// 中文注释：ScaledEpilogue 系列的基类，提供通用的加载描述符（load descriptor）。
+// 加载描述符定义了如何从全局内存加载量化参数（scale、bias、azp 等）。
+// 每种描述符对应一种广播模式：
+//   - ColOrScalarLoad<T>：列方向广播或标量广播（用于 scale_A 或 per-token 参数）
+//   - RowOrScalarLoad<T>：行方向广播或标量广播（用于 scale_B 或 per-channel 参数）
+//   - ColLoad<T>：纯列向量加载（用于 per-token 参数，不支持标量）
+//   - RowLoad<T>：纯行向量加载（用于 bias 等）
+//   - ColOrScalarLoadArray<T> / RowOrScalarLoadArray<T>：数组版本，用于 group GEMM
 template <typename ElementAcc, typename ElementD, typename TileShape>
 struct ScaledEpilogueBase {
  protected:
@@ -97,6 +138,11 @@ struct ScaledEpilogueBase {
   // This utility function constructs the arguments for the load descriptors
   // from a tensor. It can handle both row and column, as well as row/column or
   // scalar cases.
+  // 中文注释：从 PyTorch Tensor 构造加载描述符的参数。
+  // 对于 ColOrScalarLoad/RowOrScalarLoad，会检查 tensor.numel() 是否为 1：
+  //   - numel == 1：标量广播模式（row_broadcast/col_broadcast = false）
+  //   - numel > 1：向量广播模式（row_broadcast/col_broadcast = true）
+  // 这样一个函数就能处理 per-tensor（标量）和 per-channel/per-token（向量）两种情况。
   template <typename Descriptor, typename T>
   static auto args_from_tensor(TensorType const& tensor) {
     using Arguments = typename Descriptor::Arguments;
@@ -147,6 +193,17 @@ struct ScaledEpilogueBase {
    the A and B operands respectively. These scales may be either per-tensor or
    per row or column.
 */
+// 中文注释：对称量化的缩放 epilogue，实现 D = a_scale * (b_scale * Accumulator)。
+// 这是最基本的量化矩阵乘法 epilogue，等价于 torch.scaled_mm。
+//
+// EVT 计算树结构：
+//   Compute1 (a_scale * temp -> D)
+//   ├── ScaleA (ColOrScalarLoad: 加载 a_scale，per-tensor 或 per-token)
+//   └── EVTCompute0
+//       ├── ScaleB (RowOrScalarLoad: 加载 b_scale，per-tensor 或 per-channel)
+//       └── Accumulator (从寄存器获取累加结果)
+//
+// 所有计算在 float 精度下进行，最终截断为 ElementD 输出。
 template <typename ElementAcc, typename ElementD, typename TileShape>
 struct ScaledEpilogue
     : private ScaledEpilogueBase<ElementAcc, ElementD, TileShape> {
@@ -191,6 +248,14 @@ struct ScaledEpilogue
  * The bias tensor must be per-output channel.
  * ScaleA and ScaleB can be per-tensor or per-token/per-channel.
  */
+// 中文注释：带偏置的缩放 epilogue，实现 D = a_scale * (b_scale * Accumulator) + bias。
+// bias 必须是 per-output channel 的行向量。
+//
+// 与 ScaledEpilogue 的区别：
+//   Compute1 使用 homogeneous_multiply_add 而非 multiplies，
+//   即执行 a * b + c 的融合乘加操作，将 bias 融合到计算中。
+//
+// 对于非对称量化场景，azp 修正项可以预计算后折叠到 bias 中。
 template <typename ElementAcc, typename ElementD, typename TileShape>
 struct ScaledEpilogueBias
     : private ScaledEpilogueBase<ElementAcc, ElementD, TileShape> {
@@ -234,6 +299,10 @@ struct ScaledEpilogueBias
  * bias is a column vector instead of a row vector. Useful e.g. if we are
  * computing a GEMM via C^T += B^T A^T. This happens in the 2:4 sparse kernels.
  */
+// 中文注释：带列向量偏置的缩放 epilogue。
+// 与 ScaledEpilogueBias 相同的计算，但 bias 是列向量（per-row）而非行向量。
+// 用于稀疏 GEMM（2:4 structured sparsity）中，此时 GEMM 的转置关系导致
+// 原本的行偏置变成了列偏置。
 template <typename ElementAcc, typename ElementD, typename TileShape>
 struct ScaledEpilogueColumnBias
     : private ScaledEpilogueBase<ElementAcc, ElementD, TileShape> {
@@ -280,6 +349,28 @@ struct ScaledEpilogueColumnBias
  *
  * This epilogue also supports bias, which remains per-channel.
  */
+// 中文注释：带 per-tensor 非对称零点（azp）修正的缩放 epilogue。
+//
+// 非对称量化的数学模型：
+//   量化：q = round(x / scale) + azp
+//   反量化：x = (q - azp) * scale
+//
+// 当 A 使用非对称量化时，GEMM 需要修正 azp 的影响：
+//   D = a_scale * b_scale * (QuantA @ QuantB)
+//     - a_scale * b_scale * azp * J @ B
+//   其中 J 是全 1 矩阵。
+//
+// 本 epilogue 中 azp_adj = azp * J @ B 已预计算好（形状 (1,n)），
+// 直接在 epilogue 中从累加器中减去。
+//
+// EVT 计算树：
+//   ComputeScaleBiasA (a_scale * temp + bias -> D)
+//   ├── ScaleA
+//   └── EVTComputeScaleB (b_scale * temp -> temp)
+//       ├── ScaleB
+//       └── EVTComputeAzp (Accumulator - azp_adj -> temp)
+//           ├── Accumulator
+//           └── AzpWithAdj (加载 azp_adj)
 template <typename ElementAcc, typename ElementD, typename TileShape>
 struct ScaledEpilogueBiasAzp
     : private ScaledEpilogueBase<ElementAcc, ElementD, TileShape> {
@@ -345,6 +436,18 @@ struct ScaledEpilogueBiasAzp
  *
  * This epilogue also supports bias, which remains per-channel.
  */
+// 中文注释：带 per-token 非对称零点修正的缩放 epilogue。
+//
+// 与 ScaledEpilogueBiasAzp 的区别：
+//   - per-tensor azp：azp 是标量，azp_adj = azp * (J @ B) 已是完整修正项
+//   - per-token azp：azp 是 (m,1) 向量（每行不同），azp_adj = J @ B 是 (1,n) 向量
+//     需要在 epilogue 中实时计算 azp * azp_adj 的秩 1 修正
+//
+// 内存效率：如果显式计算 azp * azp_adj 需要 O(m*n) 空间，
+// 而本实现通过秩 1 外积在 epilogue 中隐式计算，只需 O(m+n) 空间。
+//
+// 计算流程（EVT 树）：
+//   D = a_scale * (b_scale * (Accumulator - azp * azp_adj)) + bias
 template <typename ElementAcc, typename ElementD, typename TileShape>
 struct ScaledEpilogueBiasAzpToken
     : private ScaledEpilogueBase<ElementAcc, ElementD, TileShape> {
@@ -420,6 +523,15 @@ struct ScaledEpilogueBiasAzpToken
    pointers in ScaleA and the number of pointers in ScaleB are equal to the
    group size.
 */
+// 中文注释：Group GEMM 使用的数组版缩放 epilogue。
+//
+// Group GEMM 是将多个小 GEMM 合并为一个大 GEMM 的技术。
+// 每个子 GEMM 可能有不同的 scale_A 和 scale_B。
+// ScaleA 和 ScaleB 是指针数组，每个元素指向对应子 GEMM 的缩放因子。
+// 内部通过 batch 维度 L 索引到正确的 scale。
+//
+// 这对于 MoE（Mixture of Experts）模型中的批量矩阵乘法非常有用，
+// 因为每个 expert 可能有不同的量化参数。
 template <typename ElementAcc, typename ElementD, typename EpilogueDescriptor>
 struct ScaledEpilogueArray
     : private ScaledEpilogueBase<ElementAcc, ElementD, EpilogueDescriptor> {

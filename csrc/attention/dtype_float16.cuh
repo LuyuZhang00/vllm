@@ -1,4 +1,23 @@
 /*
+ * 中文注释：FP16 (Half) 数据类型的向量运算实现。
+ *
+ * 本文件的核心作用：
+ *   1. 特化 Vec<uint16_t, N> —— FP16 的 Q/K/V 向量类型映射。
+ *      FP16 用 uint16_t 存储，2 个 FP16 打包为 1 个 uint32_t（f16x2），
+ *      4 个为 uint2，8 个为 uint4，利用宽向量 load 提升带宽利用率。
+ *   2. 特化 FloatVec<T> —— 对应的 FP32 累加器向量类型。
+ *      例如 FloatVec<uint2> = Float4_，表示 4 个 FP16 的累加结果用 Float4_（4 个 float）。
+ *   3. 实现 FP16 向量的 add、mul、fma、sum、from_float、to_float、zero 操作。
+ *   4. 提供半精度与单精度之间的类型转换工具函数（half_to_float、float_to_half 等）。
+ *
+ * 关键设计：
+ *   - 使用内联 PTX 汇编（如 cvt.f32.f16、fma.rn.f16x2）直接调用 GPU 硬件指令，
+ *     获得最佳性能。
+ *   - 同时支持 CUDA 和 ROCm（HIP）平台。
+ *
+ * 源自 NVIDIA FasterTransformer 项目，经过 vLLM 团队修改。
+ */
+/*
  * Adapted from
  * https://github.com/NVIDIA/FasterTransformer/blob/release/v5.3_tag/src/fastertransformer/kernels/decoder_masked_multihead_attention/decoder_masked_multihead_attention_template.hpp
  * and
@@ -32,6 +51,9 @@
 namespace vllm {
 
 // FP16 vector types for Q, K, V.
+// 中文注释：FP16 的 Vec 特化。uint16_t 存储单个 FP16 值，
+// uint32_t 存储 2 个 FP16（对应 CUDA 的 half2 类型），
+// uint2 存储 4 个 FP16，uint4 存储 8 个 FP16。
 template <>
 struct Vec<uint16_t, 1> {
   using Type = uint16_t;
@@ -50,6 +72,9 @@ struct Vec<uint16_t, 8> {
 };
 
 // FP32 accumulator vector types corresponding to Vec.
+// 中文注释：FP16 向量对应的 FP32 累加器类型。
+// 1 个 FP16 -> float，2 个 FP16 -> float2，4 个 -> Float4_，8 个 -> Float8_。
+// 保证 Attention 计算在 FP32 精度下累加，避免半精度溢出或精度损失。
 template <>
 struct FloatVec<uint16_t> {
   using Type = float;
@@ -68,6 +93,10 @@ struct FloatVec<uint4> {
 };
 
 // Utility functions for type conversions.
+// 中文注释：类型转换工具函数集合。
+// h0_h0: 将单个 FP16 值复制为两个相同的 half2 打包值（用于标量广播到向量）。
+// half_to_float / float_to_half: FP16 <-> FP32 标量转换，使用 PTX 指令实现。
+// half2_to_float2 / float2_to_half2: half2 <-> float2 向量转换。
 inline __device__ uint32_t h0_h0(uint16_t a) {
 #ifndef USE_ROCM
   uint32_t b;
@@ -147,6 +176,9 @@ inline __device__ uint32_t float2_to_half2(float2 f) {
 }
 
 // Vector addition.
+// 中文注释：FP16 向量逐元素加法。使用 PTX 的 add.f16 / add.f16x2 指令实现，
+// 在 GPU 上单周期完成，比先转 FP32 再加法再转回更快。
+// 支持 uint16_t(1个FP16)、uint32_t(2个FP16)、uint2(4个)、uint4(8个) 各种宽度。
 inline __device__ uint16_t add(uint16_t a, uint16_t b) {
   uint16_t c;
 #ifndef USE_ROCM
@@ -205,6 +237,10 @@ inline __device__ Float8_ add(uint4 a, Float8_ fb) {
 }
 
 // Vector multiplication.
+// 中文注释：FP16 向量逐元素乘法。
+// FP16 精度乘法（uint16_t * uint16_t -> uint16_t）使用 PTX mul.f16/mul.f16x2。
+// FP32 精度乘法（uint16_t * uint16_t -> float）先转 FP32 再乘，用于点积计算。
+// 这种双精度乘法设计使得 Attention kernel 可以在半精度存储下以 FP32 精度累加。
 template <>
 inline __device__ uint16_t mul(uint16_t a, uint16_t b) {
   uint16_t c;
@@ -328,6 +364,10 @@ inline __device__ Float8_ mul(uint16_t a, uint4 b) {
 }
 
 // Vector fused multiply-add.
+// 中文注释：FP16 向量融合乘加 (a*b + c)。
+// FP16 精度版本使用 PTX fma.rn.f16x2 指令，一条指令完成两个 FP16 的乘加。
+// FP32 精度版本先将 FP16 转为 FP32 再做标量 FMA，用于高精度累加。
+// 这是 Attention kernel 中 Q*K 点积累加的核心操作。
 inline __device__ uint32_t fma(uint32_t a, uint32_t b, uint32_t c) {
   uint32_t d;
 #ifndef USE_ROCM

@@ -46,6 +46,16 @@
 // if scales were initially on the device, and caused torch.compile graphs
 // breaks when moving scales to the CPU.
 //
+// 中文注释：本文件是 SM90 epilogue visitor 的数组版本，用于 Group GEMM 场景。
+// 与 broadcast_load_epilogue_c3x.hpp 的区别在于：
+//   - Sm90RowOrScalarBroadcastArray：接受指针数组 ptr_row_array（而非单个指针），
+//     每个 batch/l 维度使用不同的行向量。用于 group GEMM 中每个子 GEMM 有不同 scale_B。
+//   - Sm90ColOrScalarBroadcastArray：接受指针数组 ptr_col_array，
+//     每个 batch/l 维度使用不同的列向量。用于 group GEMM 中每个子 GEMM 有不同 scale_A。
+//
+// Group GEMM 在 MoE（Mixture of Experts）模型中很重要，
+// 因为不同 expert 的权重可能有不同的量化参数。
+//
 #pragma once
 
 // Turn off clang-format for the entire file to keep it close to upstream
@@ -63,6 +73,9 @@ using namespace cute;
 using namespace detail;
 
 // Row vector broadcast
+// 中文注释：SM90 数组版行向量广播 visitor，用于 Group GEMM。
+// 通过 ptr_row_array 指针数组，每个 batch 索引 l 可以使用不同的行向量。
+// 内部通过 group 变量（= batch 维度索引 l）选择正确的行向量指针。
 template<
   int Stages,
   class CtaTileShapeMNK,
@@ -279,6 +292,8 @@ struct Sm90RowOrScalarBroadcastArray {
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
 // Column vector broadcast
+// 中文注释：SM90 数组版列向量广播 visitor，用于 Group GEMM。
+// 通过 ptr_col_array 指针数组，每个 batch 索引 l 可以使用不同的列向量。
 template<
   int Stages,
   class CtaTileShapeMNK,

@@ -1,5 +1,27 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+#
+# vLLM V1 Worker 层工具模块
+# ==========================
+# 本模块为 GPUModelRunner 和 Worker 提供以下核心工具能力：
+#   1. KV Cache Block 清零（KVBlockZeroer）—— 使用 Triton kernel 高效地将新分配的
+#      KV cache block 清零，确保未使用的 block 不会残留脏数据。
+#   2. Attention 分组管理（AttentionGroup）—— 将共享相同 KV cache spec 和 attention
+#      后端的层分组，便于统一构建 attention metadata。
+#   3. Block Size 选择（select_common_block_size / prepare_kernel_block_sizes）
+#      —— 在 KV cache manager 的逻辑 block size 和各 attention 后端支持的 kernel
+#      block size 之间找到兼容的公共值，支持虚拟 block 拆分（virtual block splitting）。
+#   4. KV Cache 绑定（bind_kv_cache）—— 将分配好的 KV cache tensor 绑定到
+#      ModelRunner 的 runner_kv_caches 列表和各 Attention 层的 forward_context 中，
+#      使得模型前向传播时能正确读写 KV cache。
+#   5. KV Cache 共享层处理（add_kv_sharing_layers_to_kv_cache_groups）
+#      —— 支持跨层 KV cache 复用（如 encoder-decoder 模型中某些 decoder 层
+#      共享 encoder 的 KV cache）。
+#   6. 显存需求计算（request_memory）—— 校验 GPU 空闲显存是否满足配置需求。
+#   7. 多模态输出校验（sanity_check_mm_encoder_outputs）—— 校验多模态模型的
+#      embed_multimodal 方法返回的 embedding 格式是否正确。
+#   8. 序列并行检查（is_residual_scattered_for_sp）—— 判断在启用序列并行（SP）时
+#      residual tensor 是否需要在 TP rank 间分散。
 import math
 from collections import defaultdict
 from collections.abc import Iterable
@@ -58,22 +80,41 @@ def _zero_kv_blocks_kernel(
 
     Programs are mapped as (block_index, seg_index, chunk_index).
     """
+    # 中文注释：这个 Triton kernel 用于高效地将 KV cache block 的显存清零。
+    # 设计要点：
+    #   - 一次 kernel launch 可以清零多个 block，避免逐 block 调用 CUDA kernel 的开销。
+    #   - 每个 Triton program 处理一个 (block, segment, chunk) 三元组：
+    #     (1) block_index：要清零的逻辑 block 编号；
+    #     (2) seg_index：该 block 对应的内存段索引（一个 buffer 可能有多个段，
+    #         如 K 和 V 各一个段）；
+    #     (3) chunk_index：段内分块索引，用于将大的清零任务拆成小块并行执行。
+    #   - seg_addrs_ptr 存储的是各段在 GPU 显存中的绝对字节地址（int64），
+    #     这样不同 CUDA allocation 中的段也能被正确处理。
+    #   - PAGE_SIZE_EL 是一个逻辑 block 对应的元素总数（int32 为单位），
+    #     考虑了 kernel block size 和 KV cache manager block size 之间的 ratio。
+
     pid = tl.program_id(0)
+    # 中文注释：计算每个 block 需要多少个 chunk 来完成清零
     chunks = PAGE_SIZE_EL // BLOCK_SIZE
+    # 中文注释：每个 block 的总工作量 = 段数 * 每段的 chunk 数
     work_per_block = N_SEGS * chunks
+    # 中文注释：从 program_id 反推出当前 program 负责的 (block, seg, chunk) 三元组
     block_index = pid // work_per_block
     if block_index >= n_blocks:
         return
     remainder = pid % work_per_block
     seg_index = remainder // chunks
     chunk_index = remainder % chunks
+    # 中文注释：加载要清零的逻辑 block ID 和对应段的基地址
     block_id = tl.load(block_ids_ptr + block_index)
     seg_addr = tl.load(seg_addrs_ptr + seg_index)
+    # 中文注释：计算目标写入地址：段基址 + block 偏移 + chunk 偏移
     ptr = tl.cast(seg_addr, tl.pointer_type(tl.int32))
     offset = (
         block_id.to(tl.int64) * PAGE_SIZE_EL + chunk_index.to(tl.int64) * BLOCK_SIZE
     )
     cols = tl.arange(0, BLOCK_SIZE).to(tl.int64)
+    # 中文注释：将对应 chunk 区域写入全零
     tl.store(ptr + offset + cols, tl.zeros([BLOCK_SIZE], dtype=tl.int32))
 
 
@@ -84,13 +125,32 @@ class KVBlockZeroer:
     segment addresses, then call :meth:`zero_block_ids` each step to zero
     newly-allocated blocks.
     """
+    # 中文注释：KVBlockZeroer 负责高效地将新分配的 KV cache block 清零。
+    # 背景：vLLM 的 KV cache 采用分页管理（类似操作系统虚拟内存分页），
+    # 新分配的物理 block 可能残留上一个请求的数据，必须清零后才能使用。
+    # 设计思路：
+    #   (1) init_meta()：在 KV cache 分配完成后调用一次，预先计算好所有 segment
+    #       的绝对地址，避免每次清零时重复计算。
+    #   (2) zero_block_ids()：每步调度时调用，只清零本轮新分配的 block。
+    #       使用 pinned memory 做 CPU->GPU 异步传输，减少同步等待。
+    #   (3) 底层使用自定义 Triton kernel 而非 PyTorch 的 fill_()，因为 Triton
+    #       kernel 可以灵活处理跨多个 CUDA allocation 的非连续内存区域。
 
     def __init__(self, device: torch.device, pin_memory: bool):
         self.device = device
         self.pin_memory = pin_memory
+        # 中文注释：_meta 存储预计算的 Triton kernel 参数：
+        #   - seg_addrs tensor：所有 segment 的绝对字节地址（GPU 上）
+        #   - page_size_el：一个逻辑 block 的总元素数（int32 为单位）
+        #   - blk_size：Triton kernel 每次处理的 chunk 大小（元素数）
+        #   - n_segs：segment 总数
         self._meta: tuple[torch.Tensor, int, int, int] | None = None
+        # 中文注释：_id_cap 是当前已分配的 block ID 缓冲区容量
         self._id_cap: int = 0
+        # 中文注释：_ids_pinned 是 pinned memory 中的 block ID 缓冲区（CPU 端），
+        # 用于异步拷贝到 GPU
         self._ids_pinned: torch.Tensor | None = None
+        # 中文注释：_ids_gpu 是 GPU 端的 block ID 缓冲区
         self._ids_gpu: torch.Tensor | None = None
 
     def init_meta(

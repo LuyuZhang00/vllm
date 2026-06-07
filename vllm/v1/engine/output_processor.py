@@ -1,6 +1,35 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+# =============================================================================
+# 模块概述: vLLM v1 引擎的输出处理器 (Output Processor)
+# =============================================================================
+# 本模块负责将 EngineCore 的原始输出转换为用户可读的 RequestOutput。
+#
+# 核心组件:
+#   - OutputProcessor: 输出处理的主类，管理所有请求的输出状态
+#   - RequestState: 单个请求的输出状态（反分词器、logprobs 处理器等）
+#   - RequestOutputCollector: 每个请求的输出队列（生产者-消费者模式）
+#
+# 输出处理流水线 (process_outputs):
+#   对每个 EngineCoreOutput 执行以下 4 步:
+#   步骤 1 - 统计: 记录 TTFT、吞吐量、LoRA 状态等指标
+#   步骤 2 - 反分词: IncrementalDetokenizer 将 token ID 增量解码为文本
+#            同时检查自定义 stop string
+#   步骤 3 - Logprobs: LogprobsProcessor 累积采样/提示词的对数概率
+#   步骤 4 - 创建输出: 调用 make_request_output 构造 RequestOutput
+#            放入 queue (AsyncLLM) 或追加到返回列表 (LLMEngine)
+#
+# 请求完成后的清理:
+#   - 流式输入模式: 推迟清理，等待下一段输入到来
+#   - 普通模式: 从 request_states 移除，更新统计，必要时通知 EngineCore 中止
+#
+# ID 映射关系:
+#   - external_req_id: 用户传入的原始请求 ID
+#   - internal_req_id (request_id): EngineCore 内部生成的随机 ID
+#   - 一个 external_req_id 可能对应多个 internal_req_id（并行采样 n>1 时）
+# =============================================================================
+
 import asyncio
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -135,6 +164,22 @@ class StreamingUpdate:
 
 
 class RequestState:
+    # RequestState: 单个请求的输出侧状态。
+    #
+    # 每个请求在 OutputProcessor 中都有一个对应的 RequestState，
+    # 跟踪该请求从开始到完成的全部输出处理状态。
+    #
+    # 核心组件:
+    #   - detokenizer: 增量反分词器，将 token ID 逐步解码为文本
+    #   - logprobs_processor: 对数概率处理器，累积采样和提示词的 logprobs
+    #   - queue: 输出队列（RequestOutputCollector），用于流式返回结果
+    #   - parent_req: 父请求引用（并行采样 n>1 时使用）
+    #   - stream_interval: 流式输出间隔控制
+    #
+    # 生命周期:
+    #   创建 → is_prefilling=True → 收到首个输出 → is_prefilling=False
+    #   → 逐步生成 token → 收到 finish_reason → 清理
+
     def __init__(
         self,
         request_id: str,
@@ -441,6 +486,23 @@ class RequestState:
 class OutputProcessor:
     """Process EngineCoreOutputs into RequestOutputs."""
 
+    # OutputProcessor: 输出处理器主类。
+    #
+    # 核心职责:
+    #   1. 管理所有请求的输出状态（request_states）
+    #   2. 处理 EngineCore 输出（反分词、logprobs、统计）
+    #   3. 管理请求的添加、中止和完成
+    #   4. 处理并行采样（n>1）的请求扇出和结果聚合
+    #
+    # ID 映射关系:
+    #   - request_states: internal_req_id → RequestState
+    #   - external_req_ids: external_req_id → [internal_req_id, ...]
+    #   - parent_requests: parent_req_id → ParentRequest
+    #
+    # 使用场景:
+    #   - AsyncLLM: 通过 queue（RequestOutputCollector）将输出推送给 generate() 协程
+    #   - LLMEngine: 直接返回 RequestOutput 列表
+
     def __init__(
         self,
         tokenizer: TokenizerLike | None,
@@ -642,6 +704,32 @@ class OutputProcessor:
 
         If you need to touch every element of the batch, do it from
         within the loop below.
+
+        输出处理流水线（对每个 EngineCoreOutput）:
+
+        步骤 1 - 统计 (_update_stats_from_output):
+          记录首 token 延迟 (TTFT)、吞吐量、LoRA 使用状态等指标。
+          这些指标用于 Prometheus 监控和性能分析。
+
+        步骤 2 - 反分词 (detokenizer.update):
+          IncrementalDetokenizer 将新生成的 token ID 增量解码为文本。
+          同时检查是否匹配了自定义 stop string（如 "```"），
+          如果匹配则设置 finish_reason=STOP。
+
+        步骤 3 - Logprobs (logprobs_processor.update_from_output):
+          LogprobsProcessor 累积采样 token 的对数概率和提示词的对数概率。
+          这些数据用于支持 logprobs 参数请求。
+
+        步骤 4 - 创建输出 (make_request_output):
+          根据当前请求状态构造 RequestOutput 对象。
+          支持 DELTA 模式（增量输出）、FINAL_ONLY 模式（仅最终输出）、
+          并行采样（n>1）的结果聚合等。
+
+        请求完成后的清理:
+          - 流式输入模式: 推迟清理，等待下一段输入到来
+          - 普通模式: 从 request_states 移除，更新统计
+          - 如果反分词器检测到 stop string 但 EngineCore 未标记完成，
+            需要通知 EngineCore 中止该请求
         """
         # [中文注释] 输出处理的主循环 —— 整个输出链路的唯一入口
         # 这是 vLLM V1 中唯一遍历 EngineCoreOutputs 批次的位置，

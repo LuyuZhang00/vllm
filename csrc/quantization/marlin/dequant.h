@@ -63,14 +63,45 @@ where `scale_factor * multiplier` can be computed at weight loading.
 
 */
 
+// =============================================================================
+// 中文注释: Marlin 快速反量化模块
+// =============================================================================
+// 本文件实现了将量化权重 (INT4/INT8/FP4/FP8) 转换为 FP16/BF16 的高效反量化。
+//
+// 核心思想: 两步反量化
+//   Step 1 - 位操作 (bit_op): 通过 lop3 (3 输入逻辑查找表) 和位移操作，
+//            将 packed 的量化值提取并重新排列为 FP16 的位模式
+//   Step 2 - 浮点运算 (flop): 通过减法/乘法完成零点减去和缩放因子应用
+//
+// 优化技巧:
+//   - 将零点减去和缩放因子应用融合到位操作中，减少浮点运算次数
+//   - 使用 lop3 指令 (3 输入逻辑查找表) 实现任意 3 输入布尔函数，
+//     编译器无法自动识别这种模式，所以显式使用 inline PTX
+//   - INT8 -> BF16 使用 byte_perm 指令，无法与缩放融合
+//   - FP4/FP8 使用乘法代替加法，可以将 scale*multiplier 预计算
+//
+// 支持的转换:
+//   - INT4 -> FP16/BF16 (对称/非对称量化)
+//   - INT8 -> FP16/BF16
+//   - FP4_e2m1 -> FP16/BF16 (NVFP4/MXFP4)
+//   - FP8_e4m3 -> FP16/BF16
+// =============================================================================
+
 #include "marlin_dtypes.cuh"
 
+// 中文注释: Marlin 反量化命名空间
+// 包含所有反量化相关的辅助函数和主反量化函数
 namespace MARLIN_NAMESPACE_NAME {
 
 #if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 750
 // Lookup-table based 3-input logical operation; explicitly used for
 // dequantization as the compiler does not seem to automatically recognize it in
 // all cases.
+// 中文注释: 3 输入逻辑查找表操作 (lop3 指令)
+// lop3.b32 是 Turing (SM75+) 引入的指令，可以实现任意 3 输入布尔函数
+// 参数 lut (lookup table) 是一个 8 位值，编码了所有 2^3=8 种输入组合的输出
+// 例如 lut=0xCA 表示 (a & b) | (~a & c) -- 这是一个 MUX 操作
+// 在反量化中用于从 packed int32 中提取指定位域
 template <int lut>
 __device__ inline int lop3(int a, int b, int c) {
   int res;

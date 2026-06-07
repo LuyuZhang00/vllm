@@ -1,5 +1,35 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""KV 缓存协调器模块 (vllm/v1/core/kv_cache_coordinator.py)
+
+本模块实现了 KV 缓存协调器（KVCacheCoordinator），负责协调多个 KV 缓存组
+之间的块分配、缓存查找和释放操作。
+
+架构位置：
+    KVCacheManager -> KVCacheCoordinator -> SingleTypeKVCacheManager * N
+                    (kv_cache_manager.py)  (本模块)  (single_type_kv_cache_manager.py)
+
+为什么需要协调器：
+    现代 LLM 可能包含多种注意力类型（如全注意力 + 滑动窗口注意力 + Mamba），
+    每种类型有不同的缓存策略和块大小。协调器将这些差异封装起来，使得上层的
+    KVCacheManager 只需调用统一接口即可完成跨类型的缓存操作。
+
+协调器的三种实现：
+1. KVCacheCoordinatorNoPrefixCache: 禁用前缀缓存时使用，find_longest_cache_hit
+   直接返回空结果，避免不必要的哈希计算开销。
+2. UnitaryKVCacheCoordinator: 单组快速路径。大多数标准模型（LLaMA、GPT 等）
+   只有一种注意力类型，无需跨类型协调，直接委托给唯一的管理器。
+3. HybridKVCacheCoordinator: 混合模型路径。需要跨类型对齐缓存命中长度，
+   使用固定点迭代算法确保所有注意力类型都能在相同的命中长度上达成一致。
+
+前缀缓存命中查找的核心难点（混合模型）：
+    不同注意力类型有不同的缓存命中语义：
+    - 全注意力：从左到右连续扫描，命中长度单调递增（下闭性质）
+    - 滑动窗口注意力：只关注尾部窗口，从右到左扫描
+    - 分块局部注意力：按 chunk 对齐，窗口外的块直接标记为已缓存（null 块）
+    协调器必须找到一个所有类型都认可的最大命中长度，这就是固定点迭代算法的作用。
+"""
+
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from math import lcm

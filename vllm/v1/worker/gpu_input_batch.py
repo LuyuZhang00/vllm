@@ -1,6 +1,30 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Datastructures defining a GPU input batch
+#
+# 中文注释：本模块定义了 GPU 输入批次的核心数据结构，是 vLLM V1 推理引擎中
+# Scheduler 与 Model Runner 之间的关键桥梁。
+#
+# 【模块功能概述】
+# 1. CachedRequestState：缓存单个请求的完整状态（token IDs、采样参数、KV block 等），
+#    在请求从 waiting 队列移入 running 队列时被创建和维护。
+# 2. InputBatch：管理一个批次中所有活跃请求的合并数据，负责：
+#    (1) 将多个请求的 token IDs、采样参数等统一存储到固定大小的 tensor 中
+#    (2) 维护请求到 batch index 的映射关系
+#    (3) 管理 block table（逻辑 block 到物理 KV block 的映射）
+#    (4) 构建 SamplingMetadata 供 sampling 阶段使用
+#    (5) 处理请求的添加、删除、重排序（condense）操作
+#
+# 【在推理链路中的位置】
+# Scheduler 调度完成后 -> SchedulerOutput 包含 scheduled_requests ->
+# Model Runner 通过 InputBatch 管理当前批次的所有请求状态 ->
+# 构造模型输入（input_ids、positions、slot_mapping 等）-> 模型 forward -> sampling
+#
+# 【设计要点】
+# - 采用固定大小的 tensor 预分配策略，避免动态内存分配带来的性能开销
+# - 使用 numpy 数组作为 CPU 端的视图，便于快速修改；通过 copy_slice 同步到 GPU
+# - 通过 greedy_reqs、random_reqs 等 set 集合快速判断批次的采样特性，
+#   从而跳过不必要的计算（如全部 greedy 时可跳过 temperature 应用）
 
 from dataclasses import dataclass
 from typing import cast
@@ -32,6 +56,21 @@ from vllm.v1.worker.block_table import MultiGroupBlockTable
 
 @dataclass
 class CachedRequestState:
+    """
+    中文注释：缓存单个请求的完整状态信息。
+    当请求从 Scheduler 的 waiting 队列被调度执行后，其状态会被缓存在此对象中。
+    InputBatch 在添加/更新请求时会读取此对象的各字段。
+
+    【字段说明】
+    - req_id: 请求唯一标识符
+    - prompt_token_ids: 提示词的 token ID 列表（如果输入是 token 形式）
+    - mm_features: 多模态特征规格列表（如图像、音频等）
+    - sampling_params: 采样参数（temperature、top_p、top_k 等）
+    - generator: 随机数生成器，用于可复现的采样
+    - block_ids: 请求已分配的物理 KV block ID，按 KV cache group 分组
+    - num_computed_tokens: 已完成 KV cache 计算的 token 数（含 prefix cache 命中部分）
+    - output_token_ids: 已生成的输出 token ID 列表
+    """
     req_id: str
     prompt_token_ids: list[int] | None
     mm_features: list[MultiModalFeatureSpec]
@@ -42,21 +81,29 @@ class CachedRequestState:
     num_computed_tokens: int
     output_token_ids: list[int]
 
+    # 中文注释：多模态旋转位置编码（M-RoPE）相关字段，用于 Qwen2-VL 等多模态模型
     mrope_positions: torch.Tensor | None = None
     mrope_position_delta: int | None = None
 
+    # 中文注释：XDrop 位置编码相关字段
     xdrope_positions: torch.Tensor | None = None
 
+    # 中文注释：LoRA 适配器请求，为 None 表示不使用 LoRA
     lora_request: LoRARequest | None = None
+    # 中文注释：提示词的嵌入向量（当输入不是 token IDs 而是预计算的 embedding 时使用）
     prompt_embeds: torch.Tensor | None = None
     # To accumulate prompt logprobs tensor chunks across prefill steps.
+    # 中文注释：跨多个 prefill 步骤累积的 prompt logprobs tensor 块
     in_progress_prompt_logprobs_cpu: LogprobsTensors | None = None
 
     # Per-position mask for mixed-mode inputs (e.g chat completion with
     # prompt_embeds content parts). See `Request.prompt_is_token_ids`.
+    # 中文注释：逐位置的掩码，标记每个位置的输入是 token ID 还是 embedding。
+    # 用于支持混合模式输入（如 chat completion 中部分内容是 prompt_embeds）
     prompt_is_token_ids: list[bool] | None = None
 
     # Used when both async_scheduling and spec_decode are enabled.
+    # 中文注释：上一步的 draft token 长度，仅在异步调度和投机解码同时启用时使用
     prev_num_draft_len: int = 0
 
     # for pooling models

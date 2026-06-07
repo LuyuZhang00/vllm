@@ -1,4 +1,31 @@
 // copied and adapted from https://github.com/ggerganov/llama.cpp/blob/b2899/ggml-cuda/mmvq.cu
+
+// =============================================================================
+// 中文注释: GGUF 量化矩阵-向量乘法 kernel (MMVQ)
+// =============================================================================
+// 本文件实现了量化权重矩阵与浮点向量的乘法 (Matrix-Vector Multiplication)。
+// 这是 LLM 推理中 decode 阶段的核心操作，因为 decode 时每个 token 的
+// 矩阵乘法实际上是矩阵-向量乘法 (M=1)。
+//
+// 算法流程:
+//   1. 每个 thread block 处理一个输出行 (权重矩阵的一行)
+//   2. gridDim.y 维度并行处理多个输出向量 (batch)
+//   3. 每个 warp 内的线程协作计算一行的部分点积
+//   4. 通过 warp shuffle 归约得到最终结果
+//
+// 模板参数:
+//   scalar_t: 输出数据类型 (half/bf16)
+//   qk: 量化 block 大小 (如 Q4_0 的 QK=32)
+//   qi: 每个 int32 中的量化值数量
+//   block_q_t: 量化 block 数据结构
+//   vdr: 每次迭代处理的量化值数量
+//   vec_dot_q_cuda: 量化向量点积函数
+//
+// 性能优化:
+//   - 使用 warp shuffle 进行归约，避免 shared memory 的 bank conflict
+//   - 每个 warp 处理连续的 block，减少内存访问碎片化
+// =============================================================================
+
 template <typename scalar_t, int qk, int qi, typename block_q_t, int vdr, vec_dot_q_cuda_t vec_dot_q_cuda>
 static __global__ void mul_mat_vec_q(const void * __restrict__ vx, const void * __restrict__ vy, scalar_t * __restrict__ dst, const int ncols, const int nrows, const int nvecs) {
     const auto row = blockIdx.x*blockDim.y + threadIdx.y;

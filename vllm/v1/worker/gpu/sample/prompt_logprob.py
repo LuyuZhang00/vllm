@@ -1,5 +1,27 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""
+Prompt Log 概率计算模块 (Prompt Log Probability Computation Module)
+
+本模块实现了 prompt token 的 log 概率计算功能。与采样 token 的 logprob 不同，
+prompt logprob 是计算 prompt 中每个 token 在给定前面 token 条件下的 log 概率。
+
+应用场景：
+- 评估 prompt 的"困惑度"（perplexity）
+- 分析模型对 prompt 中每个 token 的置信度
+- 用于 fine-tuning 数据的质量评估
+
+处理流程：
+1. 获取需要计算 logprob 的 prompt token IDs
+2. 使用 logits_fn（包含 all-gather 等分布式操作）计算 logits
+3. 计算 top-K log 概率
+4. 处理分块 prefill 的情况：如果 prompt 被分块处理，
+   需要将多个步骤的结果合并
+
+特殊处理：
+- 被抢占后恢复的请求：prompt logprob 在抢占前已计算，跳过
+- 分块 prefill：prompt 可能分多步处理，需要累积结果
+"""
 from collections.abc import Callable
 
 import numpy as np
@@ -13,15 +35,35 @@ from vllm.v1.worker.gpu.sample.logprob import compute_topk_logprobs
 
 
 class PromptLogprobsWorker:
+    """Prompt log 概率计算的工作器。
+
+    管理每个请求的 prompt logprob 状态，处理分块 prefill 的结果累积。
+    """
+
     def __init__(self, max_num_reqs: int):
+        """初始化 prompt logprob 工作器。
+
+        Args:
+            max_num_reqs: 最大请求数
+        """
         self.max_num_reqs = max_num_reqs
 
+        # 标记每个请求是否需要 prompt logprob
         self.uses_prompt_logprobs = np.zeros(self.max_num_reqs, dtype=bool)
+        # 每个请求需要的 prompt logprob 数量
         self.num_prompt_logprobs = np.zeros(self.max_num_reqs, dtype=np.int32)
-        # req_idx -> list of in-progress LogprobsTensors
+        # 正在处理中的 prompt logprob（用于分块 prefill 的结果累积）
+        # req_id -> list of in-progress LogprobsTensors
         self.in_progress_prompt_logprobs: dict[str, list[LogprobsTensors]] = {}
 
     def add_request(self, req_id: str, req_idx: int, sampling_params: SamplingParams):
+        """添加新请求的 prompt logprob 配置。
+
+        Args:
+            req_id: 请求 ID
+            req_idx: 请求在批次中的索引
+            sampling_params: 采样参数
+        """
         uses_prompt_logprobs = sampling_params.prompt_logprobs is not None
         self.uses_prompt_logprobs[req_idx] = uses_prompt_logprobs
         self.num_prompt_logprobs[req_idx] = sampling_params.prompt_logprobs or 0
@@ -29,6 +71,11 @@ class PromptLogprobsWorker:
             self.in_progress_prompt_logprobs[req_id] = []
 
     def remove_request(self, req_id: str) -> None:
+        """移除请求的 prompt logprob 状态。
+
+        Args:
+            req_id: 请求 ID
+        """
         self.in_progress_prompt_logprobs.pop(req_id, None)
 
     def compute_prompt_logprobs(
@@ -47,24 +94,45 @@ class PromptLogprobsWorker:
         # [max_num_reqs]
         num_computed_prefill_tokens: np.ndarray,
     ) -> dict[str, LogprobsTensors]:
+        """计算 prompt token 的 log 概率。
+
+        处理流程：
+        1. 检查是否有请求需要 prompt logprob
+        2. 获取需要计算 logprob 的 prompt token IDs
+        3. 计算 logits（可能涉及 all-gather 等分布式操作）
+        4. 计算 top-K log 概率
+        5. 处理分块 prefill 的结果累积和合并
+
+        Args:
+            logits_fn: 计算 logits 的函数（可能包含 all-gather 等操作）
+            hidden_states: 隐藏状态张量
+            input_batch: 输入批次数据
+            all_token_ids: 所有 token IDs [max_num_reqs, max_model_len]
+            num_computed_tokens: 已计算的 token 数量
+            prompt_lens: prompt 长度
+            prefill_lens: prefill 长度
+            num_computed_prefill_tokens: 已计算的 prefill token 数量
+
+        Returns:
+            请求 ID 到 LogprobsTensors 的字典
+        """
         idx_mapping_np = input_batch.idx_mapping_np
         needs_prompt_logprobs = self.uses_prompt_logprobs[idx_mapping_np]
         if not np.any(needs_prompt_logprobs):
-            # Common case: No request asks for prompt logprobs.
+            # 常见情况：没有请求需要 prompt logprob
             return {}
 
         num_prompt_logprobs = self.num_prompt_logprobs[idx_mapping_np]
         prompt_lens = prompt_lens[idx_mapping_np]
         computed_prefill = num_computed_prefill_tokens[idx_mapping_np]
         includes_prompt = computed_prefill < prompt_lens
-        # NOTE(woosuk): If the request was resumed after preemption, its prompt
-        # logprobs must have been computed before preemption. Skip.
+        # 注意：如果请求在被抢占后恢复，其 prompt logprob 在抢占前已计算，跳过
         resumed_after_prompt = prompt_lens < prefill_lens[idx_mapping_np]
         needs_prompt_logprobs &= includes_prompt & ~resumed_after_prompt
         if not np.any(needs_prompt_logprobs):
             return {}
 
-        # get the maximum number in this batch
+        # 获取本批次中请求的最大 logprob 数量
         requested_num_prompt_logprobs = num_prompt_logprobs[needs_prompt_logprobs]
         max_num_prompt_logprobs = (
             -1
@@ -72,7 +140,7 @@ class PromptLogprobsWorker:
             else int(requested_num_prompt_logprobs.max())
         )
 
-        # Get the prompt logprobs token_ids.
+        # 获取需要计算 logprob 的 prompt token IDs
         prompt_logprobs_token_ids = get_prompt_logprobs_token_ids(
             input_batch.num_tokens,
             input_batch.query_start_loc,
@@ -80,6 +148,7 @@ class PromptLogprobsWorker:
             num_computed_tokens,
             all_token_ids,
         )
+        # 分块计算 prompt logprob（避免内存溢出）
         prompt_token_ids, prompt_logprobs, prompt_ranks = (
             compute_prompt_logprobs_with_chunking(
                 prompt_logprobs_token_ids,
@@ -89,6 +158,7 @@ class PromptLogprobsWorker:
             )
         )
 
+        # 检查 prompt 是否被分块处理
         pos_after_step = computed_prefill + input_batch.num_scheduled_tokens
         is_prompt_chunked = pos_after_step < prompt_lens
 
@@ -113,7 +183,7 @@ class PromptLogprobsWorker:
                 if req_num_prompt_logprobs == -1
                 else req_num_prompt_logprobs + 1
             )
-            # no logprobs if start_idx >= end_idx
+            # 如果 start_idx >= end_idx，没有 logprob
             logprobs = (
                 None
                 if start_idx >= end_idx
@@ -128,11 +198,11 @@ class PromptLogprobsWorker:
             if logprobs is not None and (req_is_prompt_chunked or prompt_logprobs_list):
                 prompt_logprobs_list.append(logprobs)
             if req_is_prompt_chunked:
-                # Prompt is chunked. Do not return the logprobs yet.
+                # Prompt 被分块处理，暂不返回 logprob
                 continue
 
             if prompt_logprobs_list:
-                # Merge the in-progress logprobs.
+                # 合并正在处理中的 logprob 结果
                 logprobs = LogprobsTensors(
                     logprob_token_ids=torch.cat(
                         [x.logprob_token_ids for x in prompt_logprobs_list]

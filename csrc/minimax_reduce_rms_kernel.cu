@@ -15,6 +15,37 @@
  * limitations under the License.
  */
 
+/*
+ * 中文注释 - 文件功能概述：
+ * ============================================================================
+ * 本文件实现了 MiniMax 模型专用的 "AllReduce + RMSNorm" 融合 CUDA kernel。
+ *
+ * 核心功能：
+ *   在张量并行 (TP) 场景下，将 RMSNorm 与跨 GPU 的 AllReduce 融合在同一个
+ *   kernel 中执行，避免 AllReduce 和 RMSNorm 分开执行时的额外显存读写开销。
+ *
+ * 整体算法流程（以单个 token 为例）：
+ *   1. 每个 rank 读取本地的输入向量 x_local，计算局部方差和 sum(x_local^2)。
+ *   2. 通过 Lamport 协议（一种基于标志位的无锁 AllReduce 方式）在所有 rank
+ *      之间交换局部方差和，得到全局方差和 sum_all = sum_over_ranks(sum(x_r^2))。
+ *   3. 计算 RMSNorm 输出：output = x_local * rsqrt(sum_all / (hidden_dim * nranks) + eps) * gamma。
+ *
+ * 本文件包含两个 CUDA kernel：
+ *   (A) minimax_reduce_rms_kernel_lamport:
+ *       标量版本，每个线程处理 kElemsPerAccess<DType> 个元素（float4 加载），
+ *       适用于单矩阵（如 Q 或 K 单独）的 RMSNorm。
+ *   (B) minimax_reduce_qk_rms_kernel_lamport_float4:
+ *       float4 优化版本，一次循环同时处理 4 行（4 个 token），且同时处理 Q 和 K
+ *       两个矩阵，实现更好的内存合并访问和更高的吞吐量。
+ *
+ * Lamport 无锁通信协议：
+ *   使用三缓冲区（triple buffering）和标志位实现跨 rank 的无锁数据交换。
+ *   每个 rank 将局部结果写入所有其他 rank 的缓冲区中自己的槽位，
+ *   然后轮询读取其他 rank 写入本 rank 缓冲区中的数据。
+ *   通过 flag 的模 3 切换缓冲区偏移，实现流水线式的无锁通信。
+ * ============================================================================
+ */
+
 #include <cooperative_groups.h>
 #include <cuda_runtime.h>
 
@@ -30,13 +61,37 @@
 #include <algorithm>
 
 #define FINAL_MASK 0xffffffff
+// 中文注释：一个 warp 中的线程数，CUDA 中 warp 大小固定为 32
 #define MINIMAX_REDUCE_RMS_WARP_SIZE 32
 
 namespace vllm {
 namespace tensorrt_llm {
 
+/*
+ * 中文注释 - LamportComm 结构体：
+ * Lamport 无锁跨 rank 通信协议的设备端管理器。
+ *
+ * 工作原理：
+ *   - 使用三缓冲区（triple buffering）避免读写冲突：flag_value % 3 决定当前
+ *     写入的缓冲区偏移，(flag_value + 2) % 3 决定需要清除的旧缓冲区偏移。
+ *   - 每个 rank 有 NRanks 个数据缓冲区指针 data_bufs[r]，指向 rank r 的共享
+ *     内存区域，允许本 rank 直接写入其他 rank 的缓冲区。
+ *   - counter_ptr 用于跟踪所有 block 是否完成当前迭代（barrier 同步）。
+ *   - flag_ptr 控制缓冲区轮转，clear_ptr 记录需要清除的数据大小。
+ *
+ * 生命周期：
+ *   构造 -> 各 block 完成计算并写入数据 -> update() 中 block 0 等待所有 block
+ *   完成后翻转 flag 并清除旧缓冲区。
+ */
 template <int NRanks>
 struct LamportComm {
+  // 中文注释：构造函数，初始化 Lamport 通信所需的缓冲区指针。
+  // workspace 布局：
+  //   workspace[0..NRanks-1]         : 输入数据缓冲区指针（未使用）
+  //   workspace[NRanks..2*NRanks-1]  : 输出数据缓冲区指针（未使用）
+  //   workspace[2*NRanks..3*NRanks-1]: 每个 rank 的三缓冲区基地址
+  //   workspace[NRanks*3]            : 共享计数器和标志位（counter, flag）
+  //   workspace[NRanks*3+1]          : clear 指针和 comm_size
   __device__ __forceinline__ LamportComm(void** workspace, int rank) {
     counter_ptr = &reinterpret_cast<int*>(workspace[NRanks * 3])[0];
     flag_ptr = &reinterpret_cast<int*>(workspace[NRanks * 3])[2];
@@ -44,6 +99,8 @@ struct LamportComm {
     flag_value = *flag_ptr;
     auto comm_size = reinterpret_cast<int64_t*>(workspace[NRanks * 3 + 1])[1];
     clear_size = *clear_ptr;
+    // 中文注释：data_offset 指向当前轮次的写入缓冲区，clear_offset 指向上一轮的
+    // 缓冲区（需要清除以供下一轮使用），两者相差 2（模 3）保证不冲突。
     int data_offset = flag_value % 3;
     int clear_offset = (flag_value + 2) % 3;
     for (int r = 0; r < NRanks; ++r) {
@@ -53,11 +110,15 @@ struct LamportComm {
     clear_buf = reinterpret_cast<uint8_t*>(workspace[2 * NRanks + rank]) +
                 clear_offset * comm_size;
     __syncthreads();
+    // 中文注释：每个 block 的 thread 0 原子递增计数器，用于后续 barrier 同步。
     if (threadIdx.x == 0) {
       atomicAdd(counter_ptr, 1);
     }
   }
 
+  // 中文注释：update 由 block 0 的 thread 0 调用，执行三缓冲区轮转。
+  // 流程：等待所有 block 完成（counter == gridDim.x）-> 翻转 flag ->
+  // 更新 clear_size -> 重置 counter 为 0，为下一轮迭代做准备。
   __device__ __forceinline__ void update(int64_t new_clear_size) {
     if (blockIdx.x == 0 && threadIdx.x == 0) {
       while (*reinterpret_cast<int volatile*>(counter_ptr) != gridDim.x) {
@@ -77,6 +138,14 @@ struct LamportComm {
   int flag_value;
 };
 
+/*
+ * 中文注释 - 负零检测工具函数：
+ * 在 Lamport 协议中，负零（-0.0）被用作"数据尚未就绪"的哨兵值。
+ * 因为正常的浮点计算结果不会产生负零（-0.0 只在特定除法或初始化时出现），
+ * 所以可以用它来区分"已写入的有效数据"和"未写入的缓冲区"。
+ * is_neg_zero: 检测 float/float4 是否为负零。
+ * get_neg_zero: 构造一个全负零的 float4 向量，用于清除缓冲区。
+ */
 __device__ __forceinline__ bool is_neg_zero(float v) {
   return *reinterpret_cast<uint32_t*>(&v) == 0x80000000;
 }
@@ -95,6 +164,13 @@ __device__ __forceinline__ float4 get_neg_zero() {
   return vec;
 }
 
+/*
+ * 中文注释 - RMSNorm 的 rsqrt 计算：
+ * RMSNorm 的归一化因子为 rsqrt(mean(x^2) + eps) = rsqrt(sum(x^2)/Dim + eps)。
+ * 这里 v 传入的是已经跨 rank 求和后的全局 sum(x^2)，Dim 是完整的 hidden_dim
+ * （即 nranks * per_rank_dim），kInvDim = 1.0/Dim 用于将求和转为均值。
+ * 模板参数 Dim 在编译期确定，避免运行时除法。
+ */
 template <int Dim>
 __device__ __forceinline__ float rms_rsqrt(float& v, float eps) {
   constexpr float kInvDim = 1.0F / static_cast<float>(Dim);
@@ -102,6 +178,7 @@ __device__ __forceinline__ float rms_rsqrt(float& v, float eps) {
   return v;
 }
 
+// 中文注释：float4 向量化版本，同时对 4 个 token 的方差和计算 rsqrt。
 template <int Dim>
 __device__ __forceinline__ float4 rms_rsqrt(float4& v, float eps) {
   constexpr float kInvDim = 1.0F / static_cast<float>(Dim);
@@ -111,6 +188,14 @@ __device__ __forceinline__ float4 rms_rsqrt(float4& v, float eps) {
   v.w = rsqrtf((v.w * kInvDim) + eps);
   return v;
 }
+/*
+ * 中文注释 - volatile 全局内存加载：
+ * 使用 PTX 内联汇编的 ld.volatile 指令从全局内存加载数据。
+ * "volatile" 语义确保编译器不会缓存该加载结果，每次都从显存重新读取。
+ * 这在 Lamport 轮询等待场景中至关重要：线程需要不断检查其他 rank 是否
+ * 已写入数据，如果加载被缓存，可能永远看不到最新写入的值。
+ * float4 版本一次加载 128 位（4 个 float），float 版本加载 32 位。
+ */
 __device__ __forceinline__ float4 ld_global_volatile(float4* addr) {
   float4 val;
   asm volatile("ld.volatile.global.v4.f32 {%0, %1, %2, %3}, [%4];"
@@ -125,6 +210,12 @@ __device__ __forceinline__ float ld_global_volatile(float* addr) {
   return val;
 }
 
+/*
+ * 中文注释 - warpReduceSumV2：标量 warp 内归约求和。
+ * 在一个 warp 内通过 __shfl_xor_sync 进行 butterfly 归约，
+ * 将 NUM 个通道的值分别在 32 个线程间求和。
+ * 仅用于标量 kernel（非 float4 版本）。
+ */
 // Used by the scalar (non-float4) kernel only
 template <typename T, int NUM>
 __inline__ __device__ T warpReduceSumV2(T* val) {
@@ -137,6 +228,14 @@ __inline__ __device__ T warpReduceSumV2(T* val) {
   return (T)(0.0f);
 }
 
+/*
+ * 中文注释 - blockReduceSumV2：block 级别归约求和。
+ * 两阶段归约：
+ *   1. 每个 warp 内先通过 warpReduceSumV2 归约到 warp 部分和。
+ *   2. 每个 warp 的 lane 0 将部分和写入 shared memory。
+ *   3. 第一个 warp 读取所有 warp 的部分和，再次 warp 内归约得到 block 总和。
+ * 使用 shared[NUM][33] 布局，第二维 33 是为了避免 bank conflict。
+ */
 template <typename T, int NUM>
 __inline__ __device__ T blockReduceSumV2(T* val) {
   static __shared__ T shared[NUM][33];
@@ -163,6 +262,12 @@ __inline__ __device__ T blockReduceSumV2(T* val) {
   return (T)0.0f;
 }
 
+/*
+ * 中文注释 - local_warp_reduce_sum_array：float4 版本的 warp 内归约。
+ * 对 ArraySize 个 float 通道分别在 kNumThreads 个线程间进行 butterfly 归约。
+ * kNumThreads 可以小于 32（如只用 NRanks 个线程做跨 rank 归约），
+ * active_mask 控制参与归约的线程掩码，未参与的线程自动贡献 0。
+ */
 // for float4 version
 template <uint32_t kNumThreads, typename T, int ArraySize = 4>
 __device__ __forceinline__ void local_warp_reduce_sum_array(
@@ -179,6 +284,7 @@ __device__ __forceinline__ void local_warp_reduce_sum_array(
   }
 }
 
+// 中文注释：计算大于等于 val 的最小 2 的幂次，用于 warp 归约时确定有效线程数。
 constexpr int next_pow2(int val) {
   int result = 1;
   while (result < val) {
@@ -189,6 +295,20 @@ constexpr int next_pow2(int val) {
 
 // ---------------------------------------------------------------------------
 
+/*
+ * 中文注释 - IndexHelper 类：
+ * 负责计算当前线程在全局数据中的索引。根据 CUDA 架构版本选择不同的索引策略：
+ *   - SM 90+（Hopper）：使用 cooperative_groups 的 cluster 索引，一个 cluster
+ *     处理一个 token，cluster 内线程并行处理该 token 的不同元素。
+ *   - SM < 90：使用传统的 blockIdx.x 和 threadIdx.x 映射。
+ *
+ * 关键成员变量：
+ *   token_id          : 当前线程负责处理的 token 编号
+ *   access_id_in_token: token 内的线程偏移（即负责第几个 float4 访问）
+ *   access_id         : 全局访问索引 = token_id * hidden_dim/elems_per_access + access_id_in_token
+ *   access_stride     : 一次循环迭代后跳到下一个 token 的步长
+ *   tot_access        : 总共需要访问的 float4 数量
+ */
 template <typename DType>
 class IndexHelper {
  public:
@@ -230,9 +350,38 @@ rsqrt(variance + eps)) in this case, max hidden_dim is 6144 (float data), for
 each token, we only need 6144 / 4 / tp_size = (1536 / tp_size) threads so we can
 assume cluster size is 1 (tp_size >= 2)
  */
+/*
+ * 中文注释 - minimax_reduce_rms_kernel_lamport（标量版本 kernel）：
+ * =========================================================================
+ * 这是 AllReduce + RMSNorm 融合的主 kernel（标量处理，一个循环处理一个 token）。
+ *
+ * 每个 block 处理一个 token，block 内的线程并行处理该 token 的 hidden_dim 个元素。
+ *
+ * 执行流程：
+ *   Step 1 - 局部方差计算：
+ *     每个线程用 float4 加载 kElemsPerAccess 个元素，计算每个元素的平方并累加，
+ *     然后通过 blockReduceSumV2 在整个 block 内求和，得到本 rank 对该 token 的
+ *     局部方差和 sum(x_local^2)。
+ *
+ *   Step 2 - 跨 rank AllReduce（Lamport 协议）：
+ *     每个 block 的 thread 0 将局部方差和写入所有其他 rank 的通信缓冲区中
+ *     自己的槽位（push），然后轮询读取所有其他 rank 写入本 rank 缓冲区的
+ *     局部方差和（pull），通过 volatile 加载确保读到最新值。
+ *     所有 rank 的局部方差和相加得到全局方差和。
+ *
+ *   Step 3 - RMSNorm 归一化：
+ *     用全局方差和计算 rsqrt(sum_all / (hidden_dim * NRanks) + eps)，
+ *     然后将原始输入值乘以该归一化因子和可学习的 gamma 权重，写回输出。
+ *
+ *   Step 4 - 清理：
+ *     将上一轮使用的缓冲区用负零清除，为下一轮迭代做准备。
+ *     调用 comm.update() 翻转三缓冲区的标志位。
+ * =========================================================================
+ */
 template <typename DType, int NRanks>
 __global__ void __launch_bounds__(1024)
     minimax_reduce_rms_kernel_lamport(MiniMaxReduceRMSParams params) {
+  // 中文注释：通过 IndexHelper 计算当前线程的索引信息
   IndexHelper<DType> index_helper(params);
   int token_id = index_helper.token_id;
   int access_id_in_token = index_helper.access_id_in_token;
@@ -241,27 +390,39 @@ __global__ void __launch_bounds__(1024)
   int access_stride = index_helper.access_stride;
   int tot_access = index_helper.tot_access;
   int tot_tokens = params.size_q / params.hidden_dim;
+  // 中文注释：clear_vec 是全负零的 float4，用于清除上一轮的通信缓冲区
   float4 clear_vec = get_neg_zero();
 
+  // 中文注释：初始化 Lamport 通信上下文，建立跨 rank 的缓冲区指针
   LamportComm<NRanks> comm(params.workspace, params.rank);
   int clear_access = comm.clear_size / kElemsPerAccess<DType>;
+  // 中文注释：SM 90+ (Hopper) 使用 grid dependency control 等待前置 kernel 完成
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   asm volatile("griddepcontrol.wait;");
 #endif
+  // 中文注释：主循环 - 遍历当前线程负责的所有 token（可能有多个 token 需要处理）
   for (int idx = access_id; idx < tot_access;
        idx += access_stride, token_id += token_stride) {
+    // ========== Step 1: 计算本 rank 的局部方差和 ==========
     alignas(16) DType vals[kElemsPerAccess<DType>];
     float sum_variance = 0.F;
+    // 中文注释：从全局内存加载当前 token 对应的 kElemsPerAccess 个元素
     *reinterpret_cast<float4*>(vals) =
         reinterpret_cast<float4*>(params.allreduce_in)[idx];
+    // 中文注释：计算每个元素的平方并累加，得到线程级别的部分方差和
 #pragma unroll
     for (int i = 0; i < kElemsPerAccess<DType>; ++i) {
       sum_variance += static_cast<float>(vals[i]) * static_cast<float>(vals[i]);
     }
+    // 中文注释：block 内归约求和，得到该 token 在本 rank 上的完整方差和
     blockReduceSumV2<float, 1>(&sum_variance);
+    // 中文注释：清除负零哨兵值（归约过程中可能意外产生）
     if (is_neg_zero(sum_variance)) {
       sum_variance = 0.F;
     }
+    // ========== Step 2: 跨 rank AllReduce（Lamport push） ==========
+    // 中文注释：thread 0 将本 rank 的局部方差和写入所有其他 rank 的缓冲区
+    // 写入位置：comm.data_bufs[r] 的 [rank * tot_tokens + token_id] 槽位
     if (threadIdx.x == 0) {
       for (int r = 0; r < NRanks; ++r) {
         reinterpret_cast<float*>(
@@ -270,6 +431,10 @@ __global__ void __launch_bounds__(1024)
       }
     }
 
+    // ========== Step 2 续: 跨 rank AllReduce（Lamport pull + 轮询等待） ==========
+    // 中文注释：轮询等待所有 rank 将它们的局部方差和写入本 rank 的缓冲区。
+    // 使用 volatile 加载确保每次都从显存读取最新值。
+    // is_neg_zero 检测：负零表示数据尚未就绪，非负零表示有效数据已写入。
     bool done = false;
     float vars_all_ranks[NRanks];
     while (!done) {
@@ -281,17 +446,23 @@ __global__ void __launch_bounds__(1024)
         done &= !is_neg_zero(vars_all_ranks[r]);
       }
     }
+    // 中文注释：汇总所有 rank 的局部方差和，得到全局方差和
     sum_variance = 0.F;
 #pragma unroll
     for (int r = 0; r < NRanks; ++r) {
       sum_variance += vars_all_ranks[r];
     }
 
+    // ========== Step 3: RMSNorm 归一化 ==========
+    // 中文注释：加载 RMSNorm 的 gamma 权重（每个元素对应一个可学习参数）
     DType norm_weight[kElemsPerAccess<DType>];
     *reinterpret_cast<typename ElemsPerAccess<DType>::vec_type*>(norm_weight) =
         reinterpret_cast<typename ElemsPerAccess<DType>::vec_type*>(
             params.rms_gamma)[access_id_in_token];
 
+    // 中文注释：计算最终输出 = x * rsqrt(sum_all / (hidden_dim * NRanks) + eps) * gamma
+    // 其中 hidden_dim * NRanks 是完整的（未切分的）隐藏维度，
+    // rsqrt 中的除法将方差和转为均值后再加 eps 取倒数平方根。
 #pragma unroll
     for (int i = 0; i < kElemsPerAccess<DType>; ++i) {
       vals[i] = static_cast<DType>(
@@ -302,13 +473,18 @@ __global__ void __launch_bounds__(1024)
           static_cast<float>(norm_weight[i]));
     }
 
+    // 中文注释：将归一化结果写回全局输出
     reinterpret_cast<float4*>(params.rms_norm_out)[idx] =
         *reinterpret_cast<float4*>(vals);
   }
+  // ========== Step 4: 清理上一轮的通信缓冲区 ==========
+  // 中文注释：用负零填充上一轮使用的缓冲区，为下一轮 Lamport 通信做准备
   for (int idx = access_id; idx < clear_access; idx += access_stride) {
     reinterpret_cast<float4*>(comm.clear_buf)[idx] = clear_vec;
   }
+  // 中文注释：翻转三缓冲区标志位，推进到下一轮
   comm.update(params.size_q * NRanks);
+  // 中文注释：SM 90+ 通知依赖的后续 kernel 可以开始执行
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   asm volatile("griddepcontrol.launch_dependents;");
 #endif
@@ -321,15 +497,41 @@ __global__ void __launch_bounds__(1024)
  * zeros; padded rows are not written to rms_norm_out. IsQK: when true, process
  * Q+K in one loop with doubled comm buffer; when false, single-matrix (Q only).
  */
+/*
+ * 中文注释 - minimax_reduce_qk_rms_kernel_lamport_float4（float4 优化版本）：
+ * =========================================================================
+ * 这是 AllReduce + RMSNorm 融合的优化版本，同时处理 Q 和 K 两个矩阵。
+ *
+ * 与标量版本的关键区别：
+ *   1. 每次循环处理 4 行（4 个 token）而不是 1 行，提升数据复用率。
+ *   2. 使用 float4 向量化进行 AllReduce 通信，提升内存带宽利用率。
+ *   3. 同一个 kernel 内同时处理 Q 和 K 两个矩阵，减少 kernel 启动开销。
+ *
+ * Block 内线程分配：
+ *   前 NumWarpQ 个 warp 负责 Q 矩阵的处理，
+ *   后 NumWarpK 个 warp 负责 K 矩阵的处理。
+ *   Q 和 K 各自独立计算方差和、独立做跨 rank 归约，最后独立写回。
+ *
+ * 执行流程（以 Q 为例，K 同理）：
+ *   1. 每组 4 行的线程分别加载 float4 数据，计算每行的平方和。
+ *   2. warp 内 butterfly 归约得到每个 warp 对 4 行的方差和。
+ *   3. shared memory 二次归约得到 block 级别的方差和。
+ *   4. NRanks 个 leader 线程通过 Lamport 协议做跨 rank 归约。
+ *   5. 计算 rsqrt，广播到所有线程，完成 RMSNorm 归一化并写回。
+ * =========================================================================
+ */
 template <typename DType, int NRanks, int OriginQDim, int OriginKDim>
 __global__ void __launch_bounds__(1024)
     minimax_reduce_qk_rms_kernel_lamport_float4(MiniMaxReduceRMSParams params) {
+  // 中文注释：编译期确定每个 rank 上 Q/K 的维度大小
   // Compile-time per-rank dimensions
   constexpr int RankQDim = OriginQDim / NRanks;
   constexpr int RankKDim = OriginKDim / NRanks;
+  // 中文注释：覆盖一行 Q/K 所需的 float4 访问次数（即每行需要多少个线程）
   // Threads needed to cover one row of Q / K with float4 accesses
   constexpr int ThreadsPerRowQ = RankQDim / kElemsPerAccess<DType>;
   constexpr int ThreadsPerRowK = RankKDim / kElemsPerAccess<DType>;
+  // 中文注释：覆盖一行 Q/K 需要的 warp 数量（向上取整到 warp 对齐）
   // Number of warps dedicated to Q / K
   constexpr int NumWarpQ = (ThreadsPerRowQ + MINIMAX_REDUCE_RMS_WARP_SIZE - 1) /
                            MINIMAX_REDUCE_RMS_WARP_SIZE;
@@ -337,6 +539,7 @@ __global__ void __launch_bounds__(1024)
                            MINIMAX_REDUCE_RMS_WARP_SIZE;
 
   int tot_tokens = params.size_q / RankQDim;
+  // 中文注释：总 token 数除以 4 得到"组数"，每组处理 4 个 token；最后不足 4 个的用零填充
   int tot_groups = (tot_tokens + 3) / 4;  // ceiling; last group may be partial
 
   // Memory strides for strided qkv tensors (elements -> float4-access units)

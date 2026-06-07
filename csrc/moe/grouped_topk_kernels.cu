@@ -17,6 +17,35 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+
+// =============================================================================
+// 中文注释：Grouped Top-K 路由算子实现
+//
+// 本文件实现了 DeepSeek V3 / Kimi K2 等 MoE 模型使用的"分组 Top-K"路由算法。
+// 与标准 top-k 不同，grouped top-k 先将专家分成 n_group 组，每组计算一个
+// "组得分"（组内 top-2 专家得分之和），然后选出得分最高的 topk_group 个组，
+// 最终只在这些被选中的组内做 top-k 选择。
+//
+// 算法流程（以 DeepSeek V3 为例，256 专家，8 组，每组 32 专家）：
+// 1. 对每个 token 的 256 个专家得分做 sigmoid/scoring 激活 + bias 偏移。
+// 2. 每个 warp 负责一个专家组，计算组内 top-2 得分之和作为组得分。
+// 3. warp 0 从 8 个组得分中选出 topk_group 个组。
+// 4. 在被选中的组内，合并所有候选专家，选出最终的 topk 个专家。
+// 5. 对选中专家的权重做归一化和缩放。
+//
+// 支持两种 kernel 路径：
+// - grouped_topk_fused_kernel：通用路径，一个 warp 对应一个专家组，
+//   使用 WarpSelect 进行高效的在线 top-k 选择。
+// - grouped_topk_fused_small_expert_count_kernel：针对小专家数（<=512）的
+//   优化路径，使用 reduceTopK 进行 warp 级归约，支持无分组和有分组两种模式。
+//
+// 支持的模型配置：
+// - DeepSeek V3: 256 experts, 8 groups, topk_group=4, topk=8
+// - Kimi K2: 384 experts
+// - Nemotron: 512 experts, 1 group, topk=22
+//
+// 依赖文件：moeTopKFuncs.cuh（提供 warp 级 reduceTopK 原语）
+// =============================================================================
 #include "moeTopKFuncs.cuh"
 #include <c10/cuda/CUDAStream.h>
 #include <torch/all.h>
@@ -44,6 +73,10 @@ static constexpr int DefaultMaxNumTopExperts = 8;
 static constexpr int MaxSupportedTopExperts = 22;
 static constexpr int MaxNumTopGroups = 4;
 
+// 中文注释：warp_topk 命名空间 —— 提供 warp 级别的 Top-K 排序/选择原语。
+// 包含 BitonicSort（双调排序）、BitonicMerge（双调归并）、WarpSort（排序基类）、
+// WarpSelect（在线 Top-K 选择）等工具类。
+// 核心思想：利用 warp 内 __shfl_xor_sync 进行无 shared memory 的高效排序。
 namespace warp_topk {
 
 template <int size, typename T>
@@ -75,6 +108,10 @@ __forceinline__ __device__ bool is_better_than(T val, T baseline, idxT index,
   return res;
 }
 
+// 中文注释：BitonicMerge —— 双调归并网络。
+// 输入一个双调序列（先递增后递减，或先递减后递增），输出单调序列。
+// 递归地将序列拆分为两半，每半内部已经是单调的，通过比较-交换操作归并。
+// size >= 2*WARP_SIZE 时使用寄存器数组存储，否则使用 warp shuffle。
 template <int size, bool ascending, bool reverse, typename T, typename idxT,
           bool is_stable>
 struct BitonicMerge {
@@ -116,6 +153,9 @@ struct BitonicMerge {
   }
 };
 
+// 中文注释：BitonicSort —— 双调排序网络。
+// 将无序序列排序为单调序列。先递归地将序列分为两半，分别排成递增和递减，
+// 形成双调序列后用 BitonicMerge 归并。
 template <int size, bool ascending, typename T, typename idxT, bool is_stable>
 struct BitonicSort {
   __device__ static void sort(T* __restrict__ val_arr,
@@ -212,6 +252,9 @@ struct BitonicMerge<32, ascending, reverse, T, idxT, is_stable> {
   }
 };
 
+// 中文注释：WarpSort —— Warp 级排序基类。
+// 每个线程持有 capacity/WARP_SIZE 个元素，通过 warp shuffle 进行排序。
+// 提供 load_sorted（加载已排序数据并合并）和 dump（输出排序结果）接口。
 template <int capacity, bool greater, typename T, typename idxT, bool is_stable>
 class WarpSort {
  public:
@@ -290,6 +333,11 @@ class WarpSort {
 
 };  // end class WarpSort
 
+// 中文注释：WarpSelect —— Warp 级在线 Top-K 选择器（继承自 WarpSort）。
+// 与 WarpSort 不同，WarpSelect 不需要一次性加载所有数据，而是通过 add() 方法
+// 逐步添加候选元素，内部维护一个大小为 K 的"堆"（实际上是排序数组）。
+// 当候选数量超过 K 时，自动丢弃得分最低的元素。
+// 使用 shared memory 作为临时缓冲区，当缓冲区满时与寄存器数组合并。
 template <int capacity, bool greater, typename T, typename idxT, bool is_stable>
 class WarpSelect : public WarpSort<capacity, greater, T, idxT, is_stable> {
  public:
@@ -466,6 +514,15 @@ __device__ inline T apply_scoring(T val) {
   }
 }
 
+// 中文注释：topk_with_k2 —— 单个 warp 内计算组内 top-2 专家得分之和。
+// 每个 warp 负责一个专家组（如 32 个专家），计算组内得分最高的 2 个专家的
+// 得分之和，作为该组的"组得分"。
+// 算法流程：
+// 1. 每个线程遍历负责的专家，做 scoring 激活 + bias，找到局部 top-2。
+// 2. 通过 warp reduce 找到全局 top-1。
+// 3. 如果只有一个线程持有 top-1，则将该线程的 top-1 替换为 top-2，
+//    再做一次 warp reduce 找到全局 top-2。
+// 4. 输出 top-1 + top-2 作为组得分。
 template <typename T, typename BiasT, ScoringFunc SF>
 __device__ void topk_with_k2(T* output, T const* input, BiasT const* bias,
                              cg::thread_block_tile<32> const& tile,
@@ -512,6 +569,21 @@ __device__ void topk_with_k2(T* output, T const* input, BiasT const* bias,
   }
 }
 
+// 中文注释：grouped_topk_fused_kernel —— 通用的分组 Top-K 路由 kernel。
+// 适用于专家数较多、每组专家数超过 warp 大小的场景。
+//
+// 线程组织：一个 block 处理一个 token，一个 warp 处理一个专家组。
+// block 大小 = n_group * WARP_SIZE（如 8 组 * 32 = 256 线程）。
+//
+// 算法流程：
+// phase 1（所有 warp 并行）：
+//   每个 warp 调用 topk_with_k2 计算该组的 top-2 得分之和，写入 shared memory。
+// phase 2（仅 warp 0 执行）：
+//   a. 从 n_group 个组得分中选出 topk_group 个组（使用 WarpSelect）。
+//   b. 在被选中的组内，遍历所有专家，做 scoring + bias，添加到 expert_sel。
+//   c. 从合并的候选中选出最终的 topk 个专家。
+//   d. 计算无偏权重（只用 sigmoid 值，不含 bias），可选归一化。
+//   e. 乘以 routed_scaling_factor，写入输出。
 template <typename T, typename BiasT, typename IdxT, ScoringFunc SF>
 __global__ void grouped_topk_fused_kernel(
     T* scores, float* topk_values, IdxT* topk_indices, BiasT const* bias,
@@ -669,6 +741,21 @@ __global__ void grouped_topk_fused_kernel(
 #endif
 }
 
+// 中文注释：grouped_topk_fused_small_expert_count_kernel
+// —— 针对小专家数（<=512）优化的分组 Top-K 路由 kernel。
+// 与 grouped_topk_fused_kernel 不同，此 kernel 使用 reduceTopK 进行 warp 级归约，
+// 而非 WarpSelect，避免了 shared memory 的使用。
+//
+// 支持两种模式：
+// 1. UseGroups=true：有分组模式，先计算组得分，选组，再在组内选专家。
+// 2. UseGroups=false：无分组模式，直接从所有专家中选 topk。
+//
+// 模板参数 MaxNumExperts 决定 shared memory 大小和线程数：
+// - MaxNumExpertsUnit (128), NumDeepseekExperts (256), NumKimiK2Experts (384), NumNemotronExperts (512)
+// 这些是编译期常量，确保 shared memory 布局在编译时确定。
+//
+// 线程组织：一个 block 处理一个 token，线程数 = MaxNumExperts。
+// 每个 warp 代表一个专家组（或一组专家）。
 template <typename T, typename BiasT, typename IdxT, ScoringFunc SF,
           int MaxNumExperts, bool UseGroups,
           int MaxNumTopExperts = DefaultMaxNumTopExperts>
@@ -884,6 +971,14 @@ __global__ void grouped_topk_fused_small_expert_count_kernel(
 #endif
 }
 
+// 中文注释：invokeNoAuxTc —— 分组 Top-K 路由的 kernel 调度入口。
+// 根据专家数量和分组配置，选择最优的 kernel 实现：
+// 1. 小专家数（<=128 或 <=256/384/512）且条件满足时，使用
+//    grouped_topk_fused_small_expert_count_kernel（共享内存归约，更快）。
+// 2. 否则使用 grouped_topk_fused_kernel（WarpSelect，在线选择，更通用）。
+//
+// 支持 CUDA Graph 的 Programmatic Dependent Launch (PDL) 优化：
+// 通过 cudaLaunchAttributeProgrammaticStreamSerialization 实现 kernel 间依赖。
 template <typename T, typename BiasT, typename IdxT, ScoringFunc SF>
 void invokeNoAuxTc(T* scores, float* topk_values, IdxT* topk_indices,
                    BiasT const* bias, int64_t const num_tokens,
@@ -1001,6 +1096,20 @@ INSTANTIATE_NOAUX_TC(__nv_bfloat16, __nv_bfloat16, int32_t, SCORING_NONE);
 }  // end namespace moe
 }  // namespace vllm
 
+// 中文注释：grouped_topk —— Python 层调用的分组 Top-K 路由入口函数。
+// 输入：
+//   scores: [num_tokens, num_experts] — 每个 token 对每个专家的原始得分
+//   bias: [num_experts] — 每个专家的校正偏置
+//   n_group: 专家组数（如 DeepSeek V3 为 8）
+//   topk_group: 选中的专家组数（如 DeepSeek V3 为 4）
+//   topk: 最终选出的专家数（如 DeepSeek V3 为 8）
+//   scoring_func: 激活函数类型（0=无，1=sigmoid）
+// 输出：
+//   topk_values: [num_tokens, topk] — 选中专家的路由权重
+//   topk_indices: [num_tokens, topk] — 选中专家的索引
+//
+// 流程：根据 scores/bias 的数据类型（fp16/fp32/bf16）和 scoring_func
+// 分发到对应的 invokeNoAuxTc 模板实例。
 std::tuple<torch::Tensor, torch::Tensor> grouped_topk(
     torch::Tensor const& scores, int64_t n_group, int64_t topk_group,
     int64_t topk, bool renormalize, double routed_scaling_factor,

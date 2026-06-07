@@ -1,5 +1,35 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Logits处理器状态管理模块。
+
+本模块提供了两个核心类:
+
+1. BatchUpdateBuilder:
+    - 帮助跟踪持久化batch的状态变化
+    - 构建用于logits处理器的BatchUpdate数据结构
+    - 管理请求的添加、删除和移动操作
+
+2. LogitsProcessors:
+    - 封装已初始化的logits处理器对象
+    - 将处理器分为两类: argmax不变的和非argmax不变的
+    - 提供遍历所有处理器的迭代器
+
+BatchUpdateBuilder的设计假设和保证:
+
+假设:
+    1. 所有关于从持久化batch中移除请求的信息在步骤开始时通过
+       self.removed_append()调用聚合在self._removed中
+    2. 在给定步骤中第一次读取self.removed、self.pop_removed()
+       或self.peek_removed()之后，不再注册新的移除操作
+    3. self._removed的元素永远不会被直接修改、添加或移除
+       （修改仅通过self.removed_append()和self.pop_removed()进行）
+
+保证（在上述假设下）:
+    1. self.removed始终按降序排序
+    2. self.pop_removed()和self.peek_removed()都返回
+       当前步骤中最低的已移除请求索引
+"""
+
 from collections.abc import Iterable, Iterator
 from itertools import chain
 from typing import TYPE_CHECKING
@@ -16,24 +46,22 @@ if TYPE_CHECKING:
 
 
 class BatchUpdateBuilder:
-    """Helps track persistent batch state changes and build
-    a batch update data structure for logitsprocs
-    Assumptions:
-    * All information about requests removed from persistent batch
-      during a step is aggregated in self._removed through calls to
-      self.removed_append() at the beginning of a step. This must happen
-      before the first time that self.removed, self.pop_removed()
-      or self.peek_removed() are invoked in a given step
-    * After the first time that self.removed, self.pop_removed()
-      or self.peek_removed() are read in a step, no new removals
-      are registered using self.removed_append()
-    * Elements of self._removed are never directly modified, added or
-      removed (i.e. modification is only via self.removed_append() and
-      self.pop_removed())
-    Guarantees under above assumptions:
-    * self.removed is always sorted in descending order
-    * self.pop_removed() and self.peek_removed() both return
-      the lowest removed request index in the current step
+    """Batch更新构建器: 帮助跟踪持久化batch状态变化并构建BatchUpdate。
+
+    该类在调度器中使用，用于收集每个解码步骤中batch的变化信息，
+    然后传递给logits处理器。
+
+    使用模式:
+    1. 在步骤开始时，调用removed_append()注册所有被移除的请求
+    2. 通过added和moved列表记录添加和移动操作
+    3. 调用get_and_reset()生成BatchUpdate并重置内部状态
+
+    属性:
+        _removed: 被移除请求的索引列表（内部存储）
+        _is_removed_sorted: _removed是否已排序
+        added: 新添加请求的信息列表
+        moved: 移动请求的信息列表
+        batch_changed: 是否有batch变化（用于池化模式）
     """
 
     _removed: list[RemovedRequest]
@@ -47,20 +75,26 @@ class BatchUpdateBuilder:
         added: list[AddedRequest] | None = None,
         moved: list[MovedRequest] | None = None,
     ) -> None:
+        """
+        初始化Batch更新构建器。
+
+        参数:
+            removed: 初始的已移除请求列表
+            added: 初始的已添加请求列表
+            moved: 初始的移动请求列表
+        """
         self._removed = removed or []
         self.added = added or []
         self.moved = moved or []
         self._is_removed_sorted = False
 
-        # Used to track changes in the pooling case
-        # where we don't populate the added list.
+        # 用于跟踪池化模式下的变化（此时不填充added列表）
         self.batch_changed = False
 
     def _ensure_removed_sorted(self) -> None:
-        """Sort removed request indices in
-        descending order.
-        Idempotent after first call in a
-        given step, until reset.
+        """确保removed列表按降序排序。
+
+        在给定步骤中第一次调用后变为幂等操作，直到reset()。
         """
         if not self._is_removed_sorted:
             self._removed.sort(reverse=True)
@@ -68,19 +102,27 @@ class BatchUpdateBuilder:
 
     @property
     def removed(self) -> list[RemovedRequest]:
-        """Removed request indices sorted in
-        descending order"""
+        """按降序排列的已移除请求索引列表。
+
+        首次访问时触发排序。
+
+        返回:
+            按降序排列的已移除请求索引列表
+        """
         self._ensure_removed_sorted()
         return self._removed
 
     def removed_append(self, index: int) -> None:
-        """Register the removal of a request from the persistent batch.
+        """注册从持久化batch中移除的请求。
 
-        Must not be called after the first time self.removed,
-        self.pop_removed() or self.peek_removed() are invoked.
+        在self.removed、self.pop_removed()或self.peek_removed()被读取后
+        不得调用此方法。
 
-        Args:
-          index: request index
+        参数:
+            index: 请求索引
+
+        异常:
+            RuntimeError: 如果在removed被读取后调用
         """
         if self._is_removed_sorted:
             raise RuntimeError(
@@ -90,24 +132,41 @@ class BatchUpdateBuilder:
         self.batch_changed = True
 
     def has_removed(self) -> bool:
+        """检查是否有已移除的请求。
+
+        返回:
+            是否有已移除的请求
+        """
         return bool(self._removed)
 
     def peek_removed(self) -> int | None:
-        """Return lowest removed request index"""
+        """查看最低的已移除请求索引（不移除）。
+
+        返回:
+            最低的已移除请求索引，如果没有则返回None
+        """
         if self.has_removed():
             self._ensure_removed_sorted()
             return self._removed[-1]
         return None
 
     def pop_removed(self) -> int | None:
-        """Pop lowest removed request index"""
+        """弹出最低的已移除请求索引。
+
+        返回:
+            最低的已移除请求索引，如果没有则返回None
+        """
         if self.has_removed():
             self._ensure_removed_sorted()
             return self._removed.pop()
         return None
 
     def reset(self) -> bool:
-        """Returns True if there were any changes to the batch."""
+        """重置构建器状态。
+
+        返回:
+            在重置之前是否有任何batch变化
+        """
         self._is_removed_sorted = False
         self._removed.clear()
         self.added.clear()
@@ -117,22 +176,21 @@ class BatchUpdateBuilder:
         return batch_changed
 
     def get_and_reset(self, batch_size: int) -> BatchUpdate | None:
-        """Generate a logitsprocs batch update data structure and reset
-        internal batch update builder state.
+        """生成logits处理器的batch更新数据结构并重置内部状态。
 
-        Args:
-          batch_size: current persistent batch size
+        参数:
+            batch_size: 当前持久化batch大小
 
-        Returns:
-          Frozen logitsprocs batch update instance; `None` if no updates
+        返回:
+            冻结的logits处理器batch更新实例; 如果没有更新则返回None
         """
-        # Reset removal-sorting logic
+        # 重置排序逻辑
         self._is_removed_sorted = False
         self.batch_changed = False
         if not any((self._removed, self.moved, self.added)):
-            # No update; short-circuit
+            # 无更新; 短路返回
             return None
-        # Build batch state update
+        # 构建batch状态更新
         batch_update = BatchUpdate(
             batch_size=batch_size,
             removed=self._removed,
@@ -146,9 +204,26 @@ class BatchUpdateBuilder:
 
 
 class LogitsProcessors:
-    """Encapsulates initialized logitsproc objects."""
+    """封装已初始化的logits处理器对象。
+
+    将logits处理器分为两类:
+    1. argmax_invariant: 不影响贪心采样结果的处理器（如min_p）
+       - 仅在随机采样路径中应用（温度缩放后、Top-K/Top-P前）
+    2. non_argmax_invariant: 可能影响贪心采样结果的处理器（如min_tokens、logit_bias）
+       - 在所有采样路径中应用（温度缩放前）
+
+    属性:
+        argmax_invariant: argmax不变的处理器列表
+        non_argmax_invariant: 非argmax不变的处理器列表
+    """
 
     def __init__(self, logitsprocs: Iterable["LogitsProcessor"] | None = None) -> None:
+        """
+        初始化LogitsProcessors容器。
+
+        参数:
+            logitsprocs: logits处理器的可迭代对象
+        """
         self.argmax_invariant: list[LogitsProcessor] = []
         self.non_argmax_invariant: list[LogitsProcessor] = []
         if logitsprocs:
@@ -161,5 +236,11 @@ class LogitsProcessors:
 
     @property
     def all(self) -> Iterator["LogitsProcessor"]:
-        """Iterator over all logits processors."""
+        """遍历所有logits处理器的迭代器。
+
+        先遍历argmax不变的处理器，再遍历非argmax不变的处理器。
+
+        返回:
+            所有logits处理器的迭代器
+        """
         return chain(self.argmax_invariant, self.non_argmax_invariant)

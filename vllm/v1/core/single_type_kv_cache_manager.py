@@ -1,5 +1,38 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""单类型 KV 缓存管理器模块 (vllm/v1/core/single_type_kv_cache_manager.py)
+
+本模块为每种注意力类型提供专用的 KV 缓存管理器，实现该类型特有的缓存策略。
+
+架构层级：
+    KVCacheManager -> KVCacheCoordinator -> SingleTypeKVCacheManager (本模块)
+    (顶层管理)        (跨类型协调)         (单类型管理) -> BlockPool (物理块池)
+
+模块设计思路：
+    不同注意力类型（全注意力、滑动窗口、Mamba 等）在缓存管理上有显著差异：
+    - 全注意力：所有块都需要保留到请求结束，前缀缓存命中从左到右扫描
+    - 滑动窗口注意力：早期块可以回收，前缀缓存命中从右到左扫描尾部窗口
+    - Mamba：只需要保留最后一个 token 的状态，采用滚动分配+释放策略
+    - 分块局部注意力：按 chunk 边界对齐，窗口外的块标记为 null
+
+    通过继承体系，每种类型实现自己的 find_longest_cache_hit、
+    get_num_skipped_tokens 等方法，而公共逻辑（如 allocate_new_blocks、
+    free）在基类中统一实现。
+
+具体管理器类：
+- FullAttentionManager: 全注意力管理器，所有块保留到请求结束
+- SlidingWindowManager: 滑动窗口注意力管理器，早期块可回收
+- ChunkedLocalAttentionManager: 分块局部注意力管理器
+- MambaManager: Mamba/SSM 管理器，滚动状态块策略
+- CrossAttentionManager: 交叉注意力管理器（编码器-解码器模型）
+
+关键概念：
+- req_to_blocks: 请求 ID -> 块列表的映射，是"哪个请求占用哪些块"的唯一真相来源
+- num_cached_block: 已缓存块计数，用于避免重复哈希和写入前缀缓存
+- null_block: 不持有实际 KV 数据的占位块，用于滑动窗口中被跳过的位置
+- admission cap (准入上限): SWA 等类型每个请求同时占用的最大块数限制
+"""
+
 import itertools
 from abc import ABC, abstractmethod
 from collections import defaultdict

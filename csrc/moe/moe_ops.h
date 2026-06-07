@@ -1,3 +1,27 @@
+// =============================================================================
+// 中文注释：MoE CUDA 算子头文件
+//
+// 本头文件声明了 vLLM MoE 模块中所有 CUDA kernel 的 C++ 函数签名。
+// 这些函数在对应的 .cu 文件中实现，并通过 torch_bindings.cpp 注册为 PyTorch 自定义算子。
+//
+// 主要算子分类：
+// 1. 路由(Routing)算子：topk_softmax, topk_sigmoid, topk_softplus_sqrt
+//    —— 对模型输出的 gating logits 做激活函数并选择 top-k 专家。
+// 2. Token 分组对齐算子：moe_align_block_size, batched_moe_align_block_size,
+//    moe_lora_align_block_size
+//    —— 将 token 按专家分组并对齐到 block 边界，供分块 GEMM kernel 使用。
+// 3. 量化 GEMM 算子：moe_wna16_gemm
+//    —— WNA16 (Weight-Only N-bit with 16-bit activation) 量化 MoE 矩阵乘法。
+// 4. 排列/反排列算子：moe_permute, moe_unpermute, shuffle_rows
+//    —— 将 token 按专家排序以便批量计算，计算完成后还原原始顺序。
+// 5. 分组路由算子：grouped_topk
+//    —— DeepSeek V3 等模型使用的分组 top-k 路由算法。
+// 6. 专用 Router GEMM：dsv3_router_gemm
+//    —— DeepSeek V3 专用的 router 矩阵乘法优化算子。
+// 7. 求和算子：moe_sum
+//    —— 将多个专家的输出按权重加权求和。
+// =============================================================================
+
 #pragma once
 
 #include <torch/all.h>

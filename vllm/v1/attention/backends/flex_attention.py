@@ -2,6 +2,37 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Attention layer with FlexAttention."""
 
+# ===========================================================================
+# FlexAttention 后端整体说明
+# ===========================================================================
+# 本文件实现了 vLLM V1 的 FlexAttention 注意力后端，基于 PyTorch 原生的
+# flex_attention 算子。FlexAttention 是一种可编程的注意力内核，允许用户通过
+# mask_mod（掩码修改函数）和 score_mod（分数修改函数）自定义注意力行为，
+# 支持因果遮罩、滑动窗口、前缀 LM、双向注意力（encoder-only）等多种模式。
+#
+# 核心设计思路：
+# 1. FlexAttention 使用 BlockMask（块级稀疏掩码）来跳过全被遮罩的 KV 块，
+#    避免不必要的计算，从而提高效率。
+# 2. vLLM 使用 PagedAttention 的分页 KV cache，逻辑 block 和物理 block 不同，
+#    因此需要将物理索引转换为逻辑索引，再传给 mask_mod / score_mod 函数。
+# 3. 本后端通过 physical_to_logical_mapping 建立物理到逻辑的反向映射，
+#    并在 mask_mod 中进行索引转换，使得用户自定义的 mask_mod 可以直接
+#    使用逻辑索引（不感知底层物理分页布局）。
+#
+# 主要类：
+# - FlexAttentionBackend:      后端注册类，声明支持的数据类型、注意力类型等
+# - FlexAttentionMetadata:     注意力元数据，包含 block mask、mask_mod、索引映射等
+# - FlexAttentionMetadataBuilder: 元数据构建器，每步调度后构建 FlexAttentionMetadata
+# - FlexAttentionImpl:         注意力实现类，执行实际的 forward 计算
+#
+# 关键函数：
+# - physical_to_logical_mapping(): 构建物理 block 到逻辑 block 的反向映射
+# - unique_static_unsorted():      静态去重，用于构建 BlockMask 的 KV 索引
+# - causal_mask_mod():              因果遮罩（decoder 默认）
+# - bidirectional_mask_mod():       双向遮罩（encoder-only）
+# - get_kernel_options():           根据硬件和配置选择内核参数
+# ===========================================================================
+
 import math
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -41,16 +72,41 @@ from vllm.v1.kv_cache_interface import AttentionSpec, EncoderOnlyAttentionSpec
 
 logger = init_logger(__name__)
 
+# 中文注释：提高 torch.compile 的重编译限制，避免因动态形状变化频繁触发重编译。
+# FlexAttention 的 mask_mod 函数签名在不同批次间可能不同，导致需要更多编译缓存。
 torch._dynamo.config.recompile_limit = 16
+
+# 中文注释：预编译 create_block_mask，使用 fullgraph=True 确保整个函数被编译为一张计算图，
+# mode="reduce-overhead" 通过 CUDA graph 等技术减少 Python 端开销。
 create_block_mask_compiled = torch.compile(
     create_block_mask, fullgraph=True, mode="reduce-overhead"
 )
+
+# 中文注释：预编译 flex_attention 核心算子，fullgraph=True 确保端到端编译优化。
+# 这是 PyTorch 提供的灵活注意力前向内核，支持自定义 mask_mod 和 score_mod。
 flex_attention_compiled = torch.compile(flex_attention, fullgraph=True)
 
 
 def _offsets_to_doc_ids_tensor(
     offsets_cpu: torch.Tensor, device: torch.device
 ) -> torch.Tensor:
+    """将 query_start_loc 偏移量转换为每个 token 对应的文档 ID（请求 ID）。
+
+    例如，如果 query_start_loc = [0, 5, 12]，表示请求 0 有 token 0-4，
+    请求 1 有 token 5-11，则返回 [0,0,0,0,0, 1,1,1,1,1,1,1]。
+
+    这个映射在 FlexAttention 的 mask_mod 中用于确定每个 query token
+    属于哪个请求，从而正确地应用请求级遮罩。
+
+    为什么在 CPU 上构建：
+    repeat_interleave 的输出长度依赖于输入数据（data-dependent），
+    如果在 GPU 上执行会导致 GPU->CPU 同步以获取输出长度，性能很差。
+    因此在 CPU 上构建后异步上传到 GPU。
+    """
+    # 中文注释：在链路中的作用——该函数是 FlexAttention 请求级遮罩的基础。
+    # vLLM 将多个请求打包（packing）到一个大序列中，FlexAttention 内核
+    # 需要知道每个 token 属于哪个请求，才能正确地阻止跨请求的注意力计算。
+    # 该映射存储在 FlexAttentionMetadata.doc_ids 中，被 mask_mod 函数引用。
     # Build on CPU (so `repeat_interleave` doesn't force a GPU->CPU sync to
     # learn the data-dependent output length) and upload non-blocking.
     counts = offsets_cpu[1:] - offsets_cpu[:-1]
@@ -61,6 +117,14 @@ def _offsets_to_doc_ids_tensor(
 
 
 def pad_to_multiple(x: torch.Tensor, multiple: int, dim: int):
+    """将张量在指定维度上填充到 multiple 的整数倍。
+
+    FlexAttention 的 BlockMask 要求 query 和 KV 维度必须能被 block_size 整除，
+    因此需要对输入进行填充。填充使用常数 0（对于索引张量，0 通常对应无效位置）。
+    """
+    # 中文注释：在 _build_block_mask_direct 中被调用，用于将 used_pages 张量
+    # 沿 token 维度填充到 q_block_size 的整数倍，以便后续 reshape 为
+    # (num_query_groups, max_num_kv_indices) 形状进行块级去重。
     difference = (multiple - (x.shape[dim] % multiple)) % multiple
     if difference == 0:
         return x
@@ -78,6 +142,19 @@ def pad_to_multiple(x: torch.Tensor, multiple: int, dim: int):
 
 
 class FlexAttentionBackend(AttentionBackend):
+    """FlexAttention 后端注册类。
+
+    该类声明 FlexAttention 后端的能力和限制，包括支持的数据类型、
+    注意力类型（decoder / encoder-only）、是否支持级联注意力等。
+    同时提供元数据构建器（FlexAttentionMetadataBuilder）和
+    实现类（FlexAttentionImpl）的工厂方法。
+
+    注意：
+    - forward_includes_kv_cache_update = False，表示 FlexAttention 的 forward
+      不自动包含 KV cache 更新，需要单独调用 do_kv_cache_update。
+    - 不支持级联注意力（cascade attention），即不支持公共前缀 KV 共享。
+    - 支持 batch invariance（批次不变性），即相同输入在不同批次大小下产生相同结果。
+    """
     supported_dtypes: ClassVar[list[torch.dtype]] = [
         torch.float16,
         torch.bfloat16,
@@ -89,6 +166,8 @@ class FlexAttentionBackend(AttentionBackend):
         "bfloat16",
     ]
 
+    # 中文注释：False 表示 KV cache 的写入不在 forward 中自动完成，
+    # 而是由 Model Runner 在 forward 之前单独调用 do_kv_cache_update。
     forward_includes_kv_cache_update: bool = False
 
     @staticmethod
@@ -125,12 +204,24 @@ class FlexAttentionBackend(AttentionBackend):
         head_size: int,
         cache_dtype_str: str = "auto",
     ) -> tuple[int, ...]:
+        """返回 FlexAttention 的 KV cache 张量形状。
+
+        形状为 (num_blocks, 2, block_size, num_kv_heads, head_size)，
+        其中维度 1 的大小为 2，分别存储 K 和 V。
+        这与 FlashAttention 后端的 (num_blocks, 2, block_size, num_kv_heads, head_size) 布局一致，
+        但与 FlashMLA 等后端的 (num_layers, num_blocks, 2, ...) 不同。
+        """
         return (num_blocks, 2, block_size, num_kv_heads, head_size)
 
     @staticmethod
     def get_kv_cache_stride_order(
         include_num_layers_dimension: bool = False,
     ) -> tuple[int, ...]:
+        """返回 KV cache 维度的步幅重排序，用于 reshape_and_cache 等操作。
+
+        FlexAttention 的 KV cache 布局是 (num_blocks, 2, block_size, num_kv_heads, head_size)，
+        步幅顺序为 (0, 2, 1, 3, 4)，即 block_size 维度排在 K/V 维度之前。
+        """
         if include_num_layers_dimension:
             return (1, 0, 3, 2, 4, 5)
         return (0, 2, 1, 3, 4)
@@ -153,6 +244,10 @@ class FlexAttentionBackend(AttentionBackend):
 
 
 # @torch.compile(fullgraph=True, mode="reduce-overhead")
+# 中文注释：构建物理 block 到逻辑 block 的反向映射。
+# 在 vLLM 的 PagedAttention 中，block_table 存储的是 逻辑->物理 的映射，
+# 但 FlexAttention 的 mask_mod 需要知道每个物理 KV 位置属于哪个逻辑位置，
+# 因此需要构建反向映射（物理->逻辑），使得内核可以通过物理索引查到逻辑索引。
 def physical_to_logical_mapping(
     block_table: torch.Tensor,
     seq_lens: torch.Tensor,
@@ -237,22 +332,32 @@ def physical_to_logical_mapping(
     max_reqs, max_num_blocks = block_table.shape
     device = block_table.device
 
+    # 中文注释：初始化反向映射表，默认值为 -1（表示该物理 block 未被任何逻辑 block 使用）。
+    # 形状为 [max_reqs, total_blocks]，即每个请求对所有物理 block 都有一个映射条目。
     physical_to_logical = torch.full(
         (max_reqs, total_blocks), -1, dtype=torch.long, device=device
     )
 
     # Only process valid blocks to avoid garbage values
+    # 中文注释：计算每个序列实际需要的 block 数量，并构建有效 block 掩码。
+    # block_table 中超出序列实际长度的位置包含垃圾值，需要通过掩码排除。
     num_blocks_per_seq: torch.Tensor = cdiv(seq_lens, block_size)
     mask = (
         torch.arange(max_num_blocks, device=device)[None, :]
         < num_blocks_per_seq[:, None]
     )
 
+    # 中文注释：将无效位置的 block_table 值置为 0（避免垃圾值影响 scatter），
+    # 同时将无效位置的逻辑索引也置为 0（后续会被掩码过滤掉）。
     valid_block_table = torch.where(mask, block_table, 0)
     valid_logical_indices = torch.where(
         mask, torch.arange(max_num_blocks, device=device)[None, :], 0
     )
 
+    # 中文注释：使用 scatter_reduce_ 的 amax（取最大值）模式构建反向映射。
+    # 当同一个物理 block 被多个逻辑 block 映射时（如滑动窗口场景中的复用），
+    # 取最大的逻辑 block 索引，因为最新的逻辑 block 对应当前物理 block 的内容。
+    # 这避免了多次写入冲突，一次 scatter 即可完成所有映射。
     physical_to_logical.scatter_reduce_(
         -1, valid_block_table.to(torch.int64), valid_logical_indices, reduce="amax"
     )
@@ -327,12 +432,18 @@ def bidirectional_mask_mod(
     return q_idx >= 0
 
 
-# Type alias for the block sparsity hint callable signature.
+# 中文注释：块稀疏性提示的函数类型别名。
+# 该函数接收 (q_block_idx, kv_block_idx, block_size)，返回布尔张量，
+# 指示哪些 (query block, KV block) 对可能包含非遮罩元素。
+# 用于在 FlexAttention 内核调用前剪枝完全被遮罩的 KV 块。
 _block_sparsity_hint_signature = Callable[
     [torch.Tensor, torch.Tensor, int], torch.Tensor
 ]
 
 
+# 中文注释：块稀疏性提示，用于自定义 mask_mod 中稀疏注意力的 KV 块剪枝。
+# 当用户自定义的 mask_mod 只关注特定范围的 KV 时，通过 hint_fn 告诉
+# FlexAttention 内核哪些 KV 块可以跳过，避免不必要的计算。
 class BlockSparsityHint(NamedTuple):
     """This prunes KV blocks from the BlockMask before the flex_attention kernel
     is invoked, so that blocks that are fully masked never get loaded.
@@ -349,11 +460,33 @@ class BlockSparsityHint(NamedTuple):
 
 
 def copy_to_persistent(dst, src):
+    """中文注释：将 src 数据拷贝到预分配的持久化缓冲区 dst 中。
+
+    FlexAttention 使用 torch.compile 进行编译优化，为了避免每次前向传播时
+    分配新的张量导致编译器重新编译（recompilation），预先分配最大尺寸的
+    持久化缓冲区（persistent buffer），然后在每次前向传播时只写入有效数据。
+
+    这样做的好处：
+    1. 避免动态形状导致 torch.compile 频繁触发重编译。
+    2. 减少每次前向传播时的内存分配开销。
+    3. 持久化缓冲区在 CUDA graph 捕获时也不会改变地址。
+
+    注意：dst 的形状始终 >= src 的形状，只拷贝 src 对应的切片。
+    """
     sliced = dst[tuple(slice(0, s) for s in src.shape)]
     sliced.copy_(src)
     return sliced
 
 
+# 中文注释：FlexAttention 的注意力元数据类，封装了每次前向传播所需的全部信息。
+# 包括：
+# 1. 基本信息：token 数量、序列长度、query 起始位置、block table、slot mapping
+# 2. 分页信息：物理->逻辑映射（physical_to_logical）、block 数量、block 大小
+# 3. Flex 专用：BlockMask（块级稀疏掩码）、mask_mod（掩码函数）、score_mod（分数修改函数）
+# 4. 多模态支持：mm_prefix_range（图文前缀 LM 的文档范围）
+#
+# 生命周期：由 FlexAttentionMetadataBuilder.build() 创建，每步调度后更新。
+# 传给 FlexAttentionImpl.forward() 后用于构建 BlockMask 并执行注意力计算。
 @dataclass
 class FlexAttentionMetadata:
     causal: bool
@@ -374,6 +507,11 @@ class FlexAttentionMetadata:
     prefix_kv_lens: torch.Tensor | None
     suffix_kv_lens: torch.Tensor | None
 
+    # 中文注释：分页 KV cache 相关的块信息。
+    # total_cache_tokens: GPU 上所有物理 KV block 的总 token 容量
+    # physical_to_logical: 物理 block -> 逻辑 block 的反向映射，形状 [num_reqs, total_blocks]
+    # decode_offset: 每个请求已计算的 token 数（来自 prefix cache 命中），用于计算逻辑 query 索引
+    # persistent_*: 预分配的持久化缓冲区，避免 torch.compile 重编译
     # Block info
     total_cache_tokens: int
     block_size: int
@@ -389,6 +527,18 @@ class FlexAttentionMetadata:
     # For logging.
     num_input_tokens: int = 0  # Number of tokens including padding.
 
+    # 中文注释：FlexAttention 专用的元数据字段。
+    # num_blocks: 物理 KV 块的总数（total_cache_tokens // block_size）
+    # block_mask: FlexAttention 的块级稀疏掩码，控制哪些 KV 块需要参与计算
+    # score_mod: 用户自定义的注意力分数修改函数（如温度缩放等）
+    # logical_mask_mod: 逻辑索引层面的掩码函数（因果遮罩或双向遮罩）
+    # uses_paged_kv: 是否使用分页 KV cache（decoder 使用，encoder-only 不使用）
+    # doc_ids: 每个 query token 对应的请求 ID，用于请求级遮罩
+    # direct_build: 是否使用高效的直接构建路径（BlockMask.from_kv_blocks）
+    # transformed_score_mod: 经过物理->逻辑索引转换后的 score_mod 包装函数
+    # sliding_window: 滑动窗口大小，None 表示不使用滑动窗口
+    # mm_prefix_range: 多模态前缀 LM 的文档范围，用于图文混合注意力
+    # block_sparsity_hint: 自定义的块稀疏性提示，用于剪枝完全被遮罩的 KV 块
     # Flex Metadata
     num_blocks = 0
     block_mask: BlockMask | None = None
@@ -404,6 +554,8 @@ class FlexAttentionMetadata:
     mm_prefix_range: dict[int, list[tuple[int, int]]] | None = None
     block_sparsity_hint: BlockSparsityHint | None = None
 
+    # 中文注释：缓存的逻辑 block 索引序列，范围 [0, max_num_blocks)。
+    # 用于构建 BlockMask 时的块级索引计算，避免每次重新创建。
     @cached_property
     def logical_block_ids(self):
         return torch.arange(
@@ -425,6 +577,19 @@ class FlexAttentionMetadata:
         Returns:
             tuple of (is_valid, logical_q_idx, logical_kv_idx)
         """
+        # 中文注释：核心的物理->逻辑索引转换函数。
+        #
+        # 背景：vLLM 的 PagedAttention 使用分页 KV cache，KV 按物理 block 存储，
+        # 但 FlexAttention 的 mask_mod/score_mod 需要使用逻辑索引来判断遮罩关系。
+        # 因此需要将物理索引（内核实际访问的位置）转换为逻辑索引（序列中的位置）。
+        #
+        # 转换步骤：
+        # 1. 通过 request_lookup (doc_ids) 确定每个 query token 属于哪个请求
+        # 2. 将物理 KV 索引分解为 (physical_kv_block, physical_kv_offset)
+        # 3. 通过 physical_to_logical 映射表查到逻辑 block 索引
+        # 4. 逻辑 KV 索引 = logical_block_idx * block_size + physical_kv_offset
+        # 5. 通过 validity 检查排除无效位置（未分配的 block、超出序列长度的位置）
+
         # Map query indices to corresponding request indices
         q_req = request_lookup[q_idx]
 
@@ -435,12 +600,16 @@ class FlexAttentionMetadata:
         logical_kv_idx = logical_block_idx * self.block_size + physical_kv_offset
 
         # Determine valid kv indices
+        # 中文注释：有效性检查——block 必须已分配（>= 0），且逻辑索引必须在序列范围内。
         live_block = logical_block_idx >= 0
         within_upper_bound = logical_kv_idx < self.seq_lens[q_req]
         within_lower_bound = logical_kv_idx >= 0
         is_valid = live_block & within_upper_bound & within_lower_bound
 
         # Convert physical query indices to logical indices
+        # 中文注释：物理 query 索引 -> 逻辑 query 索引。
+        # local_q_idx 是请求内的相对位置，加上 decode_offset（prefix cache 命中的 token 数）
+        # 得到绝对逻辑位置。这对 prefill 中跳过已计算 token 很关键。
         local_q_idx = q_idx - self.query_start_loc[q_req]
         logical_q_idx = local_q_idx + self.decode_offset[q_req]
 
@@ -567,6 +736,19 @@ class FlexAttentionMetadata:
         return final_mask_mod
 
     def get_mask_mod(self):
+        """中文注释：组合多层掩码，生成最终的 mask_mod 函数。
+
+        构建过程分两个阶段：
+        1. 基础掩码：根据是否使用分页 KV，选择因果遮罩（decoder）或双向遮罩（encoder-only）。
+           分页 KV 路径还会添加物理->逻辑索引转换。
+        2. 组合掩码：在基础掩码之上叠加额外的掩码约束：
+           - 滑动窗口（sliding_window）：通过 and_masks 与基础掩码取交集
+           - 前缀 LM（mm_prefix_range）：通过 or_masks 与基础掩码取并集，
+             使得图文混合输入中的图像 token 可以看到彼此（全注意力区域）
+
+        返回的 mask_mod 接受 (b, h, q_idx, physical_kv_idx) 参数，
+        内部自动完成物理->逻辑索引转换，使上层用户只需关注逻辑索引。
+        """
         # Stage-1: initialize the base mask_mod
         # (causal mask for decoder or bidirectional mask for encoder)
         if self.uses_paged_kv:
@@ -645,6 +827,19 @@ class FlexAttentionMetadata:
         and their position.
 
         """
+        # 中文注释：高效的 BlockMask 直接构建路径。
+        #
+        # 背景：FlexAttention 使用 BlockMask 来表示块级稀疏性——哪些 (Q块, KV块) 对
+        # 可能包含非遮罩元素。通用路径（create_block_mask）需要调用 mask_mod 逐块检查，
+        # 而直接路径通过分析 block_table 和 sliding_window 直接构造，效率更高。
+        #
+        # 算法步骤：
+        # 1. page_to_block_ratio: 检查 KV cache block 与 FlexAttention block 的大小关系
+        # 2. used_pages: 从 block_table 中获取每个 token 对应的所有 KV 块
+        # 3. sliding_window 过滤：排除滑动窗口之外的 KV 块
+        # 4. custom_hint 过滤：应用用户自定义的稀疏性提示
+        # 5. 按 q_block_size 分组，对每组的 KV 块去重（unique_static_unsorted）
+        # 6. 使用 BlockMask.from_kv_blocks 构建最终的 BlockMask
         page_to_block_ratio = self.kv_block_size // self.block_size
         if page_to_block_ratio != 1:
             raise ValueError(
@@ -721,6 +916,18 @@ class FlexAttentionMetadata:
         return BlockMask.from_kv_blocks(**block_mask_kwargs)
 
     def build_block_mask(self) -> BlockMask:
+        """中文注释：通用的 BlockMask 构建路径（非 direct_build 时使用）。
+
+        与 _build_block_mask_direct 不同，该方法使用 PyTorch 提供的
+        create_block_mask 函数，通过调用 mask_mod 逐块检查来确定稀疏性。
+
+        适用场景：
+        - encoder-only 模型（双向遮罩，无法直接从 block_table 推导）
+        - KV block 与 FlexAttention block 大小不一致时
+        - 自定义复杂 mask_mod 时
+
+        代价：比 direct_build 路径慢，因为需要实际调用 mask_mod 函数。
+        """
         mask_mod = self.get_mask_mod()
         kv_len = (
             self.total_cache_tokens if self.uses_paged_kv else self.num_actual_tokens
@@ -736,6 +943,17 @@ class FlexAttentionMetadata:
         )
 
     def __post_init__(self):
+        """中文注释：数据类初始化后自动调用的后处理方法。
+
+        主要完成以下工作：
+        1. 断言检查：级联注意力（cascade attention）尚未实现，需要 common_prefix_len == 0
+        2. 构建 doc_ids：将 query_start_loc 转换为每个 token 的请求 ID 映射
+        3. 计算 num_blocks：物理 KV 块的总数
+        4. 预构建 mask_mod 和 transformed_score_mod 函数
+
+        注意：BlockMask 的构建延迟到首次调用时执行（由 FlexAttentionImpl 触发），
+        因为构建依赖于 CUDA graph 安全检查。
+        """
         assert self.use_cascade is False, "Not implemented yet."
         assert self.common_prefix_len == 0, "Not implemented yet."
         assert self.cu_prefix_query_lens is None, "Not implemented yet."
@@ -752,6 +970,18 @@ class FlexAttentionMetadata:
         self.transformed_score_mod = self.get_transformed_score_mod()
 
 
+# 中文注释：FlexAttention 元数据构建器，负责每步调度后构建 FlexAttentionMetadata。
+#
+# 工作流程（build 方法）：
+# 1. 从 CommonAttentionMetadata 获取基础信息（请求数、token 数、block table 等）
+# 2. 调用 physical_to_logical_mapping() 构建物理->逻辑反向映射
+# 3. 计算每个请求的 decode_offset（prefix cache 命中的 token 数）
+# 4. 确定掩码类型（因果/双向）并组装 FlexAttentionMetadata
+# 5. 预构建 BlockMask，确保 CUDA graph 捕获前已准备就绪
+#
+# 关键设计：
+# - 使用持久化缓冲区（persistent buffers）避免 torch.compile 重编译
+# - _cudagraph_support = ALWAYS，表示该后端始终支持 CUDA graph
 class FlexAttentionMetadataBuilder(AttentionMetadataBuilder[FlexAttentionMetadata]):
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.ALWAYS
 
@@ -768,6 +998,9 @@ class FlexAttentionMetadataBuilder(AttentionMetadataBuilder[FlexAttentionMetadat
         self.parallel_config = vllm_config.parallel_config
         self.cache_config = vllm_config.cache_config
 
+        # 中文注释：初始化元数据构建器，预分配持久化缓冲区。
+        # 持久化缓冲区的作用：避免每步调度时分配新张量，防止 torch.compile 重编译。
+        # 缓冲区大小按最大可能值预分配，实际使用时只写入有效部分（通过 copy_to_persistent）。
         self.num_heads_q = self.model_config.get_num_attention_heads(
             self.parallel_config
         )
@@ -775,6 +1008,7 @@ class FlexAttentionMetadataBuilder(AttentionMetadataBuilder[FlexAttentionMetadat
         self.headdim = self.model_config.get_head_size()
         self.block_size = kv_cache_spec.block_size
         self.kv_cache_spec = kv_cache_spec
+        # 中文注释：PyTorch 2.9+ 支持小块（16）的 BlockMask，启用 direct_build 路径。
         supports_small_blocks = is_torch_equal_or_newer("2.9.0.dev0")
         self.direct_build: bool = supports_small_blocks
 
@@ -784,6 +1018,8 @@ class FlexAttentionMetadataBuilder(AttentionMetadataBuilder[FlexAttentionMetadat
             self.block_size,
         )
 
+        # 中文注释：如果 KV block 大小与 cache block 大小不一致，回退到通用构建路径。
+        # direct_build 路径要求两者相等，否则无法直接从 block_table 推导 BlockMask。
         if self.direct_build and self.kv_block_size != self.block_size:
             self.direct_build = False
 
@@ -843,6 +1079,13 @@ class FlexAttentionMetadataBuilder(AttentionMetadataBuilder[FlexAttentionMetadat
     def build_for_cudagraph_capture(
         self, common_attn_metadata: CommonAttentionMetadata
     ) -> FlexAttentionMetadata:
+        """中文注释：为 CUDA graph 捕获构建元数据。
+
+        CUDA graph 捕获时要求所有张量形状固定，因此使用实际的 max_seq_len
+        （而非 max_model_len），避免 torch.compile 因形状变化触发重编译。
+
+        该方法在 CUDA graph 初始化阶段调用，构建的元数据用于后续 replay 时的模板。
+        """
         # Use actual max_seq_len (not max_model_len) to avoid torch.compile
         # recompilation during CUDA graph capture.
         assert common_attn_metadata.seq_lens_cpu_upper_bound is not None
@@ -859,6 +1102,25 @@ class FlexAttentionMetadataBuilder(AttentionMetadataBuilder[FlexAttentionMetadat
         common_attn_metadata: CommonAttentionMetadata,
         fast_build: bool = False,
     ) -> FlexAttentionMetadata:
+        """中文注释：构建 FlexAttentionMetadata 的核心方法。
+
+        该方法在每步调度后被调用，将 CommonAttentionMetadata（通用注意力元数据）
+        转换为 FlexAttention 专用的元数据。
+
+        主要步骤：
+        1. 提取基本参数：请求数、token 数、序列长度、block table、slot mapping
+        2. 构建物理->逻辑反向映射（physical_to_logical_mapping）
+           这是 FlexAttention 特有的需求，因为 mask_mod 需要逻辑索引
+        3. 计算 decode_offset（每个请求已计算的 token 数，来自 prefix cache）
+        4. 确定逻辑掩码类型：非因果用双向遮罩，否则用因果遮罩
+        5. 组装 FlexAttentionMetadata 对象
+        6. 预构建 BlockMask（在 CUDA graph 捕获前完成，避免非图安全操作）
+
+        Args:
+            common_prefix_len: 公共前缀长度（级联注意力用，当前未实现）
+            common_attn_metadata: 通用注意力元数据，包含所有请求的信息
+            fast_build: 是否快速构建（预留参数，当前未使用）
+        """
         num_reqs = common_attn_metadata.num_reqs
         num_actual_tokens = common_attn_metadata.num_actual_tokens
         max_query_len = common_attn_metadata.max_query_len
@@ -974,6 +1236,20 @@ class FlexAttentionMetadataBuilder(AttentionMetadataBuilder[FlexAttentionMetadat
         return False
 
 
+# 中文注释：FlexAttention 的注意力实现类，执行实际的前向计算。
+#
+# 与 Model Runner 的交互：
+# 1. Model Runner 每步调度后调用 MetadataBuilder.build() 构建元数据
+# 2. 在 forward 中，FlexAttentionImpl 接收 query/key/value/kv_cache 和元数据
+# 3. 如果 KV cache 更新不在 forward 中（forward_includes_kv_cache_update=False），
+#    Model Runner 会先调用 do_kv_cache_update 写入 KV，再调用 forward 计算注意力
+# 4. forward 中调用 PyTorch 的 flex_attention 算子执行计算
+#
+# 关键特性：
+# - 支持 decoder（因果遮罩 + 分页 KV）和 encoder-only（双向遮罩 + 无 KV cache）
+# - 支持 GQA（Grouped Query Attention），通过 num_queries_per_kv 控制
+# - 支持 CUDA graph 捕获（与 MetadataBuilder 的 ALWAYS 支持配合）
+# - 通过 block_m/block_n 参数控制内核块大小，支持批次不变性（VLLM_BATCH_INVARIANT）
 class FlexAttentionImpl(AttentionImpl):
     sliding_window: int | None
     alibi_slopes: torch.Tensor | None
@@ -998,6 +1274,17 @@ class FlexAttentionImpl(AttentionImpl):
         block_n: int | None = None,
         **kwargs,
     ) -> None:
+        """中文注释：初始化 FlexAttention 实现类。
+
+        该类在模型初始化时由 AttentionBackend.get_impl_cls() 创建，每个注意力层
+        持有一个实例。配置参数来自模型配置和 VllmConfig。
+
+        关键参数：
+        - num_heads / num_kv_heads: 用于 GQA 支持，num_queries_per_kv = num_heads / num_kv_heads
+        - sliding_window: 滑动窗口大小，非 None 时启用滑动窗口注意力
+        - block_m / block_n: 内核块大小，用于控制批次不变性（VLLM_BATCH_INVARIANT）
+        - attn_type: DECODER（使用分页 KV cache）或 ENCODER_ONLY（无 KV cache）
+        """
         self.num_heads = num_heads
         self.head_size = head_size
         self.scale = float(scale)
@@ -1026,6 +1313,9 @@ class FlexAttentionImpl(AttentionImpl):
             )
 
         assert self.num_heads % self.num_kv_heads == 0
+        # 中文注释：GQA (Grouped Query Attention) 的分组比。
+        # 例如 num_heads=32, num_kv_heads=8 时，num_queries_per_kv=4，
+        # 表示每 4 个 query head 共享一组 KV head。
         self.num_queries_per_kv = self.num_heads // self.num_kv_heads
 
         if kv_sharing_target_layer_name is not None:
@@ -1036,6 +1326,8 @@ class FlexAttentionImpl(AttentionImpl):
                 "FlexAttention does not support quantized kv-cache. Yet"
             )
 
+        # 中文注释：批次不变性模式下，固定内核块大小为 16，
+        # 确保不同批次大小下产生相同的计算结果（数值一致性）。
         self.block_m = 16 if envs.VLLM_BATCH_INVARIANT else None
         self.block_n = 16 if envs.VLLM_BATCH_INVARIANT else None
 
@@ -1060,6 +1352,24 @@ class FlexAttentionImpl(AttentionImpl):
         kv_cache: torch.Tensor,
         slot_mapping: torch.Tensor,
     ) -> None:
+        """中文注释：将当前 step 的 key/value 写入分页 KV cache。
+
+        由于 FlexAttentionBackend.forward_includes_kv_cache_update = False，
+        该方法由 Model Runner 在 forward 之前单独调用，与 forward 解耦。
+
+        执行流程：
+        1. encoder-only 模式不使用 KV cache，直接返回
+        2. 将 kv_cache 按 K/V 维度拆分（unbind(1)）
+        3. 调用 C++ 扩展 reshape_and_cache_flash，将 key/value 按 slot_mapping
+           写入分页 KV cache 的对应物理位置
+
+        Args:
+            layer: 注意力层模块（包含 _k_scale, _v_scale 用于量化缩放）
+            key: 当前 step 的 key 张量，形状 [num_tokens, num_kv_heads, head_size]
+            value: 当前 step 的 value 张量，形状 [num_tokens, num_kv_heads, head_size]
+            kv_cache: 分页 KV cache 张量，形状 [num_blocks, 2, block_size, num_kv_heads, head_size]
+            slot_mapping: 逻辑 token 到物理 slot 的映射，指示每个 token 写入 cache 的位置
+        """
         if self.attn_type == AttentionType.ENCODER_ONLY:
             return
 
@@ -1114,6 +1424,12 @@ class FlexAttentionImpl(AttentionImpl):
 
         num_actual_tokens = attn_metadata.num_actual_tokens
 
+        # 中文注释：检查是否需要重建 BlockMask。
+        # BlockMask 是 FlexAttention 的核心数据结构，当以下条件变化时需要重建：
+        # 1. 滑动窗口大小变化（如首次使用滑动窗口或窗口大小改变）
+        # 2. 多模态前缀范围变化（如新图像 token 到达）
+        # 3. 层级的逻辑掩码函数变化（如某些层使用不同遮罩策略）
+        # 4. 层级的块稀疏性提示变化（如自定义稀疏模式）
         needs_rebuild_block_mask = False
         if attn_metadata.sliding_window != self.sliding_window:
             attn_metadata.sliding_window = self.sliding_window
@@ -1144,13 +1460,20 @@ class FlexAttentionImpl(AttentionImpl):
             attn_metadata.block_sparsity_hint = layer_hint
             needs_rebuild_block_mask = True
 
+        # 中文注释：如果需要重建或 BlockMask 尚未创建，则重新构建。
+        # direct_build 路径使用 BlockMask.from_kv_blocks（高效），
+        # 非 direct 路径使用 create_block_mask（通用但较慢）。
         if needs_rebuild_block_mask or attn_metadata.block_mask is None:
             if attn_metadata.direct_build:
                 attn_metadata.block_mask = attn_metadata._build_block_mask_direct()
             else:
                 attn_metadata.block_mask = attn_metadata.build_block_mask()
 
+        # 中文注释：根据注意力类型准备 QKV 张量，统一 reshape 为 4D 格式。
+        # FlexAttention 要求的输入格式：[batch=1, num_heads, seq_len, head_size]
+        # （batch=1 是因为 vLLM 将所有请求打包成一个大序列）
         if self.attn_type == AttentionType.ENCODER_ONLY:
+            # 中文注释：encoder-only 模式：Q/K/V 都来自当前输入，不使用 KV cache。
             query, key_tensor, value_tensor = map(
                 lambda x: self.view_as_4d(x).permute(0, 2, 1, 3),
                 (query, key, value),
@@ -1167,6 +1490,9 @@ class FlexAttentionImpl(AttentionImpl):
                 value_tensor = value_tensor[:, :, :num_actual_tokens, :]
 
         else:
+            # 中文注释：decoder 模式：Q 来自当前输入，K/V 来自分页 KV cache。
+            # 将 kv_cache 按 K/V 拆分后展平为 (total_tokens, num_kv_heads, head_size)，
+            # 使得 FlexAttention 内核可以直接按物理索引访问 KV cache 中的任意位置。
             assert self.attn_type == AttentionType.DECODER
             key_cache, value_cache = kv_cache.unbind(1)
 
@@ -1186,6 +1512,8 @@ class FlexAttentionImpl(AttentionImpl):
         assert attn_metadata.block_mask is not None
         block_m, block_n = attn_metadata.block_mask.BLOCK_SIZE
 
+        # 中文注释：获取内核选项，包括 BLOCK_M/BLOCK_N（内核块大小）、
+        # FORCE_USE_FLEX_ATTENTION 等参数。根据硬件特性（共享内存大小等）自动调整。
         kernel_options = get_kernel_options(
             query, block_m, block_n, attn_metadata.direct_build
         )
@@ -1196,6 +1524,15 @@ class FlexAttentionImpl(AttentionImpl):
             kernel_options["BLOCK_N"] = self.block_n
         if envs.VLLM_BATCH_INVARIANT:
             kernel_options["IS_DIVISIBLE"] = False
+
+        # 中文注释：调用 PyTorch 的 flex_attention 编译内核执行注意力计算。
+        # flex_attention 是一个可编程的注意力算子：
+        # - query/key_tensor/value_tensor: 4D QKV 张量
+        # - transformed_score_mod: 经过物理->逻辑转换的分数修改函数（可选）
+        # - block_mask: 块级稀疏掩码，跳过完全被遮罩的 KV 块
+        # - scale: 注意力缩放因子（通常为 1/sqrt(head_size)）
+        # - enable_gqa: 是否启用 Grouped Query Attention
+        # - kernel_options: 内核配置参数
         out = flex_attention_compiled(
             query,
             key_tensor,
@@ -1208,6 +1545,8 @@ class FlexAttentionImpl(AttentionImpl):
         )
 
         # Flex doesn't have an out variant today, rely on epilogue fusion
+        # 中文注释：将输出从 [1, num_heads, seq_len, head_size] 转换回
+        # [num_tokens, num_heads, head_size] 格式，并拷贝到预分配的输出缓冲区。
         out = out.permute(0, 2, 1, 3).squeeze(0)
         output[:num_actual_tokens, :, :].copy_(out)
         return output
@@ -1216,6 +1555,27 @@ class FlexAttentionImpl(AttentionImpl):
 def get_kernel_options(
     query, block_m, block_n, use_direct_build: bool
 ) -> dict[str, int | bool]:
+    """中文注释：获取 FlexAttention 内核的配置参数。
+
+    该函数根据硬件特性和输入配置，选择合适的内核块大小（BLOCK_M, BLOCK_N）。
+
+    选择策略：
+    1. direct_build 路径：直接使用 BlockMask 指定的块大小，无需调整
+    2. 非 direct_build 路径：
+       a. 首选块大小：float32 用 32，其他用 64
+       b. 确保块大小能被逻辑 block_size 整除（通过 ensure_divisible）
+       c. 根据 GPU 共享内存大小调整：共享内存 < 144KB 时减半
+       d. 最小块大小为 16
+
+    Args:
+        query: 查询张量，用于推断数据类型和设备信息
+        block_m: 逻辑 query 块大小（来自 BlockMask）
+        block_n: 逻辑 KV 块大小（来自 BlockMask）
+        use_direct_build: 是否使用直接构建路径
+
+    Returns:
+        内核选项字典，包含 BLOCK_M、BLOCK_N 等参数
+    """
     kernel_options: dict[str, int | bool] = {
         "FORCE_USE_FLEX_ATTENTION": True,
     }

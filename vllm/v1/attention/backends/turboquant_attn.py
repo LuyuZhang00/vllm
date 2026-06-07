@@ -15,6 +15,31 @@ Per-head per-position slot layout:
   [key_packed (kps bytes) | value_fp16 (D*2 bytes)]
   For turboquant_k3v4_nc head_dim=256: [100 bytes key | 512 bytes value] = 612
 """
+# TurboQuant 注意力后端模块。
+#
+# TurboQuant 是一种 KV 缓存压缩技术，通过以下方式减少显存占用：
+# 1. Key 压缩：使用 Hadamard 旋转 + Lloyd-Max 标量量化（MSE 量化）
+#    - 先对 Key 向量应用 Hadamard 变换（正交变换，保持向量范数）
+#    - 然后使用预计算的质心（centroids）进行标量量化
+#    - 每个 key 值被映射到最近的质心索引（压缩存储）
+# 2. Value 压缩：直接量化到低精度（如 4-bit）
+#
+# Prefill 流程：
+# 1. 对未压缩的原始 Q/K/V 执行标准缩放点积注意力
+# 2. 将 K/V 量化并存储到组合缓存槽中
+#
+# Decode 流程：
+# 1. 从压缩缓存中读取量化数据
+# 2. 在线反量化 K/V，计算注意力分数
+# 3. 执行 softmax + 加权求和
+#
+# 缓存布局（无前导维度 2）：
+#   (num_blocks, block_size, num_kv_heads, slot_size)
+#   其中 slot_size = key_packed_size + value_fp16_size
+#
+# 每个头每个位置的槽布局：
+#   [key_packed (kps bytes) | value_fp16 (D*2 bytes)]
+#   例如 turboquant_k3v4_nc head_dim=256: [100 bytes key | 512 bytes value] = 612
 
 import functools
 import math
@@ -66,6 +91,11 @@ if _HAS_FLASH_ATTN:
 # do_kv_cache_update already stored all tokens to TQ cache, so the decode
 # kernel can read them efficiently. This avoids O(cached_len) dequant work
 # per continuation, eliminating the O(N²/chunk_size) collapse at long context.
+# 延续 prefill 的阈值：对于较小的延续块（q_len ≤ 阈值），
+# 直接使用 TQ decode 内核，而不是先完整反量化再用 flash_attn。
+# do_kv_cache_update 已经将所有 token 存储到 TQ 缓存中，
+# decode 内核可以直接高效读取。这避免了每次延续都需要 O(cached_len)
+# 的反量化工作，消除了长上下文下 O(N^2/chunk_size) 的性能崩溃。
 _CONTINUATION_DECODE_THRESHOLD = 128
 
 
@@ -75,12 +105,28 @@ def _build_hadamard(d: int, device_str: str) -> torch.Tensor:
     Precomputed D×D matrix enables matmul-based WHT — single cuBLAS GEMM
     instead of log2(D) butterfly kernel launches. 64KB for D=128.
     """
+    # 正交归一化的 Hadamard 矩阵（Sylvester 构造法），按 (d, device) 缓存。
+    #
+    # 预计算的 D*D 矩阵支持基于矩阵乘法的 Walsh-Hadamard 变换 (WHT)，
+    # 只需一次 cuBLAS GEMM 调用，而不是 log2(D) 次蝴蝶内核启动。
+    # 对于 D=128 仅需 64KB 存储。
+    #
+    # Hadamard 矩阵的性质：
+    # 1. 正交性：H * H^T = I（保持向量范数不变）
+    # 2. 对称性：H = H^T（正变换和逆变换相同）
+    # 3. 元素仅含 +1/-1（乘法变为加减法）
     # Normalize device string so "cuda" and "cuda:0" hit the same cache entry.
     return _build_hadamard_cached(d, str(torch.device(device_str)))
 
 
 @functools.cache
 def _build_hadamard_cached(d: int, device_str: str) -> torch.Tensor:
+    """使用 Sylvester 构造法构建 Hadamard 矩阵并缓存。
+
+    递归构造过程：从 1x1 矩阵 [[1]] 开始，每次将维度翻倍：
+    H_{2n} = [[H_n, H_n], [H_n, -H_n]]
+    最后除以 sqrt(d) 进行归一化。
+    """
     H = torch.tensor([[1.0]])
     while H.shape[0] < d:
         H = torch.cat([torch.cat([H, H], 1), torch.cat([H, -H], 1)], 0)
@@ -88,15 +134,23 @@ def _build_hadamard_cached(d: int, device_str: str) -> torch.Tensor:
 
 
 class TurboQuantAttentionBackend(AttentionBackend):
-    """Attention backend using TurboQuant KV-cache compression."""
+    """Attention backend using TurboQuant KV-cache compression.
+    TurboQuant 注意力后端。使用 TurboQuant KV 缓存压缩技术。
+    """
 
     accept_output_buffer: bool = True
     forward_includes_kv_cache_update: bool = False
 
+    # 支持的数据类型
     supported_dtypes: ClassVar[list[torch.dtype]] = [
         torch.float16,
         torch.bfloat16,
     ]
+    # 支持的 KV 缓存数据类型（TurboQuant 的不同压缩配置）：
+    # - turboquant_k8v4: Key 8-bit 量化 + Value 4-bit 量化
+    # - turboquant_4bit_nc: Key 4-bit 非中心化量化 + Value 4-bit
+    # - turboquant_k3v4_nc: Key 3-bit 非中心化量化 + Value 4-bit
+    # - turboquant_3bit_nc: Key 3-bit 非中心化量化 + Value 3-bit
     supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
         "turboquant_k8v4",
         "turboquant_4bit_nc",
@@ -175,36 +229,47 @@ class TurboQuantAttentionBackend(AttentionBackend):
 
 @dataclass
 class TurboQuantMetadata(AttentionMetadata):
-    """Metadata for TurboQuant attention."""
+    """Metadata for TurboQuant attention.
+    TurboQuant 注意力的元数据，包含注意力计算所需的所有信息。
+    """
 
-    seq_lens: torch.Tensor  # (num_reqs,) — total context length per request
-    slot_mapping: torch.Tensor  # (num_tokens,) — cache slot for each token
-    block_table: torch.Tensor  # (num_reqs, max_num_blocks)
-    query_start_loc: torch.Tensor  # (num_reqs + 1,) — cu_seqlens for queries
-    num_actual_tokens: int = 0  # actual tokens (excluding padding)
-    max_query_len: int = 0  # longest query in batch
-    max_seq_len: int = 0  # longest context in batch
-    is_prefill: bool = False
-    num_decodes: int = 0  # number of decode requests (first in batch)
-    num_decode_tokens: int = 0  # tokens from decode requests
-    # CPU-resident copies used by the prefill path for per-request iteration
-    # without per-step D2H syncs.
+    seq_lens: torch.Tensor  # (num_reqs,) — 每个请求的总上下文长度
+    slot_mapping: torch.Tensor  # (num_tokens,) — 每个 token 对应的缓存槽映射
+    block_table: torch.Tensor  # (num_reqs, max_num_blocks) — 块表，用于从缓存中查找 KV
+    query_start_loc: torch.Tensor  # (num_reqs + 1,) — 查询的累积序列长度（cu_seqlens）
+    num_actual_tokens: int = 0  # 实际 token 数（不含填充）
+    max_query_len: int = 0  # 批次中最长的查询长度
+    max_seq_len: int = 0  # 批次中最长的上下文长度
+    is_prefill: bool = False  # 是否为 prefill 阶段
+    num_decodes: int = 0  # decode 请求数量（在批次前端）
+    num_decode_tokens: int = 0  # decode 请求的 token 总数
+    # CPU 端副本，用于 prefill 路径中的逐请求迭代，
+    # 避免每步都进行 GPU->CPU 同步。
     query_start_loc_cpu: torch.Tensor | None = None
     seq_lens_cpu: torch.Tensor | None = None
 
 
 class TurboQuantMetadataBuilder(AttentionMetadataBuilder[TurboQuantMetadata]):
-    """Builds TurboQuantMetadata from scheduler output."""
+    """Builds TurboQuantMetadata from scheduler output.
+    从调度器输出构建 TurboQuantMetadata 元数据。
+    """
 
+    # CUDA Graph 支持模式：UNIFORM_BATCH 表示所有请求必须是同一类型
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
 
     def __init__(self, kv_cache_spec, layer_names, vllm_config, device):
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
+        # reorder_batch_threshold=1 表示 decode 请求（query_len=1）排在批次前面
         self._init_reorder_batch_threshold(1, supports_spec_as_decode=False)
 
     def build_for_cudagraph_capture(
         self, common_attn_metadata: CommonAttentionMetadata
     ) -> TurboQuantMetadata:
+        """为 CUDA Graph 捕获构建元数据。
+
+        将 seq_lens 设为 1 以加速 CUDA Graph 捕获
+        （实际 seq_lens 在回放时填充）。
+        """
         attn_metadata = self.build(0, common_attn_metadata)
         # Set seq_lens to 1 so CUDA graph capture is fast
         # (real seq_lens are filled at replay time).
@@ -212,12 +277,21 @@ class TurboQuantMetadataBuilder(AttentionMetadataBuilder[TurboQuantMetadata]):
         return attn_metadata
 
     def build(self, common_prefix_len, common_attn_metadata, fast_build=False):
-        """Build TurboQuantMetadata from common attention metadata."""
+        """Build TurboQuantMetadata from common attention metadata.
+        从通用注意力元数据构建 TurboQuantMetadata。
+
+        处理流程：
+        1. 使用 split_decodes_and_prefills 将批次分为 decode 和 prefill
+        2. decode 请求排在批次前端（由 reorder_batch 保证）
+        3. 构建包含所有必要信息的 TurboQuantMetadata
+        """
         cam = common_attn_metadata
 
         # With reorder_batch_threshold=1, the model runner guarantees
         # decodes come first in the batch. split_decodes_and_prefills
         # finds the boundary (operates on CPU tensors — no GPU sync).
+        # reorder_batch_threshold=1 时，模型运行器保证 decode 请求在批次前端。
+        # split_decodes_and_prefills 找到 decode 和 prefill 的分界点（CPU 操作，无 GPU 同步）。
         assert self.reorder_batch_threshold is not None
         num_decodes, num_prefills, num_decode_tokens, _ = split_decodes_and_prefills(
             cam, decode_threshold=self.reorder_batch_threshold
@@ -245,6 +319,14 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
     Vectorized PyTorch: batch quantize/store, vectorized bit-unpack
     decode with einsum scores and value gather.
     """
+    # TurboQuant 注意力实现类。
+    #
+    # 整体架构：
+    # 1. do_kv_cache_update: 将 K/V 量化后存入组合 TQ 缓存
+    # 2. forward: 根据批次类型分发到不同的注意力计算路径
+    #    - 纯 decode: 使用 Triton TQ decode 内核
+    #    - 纯 prefill: 使用 FlashAttention 或 SDPA
+    #    - 混合批次: 先 decode 后 prefill
 
     supports_quant_query_input: bool = False
 
@@ -262,6 +344,20 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         kv_sharing_target_layer_name: str | None = None,
         **kwargs,
     ):
+        """初始化 TurboQuantAttentionImpl。
+
+        Args:
+            num_heads: Q 的注意力头数
+            head_size: 头维度
+            scale: 注意力缩放因子
+            num_kv_heads: KV 的头数（GQA 场景下可能少于 num_heads）
+            alibi_slopes: ALiBi 注意力的斜率
+            sliding_window: 滑动窗口大小
+            kv_cache_dtype: KV 缓存数据类型（如 "turboquant_k3v4_nc"）
+            logits_soft_cap: logits 软上限
+            attn_type: 注意力类型（DECODER/ENCODER 等）
+            kv_sharing_target_layer_name: KV 缓存共享的目标层名
+        """
         self.num_heads = num_heads
         self.head_size = head_size
         self.scale = scale
@@ -273,23 +369,31 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             TurboQuantConfig,
         )
 
+        # 从缓存数据类型解析 TurboQuant 配置
         self.tq_config = TurboQuantConfig.from_cache_dtype(kv_cache_dtype, head_size)
 
         # Pre-compute kernel constants from config (avoid repeated arithmetic)
+        # 从配置中预计算内核常量（避免重复运算）
         cfg = self.tq_config
+        # MSE 量化 Key 的字节数
         self._mse_bytes = (
             math.ceil(head_size * cfg.key_mse_bits / 8)
             if not cfg.key_fp8
             else head_size
         )
+        # Value 量化数据的字节数
         self._val_data_bytes = math.ceil(head_size * cfg.effective_value_quant_bits / 8)
+        # 量化质心数量（FP8 模式下为 1，即不使用 MSE 量化）
         self._n_centroids = cfg.n_centroids if not cfg.key_fp8 else 1
 
         # Detect flash-attn version (FA2/3/4) for prefill paths.
+        # 检测 FlashAttention 版本（FA2/3/4），用于 prefill 路径
         self.fa_version = get_flash_attn_version(head_size=head_size)
 
         # Fixed NUM_KV_SPLITS (grid dims must be constant for cudagraph,
         # and benchmarks show no regression vs dynamic in eager mode).
+        # 固定 KV 分区数（CUDA Graph 要求 grid 维度为常量，
+        # 基准测试显示与动态模式相比无性能退化）。
         vllm_config = get_current_vllm_config()
         self.max_num_kv_splits = (
             vllm_config.attention_config.tq_max_kv_splits_for_cuda_graph
@@ -305,6 +409,10 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         max_seqlen_q: int,
         max_seqlen_k: int,
     ) -> torch.Tensor:
+        """调用 flash_attn_varlen_func 执行变长因果注意力。
+
+        根据检测到的 FA 版本决定是否传递 fa_version 参数。
+        """
         # fa_utils.get_flash_attn_version() returns None on backends that
         # should not pass an explicit fa_version kwarg.
         if self.fa_version is None:
@@ -340,11 +448,24 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         quantizer is symmetric around zero (sign-flipping a coordinate
         maps it to the mirror centroid with identical distortion).
         """
+        # 一次性推导 TQ 缓冲区（旋转矩阵、中点等）并确保在目标设备上。
+        #
+        # Hadamard 旋转矩阵在所有层之间共享：随机符号翻转不会改善
+        # Lloyd-Max 量化质量，因为量化器围绕零对称（符号翻转一个坐标
+        # 会映射到具有相同失真的镜像质心）。
+        #
+        # 设置的缓冲区：
+        # 1. _tq_Pi / _tq_PiT: Hadamard 旋转矩阵及其转置（相同，因为对称）
+        # 2. _tq_Pi_half: FP16 版本的旋转矩阵（用于延续 prefill 路径）
+        # 3. _tq_centroids: Lloyd-Max 量化的质心
+        # 4. _tq_midpoints: 相邻质心的中点（用于量化决策）
         if not hasattr(layer, "_tq_cached"):
             D = self.head_size
 
             # Pure Hadamard: orthonormal + symmetric (H = H^T), enabling
             # in-kernel butterfly fusion and trivial inverse for continuation.
+            # 纯 Hadamard 矩阵：正交 + 对称（H = H^T），支持内核内
+            # 蝴蝶融合和延续 prefill 的简单逆变换。
             H = _build_hadamard(D, str(device))
             layer._tq_PiT = H
             layer._tq_Pi = H
@@ -352,10 +473,12 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             layer._tq_Pi_half = H.to(torch.float16)
 
             # Centroids for Lloyd-Max quantization.
+            # Lloyd-Max 量化的质心：预计算的最优标量量化码本
             layer._tq_centroids = get_centroids(D, self.tq_config.centroid_bits).to(
                 device=device, dtype=torch.float32
             )
 
+            # 计算相邻质心的中点（用于判断量化到哪个质心）
             c_sorted, _ = layer._tq_centroids.sort()
             layer._tq_midpoints = (c_sorted[:-1] + c_sorted[1:]) / 2
             layer._tq_cached = True
@@ -374,6 +497,16 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         the attention forward, matching FlashAttention's split pattern.
         slot_mapping is already sliced to num_actual_tokens by the caller.
         """
+        # 将压缩后的 K/V 存入组合 TQ 缓存。
+        #
+        # 作为独立的自定义操作（unified_kv_cache_update）在注意力前向传播
+        # 之前调用，与 FlashAttention 的分离模式一致。
+        # 调用者已将 slot_mapping 切片到 num_actual_tokens。
+        #
+        # 处理流程：
+        # 1. 确保 TQ 缓冲区（旋转矩阵等）在目标设备上
+        # 2. 将 key/value 重塑为 (N, num_kv_heads, head_size) 形状
+        # 3. 调用 _store_kv 执行量化和存储
         N = slot_mapping.shape[0]
         if N <= 0:
             return
@@ -397,6 +530,15 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         output_scale: torch.Tensor | None = None,
         output_block_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        """TurboQuant 注意力的前向传播。
+
+        根据批次类型分发到不同路径：
+        1. 纯 decode 批次：使用 TQ decode 内核（从压缩缓存读取）
+        2. 纯 prefill 批次：使用 FlashAttention 或 SDPA（在原始 K/V 上计算）
+        3. 混合批次：先处理 decode 请求，再处理 prefill 请求
+
+        注意：KV 缓存已由 do_kv_cache_update 提前更新。
+        """
         num_tokens = query.shape[0]
 
         if output is None:
@@ -533,6 +675,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
 
     # ------------------------------------------------------------------ #
     #  Store K/V into combined cache (vectorized)                         #
+    #  将 K/V 存入组合缓存（向量化）                                       #
     # ------------------------------------------------------------------ #
     def _store_kv(
         self,
@@ -542,7 +685,15 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         slot_mapping: torch.Tensor,
         layer: Any,
     ):
-        """Quantize + store via fused Triton kernel."""
+        """Quantize + store via fused Triton kernel.
+        通过融合的 Triton 内核执行量化和存储。
+
+        处理流程：
+        1. 对 Key 应用 Hadamard 旋转（MSE 量化模式）
+        2. 使用 Lloyd-Max 质心对 Key 进行标量量化并打包
+        3. 对 Value 进行低精度量化
+        4. 将量化后的 Key + Value 写入组合缓存槽
+        """
         triton_turboquant_store(
             key,
             value,
@@ -558,6 +709,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
 
     # ------------------------------------------------------------------ #
     #  Prefill: SDPA on raw Q/K/V with causal mask                        #
+    #  Prefill: 使用因果掩码在原始 Q/K/V 上执行缩放点积注意力                #
     # ------------------------------------------------------------------ #
     def _prefill_attention(
         self,
@@ -571,11 +723,36 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         PiT: torch.Tensor | None = None,
         layer: Any = None,
     ) -> torch.Tensor:
+        """对 prefill 请求执行注意力计算。
+
+        Prefill 有两种子路径：
+        1. 首块 prefill（q_len == seq_len）：所有 K/V 都在当前批次中，
+           可以使用 FlashAttention 的快速路径。
+        2. 延续 prefill（q_len < seq_len）：需要访问已缓存的 K/V，
+           根据 q_len 大小选择 TQ decode 内核或反量化 + flash_attn。
+
+        Args:
+            query: 查询张量 (N, Hq, D)
+            key: 键张量 (N, Hk, D)
+            value: 值张量 (N, Hk, D)
+            kv_cache: TQ 组合缓存
+            attn_metadata: TurboQuant 元数据
+            Pi: Hadamard 旋转矩阵
+            centroids: Lloyd-Max 量化质心
+            PiT: Hadamard 旋转矩阵的转置
+            layer: 注意力层（用于访问 TQ 缓冲区）
+
+        Returns:
+            注意力输出 (N, Hq, D)
+        """
         N, Hq, D = query.shape
 
         # Fast path: use flash_attn for first-chunk prefills (all K/V in batch).
         # max_query_len == max_seq_len means no request has prior cached KV.
         # Both are Python ints — no GPU sync.
+        # 快速路径：对首块 prefill 使用 flash_attn（所有 K/V 都在当前批次中）。
+        # max_query_len == max_seq_len 表示没有请求有之前的缓存 KV。
+        # 两者都是 Python int，不需要 GPU 同步。
         if _HAS_FLASH_ATTN and attn_metadata.max_query_len == attn_metadata.max_seq_len:
             return self._flash_attn_varlen(
                 q=query,
@@ -854,6 +1031,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
 
     # ------------------------------------------------------------------ #
     #  Decode: Triton TQ decode attention                                 #
+    #  Decode: 使用 Triton TQ decode 注意力内核                            #
     # ------------------------------------------------------------------ #
     def _decode_attention(
         self,
@@ -865,9 +1043,29 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         PiT: torch.Tensor | None = None,
         layer: torch.nn.Module | None = None,
     ) -> torch.Tensor:
+        """使用 Triton TQ decode 内核执行 decode 注意力。
+
+        从压缩的 TQ 缓存中读取 K/V，在线反量化并计算注意力分数。
+        使用分区内归约（partitioned reduction）来处理长序列。
+
+        Args:
+            query: 查询张量 (B, Hq, D)，每个请求一个查询 token
+            kv_cache: TQ 组合缓存
+            attn_metadata: TurboQuant 元数据
+            Pi: Hadamard 旋转矩阵
+            centroids: Lloyd-Max 量化质心
+            PiT: Hadamard 旋转矩阵的转置
+            layer: 注意力层
+
+        Returns:
+            注意力输出 (B, Hq, D)
+        """
         # Acquire shared decode scratch buffers from WorkspaceManager.
         # Layers execute sequentially so one set of buffers is sufficient.
         # Falls back to kernel-internal allocation if workspace unavailable.
+        # 从 WorkspaceManager 获取共享的 decode 临时缓冲区。
+        # 层是顺序执行的，所以一组缓冲区就够了。
+        # 如果工作空间不可用，回退到内核内部分配。
         B = query.shape[0]
         D = self.head_size
         S = self.max_num_kv_splits

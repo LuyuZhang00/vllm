@@ -1,5 +1,37 @@
 #pragma once
 
+// =============================================================================
+// 中文注释: Machete 量化 GEMM Kernel 实现
+// =============================================================================
+// 本文件实现了基于 CUTLASS 库的 Machete 量化矩阵乘法 kernel。
+//
+// 核心设计:
+//   Machete 使用 CUTLASS 的 GEMM 框架，但有一个关键的转置优化:
+//   计算 D = alpha * A * B + beta * C 时，实际计算的是
+//   D^t = alpha * B^t * A^t + beta * C^t
+//
+// 为什么要转置:
+//   - Hopper 的 wgmma 指令只支持从寄存器加载左操作数
+//   - 量化权重需要在寄存器中反量化 (upconvert/decompress)
+//   - 通过转置，将量化权重 B 移到左操作数位置，可以在寄存器中完成反量化
+//   - 典型场景 Y = XW^t，W 是量化权重，转置后 W^t 成为左操作数
+//
+// MacheteKernelTemplate 模板参数:
+//   ElementA_/ElementB_: 输入数据类型
+//   ElementD_: 输出数据类型
+//   AccumulatorT: 累加器类型 (通常 float)
+//   GroupScaleT/GroupZeroT: per-group 缩放因子和零点类型
+//   ChannelScaleT/TokenScaleT: per-channel/per-token 缩放因子类型
+//   KernelSchedule: CUTLASS kernel 调度策略
+//   ScheduleConfig: 调度配置 (tile 大小等)
+//
+// 支持的缩放策略 (通过模板参数控制是否启用):
+//   - with_group_scales: per-group 缩放因子
+//   - with_group_zeropoints: per-group 零点
+//   - with_channel_scales: per-channel 缩放因子
+//   - with_token_scales: per-token 缩放因子 (用于 FP8 的 per-token 量化)
+// =============================================================================
+
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <torch/all.h>

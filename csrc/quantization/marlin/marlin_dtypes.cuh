@@ -1,4 +1,29 @@
 
+// =============================================================================
+// 中文注释: Marlin 数据类型定义
+// =============================================================================
+// 本文件为每种标量类型定义了 Marlin kernel 所需的所有类型别名和辅助函数。
+//
+// MarlinScalarType 模板类为每种数据类型提供:
+//   - scalar_t/scalar_t2/scalar_t4: 标量和向量化类型
+//   - FragA/FragB/FragC: Tensor Core MMA 指令所需的 fragment 类型
+//     - FragA: A 矩阵 fragment (16x16 子块)
+//     - FragB: B 矩阵 fragment (8x16 子块)
+//     - FragC: C 矩阵累加器 fragment (16x8 子块)
+//   - FragS: 缩放因子 fragment
+//   - FragZP: 零点 fragment
+//   - num2float/float2num: 类型转换辅助函数
+//
+// Fragment 布局遵循 NVIDIA PTX 文档:
+// https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#matrix-fragments-for-mma-m16n8k16-with-floating-point-type
+//
+// 支持的数据类型:
+//   - FP16 (half): 基础类型，所有 SM 支持
+//   - BF16 (nv_bfloat16): SM80+ 支持
+//   - FP8 (Float8_e4m3fn): SM89+ 支持 (W4A8-FP8)
+//   - INT8 (int8_t): SM75+ 支持
+// =============================================================================
+
 #ifndef _data_types_cuh
 #define _data_types_cuh
 #include "marlin.cuh"
@@ -13,9 +38,15 @@
 
 namespace MARLIN_NAMESPACE_NAME {
 
+// 中文注释: MarlinScalarType 主模板 (未特化版本，编译时会报错)
 template <long scalar_type_id>
 class MarlinScalarType {};
 
+// 中文注释: FP16 类型特化
+// half2 是 CUDA 的 2 元素 half 向量类型，用于向量化运算
+// FragA = Vec<half2, 4> = 4 个 half2 = 8 个 half = 128 bit
+// FragB = Vec<half2, 2> = 2 个 half2 = 4 个 half = 64 bit
+// FragC = Vec<float, 4> = 4 个 float = 128 bit (FP32 累加器)
 template <>
 class MarlinScalarType<vllm::kFloat16.id()> {
  public:

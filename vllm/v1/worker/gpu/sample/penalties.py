@@ -1,5 +1,31 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""
+重复惩罚模块 (Repetition Penalties Module)
+
+本模块实现了三种采样惩罚机制，用于减少模型输出的重复性：
+
+1. 重复惩罚 (Repetition Penalty):
+   - 对在 prompt 或已生成输出中出现过的 token 施加惩罚
+   - 如果 logit > 0，除以 penalty；如果 logit < 0，乘以 penalty
+   - penalty > 1: 降低重复 token 的概率
+   - penalty = 1: 不惩罚（默认值）
+
+2. 频率惩罚 (Frequency Penalty):
+   - 根据 token 在已生成输出中的出现次数施加惩罚
+   - logit -= frequency_penalty * count
+   - count 是 token 在输出中出现的次数
+
+3. 存在惩罚 (Presence Penalty):
+   - 如果 token 在已生成输出中出现过，施加固定的惩罚
+   - logit -= presence_penalty (如果 token 出现过)
+   - 不考虑出现次数，只考虑是否出现
+
+实现细节：
+- 使用位掩码 (prompt_bin_mask) 高效记录 prompt 中出现的 token
+- 使用计数数组 (output_bin_counts) 记录输出中每个 token 的出现次数
+- 使用 Triton 内核在 GPU 上并行执行惩罚计算
+"""
 import numpy as np
 import torch
 
@@ -12,38 +38,61 @@ from vllm.v1.worker.gpu.states import RequestState
 
 
 class PenaltiesState:
+    """惩罚状态管理器。
+
+    管理每个请求的惩罚参数和统计数据（prompt 中的 token 掩码、输出中的 token 计数）。
+    """
+
     def __init__(self, req_states: RequestState):
+        """初始化惩罚状态。
+
+        Args:
+            req_states: 请求状态管理器，提供 max_num_reqs、vocab_size 和 device 信息
+        """
         self.req_states = req_states
 
         max_num_reqs = req_states.max_num_reqs
         self.vocab_size = req_states.vocab_size
         self.device = req_states.device
 
+        # 惩罚参数
         self.repetition_penalty = UvaBackedTensor(max_num_reqs, dtype=torch.float32)
         self.frequency_penalty = UvaBackedTensor(max_num_reqs, dtype=torch.float32)
         self.presence_penalty = UvaBackedTensor(max_num_reqs, dtype=torch.float32)
+        # 标记每个请求是否使用惩罚
         self.use_penalty = np.zeros(max_num_reqs, dtype=bool)
 
-        # Initialize repetition penalty manually because 0 is an invalid value for it.
+        # 手动初始化重复惩罚，因为 0 是无效值（会导致除零错误）
         self.repetition_penalty.np.fill(1.0)
         self.repetition_penalty.copy_to_uva()
 
-        # Statistics for penalties.
+        # 惩罚统计数据：
+        # prompt_bin_mask: 位掩码，记录 prompt 中出现的 token
+        #   形状 [max_num_reqs, ceil(vocab_size/32)]
+        #   每 32 个 token 压缩为一个 int32
         self.prompt_bin_mask = torch.zeros(
             max_num_reqs,
             cdiv(self.vocab_size, 32),
             dtype=torch.int32,
             device=self.device,
         )
-        # TODO(woosuk): This tensor is rarely used but can be very large, taking up
-        # GBs of GPU memory. Optimize the memory usage.
+        # output_bin_counts: 计数数组，记录输出中每个 token 的出现次数
+        #   形状 [max_num_reqs, vocab_size]
+        #   注意：此张量很少使用但可能很大，占用 GB 级 GPU 内存
         self.output_bin_counts = torch.zeros(
             max_num_reqs, self.vocab_size, dtype=torch.int32, device=self.device
         )
 
+        # 新添加的需要初始化统计数据的请求列表
         self._new_penalties_reqs: list[int] = []
 
     def add_request(self, req_idx: int, sampling_params: SamplingParams) -> None:
+        """添加新请求的惩罚参数。
+
+        Args:
+            req_idx: 请求在批次中的索引
+            sampling_params: 采样参数
+        """
         self.repetition_penalty.np[req_idx] = sampling_params.repetition_penalty
         self.frequency_penalty.np[req_idx] = sampling_params.frequency_penalty
         self.presence_penalty.np[req_idx] = sampling_params.presence_penalty
@@ -54,6 +103,12 @@ class PenaltiesState:
             self._new_penalties_reqs.append(req_idx)
 
     def apply_staged_writes(self) -> None:
+        """将暂存的惩罚数据批量应用到 GPU。
+
+        对于新添加的请求，需要初始化统计数据：
+        1. 使用 bincount 内核统计 prompt 和已 prefill 输出中的 token
+        2. 更新 prompt_bin_mask 和 output_bin_counts
+        """
         if self._new_penalties_reqs:
             idx_mapping = async_tensor_h2d(
                 self._new_penalties_reqs,
@@ -63,6 +118,7 @@ class PenaltiesState:
 
             prefill_lens = self.req_states.prefill_len.np[self._new_penalties_reqs]
             max_prefill_len = int(prefill_lens.max())
+            # 初始化统计数据：统计 prompt 和已 prefill 输出中的 token
             bincount(
                 idx_mapping,
                 self.req_states.all_token_ids.gpu,
@@ -74,6 +130,7 @@ class PenaltiesState:
             )
             self._new_penalties_reqs.clear()
 
+        # 将惩罚参数复制到 UVA 内存
         self.repetition_penalty.copy_to_uva()
         self.frequency_penalty.copy_to_uva()
         self.presence_penalty.copy_to_uva()

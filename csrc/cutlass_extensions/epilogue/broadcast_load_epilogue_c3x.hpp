@@ -46,6 +46,28 @@
 // if scales were initially on the device, and caused torch.compile graphs
 // breaks when moving scales to the CPU.
 //
+// 中文注释：本文件实现了 SM90（Hopper）GEMM 的自定义 epilogue（后处理）访客（visitor），
+// 用于在 GEMM 计算完成后广播加载量化缩放因子（scale）和偏置（bias）。
+//
+// 背景知识 - Epilogue 在 GEMM 中的作用：
+//   GEMM 计算 D = A * B 后，通常需要后处理：
+//   D_final = scale_A * scale_B * D + bias
+//   对于量化推理，scale_A（per-token/per-tensor）和 scale_B（per-channel/per-tensor）
+//   是将量化整数权重/激活反量化回浮点的关键参数。
+//
+// 本文件定义了两个核心 epilogue visitor：
+//   1. Sm90RowOrScalarBroadcast：行向量广播（用于 per-channel scale/bias）
+//      - 如果 ptr_row 指向一个行向量，则每列使用不同值（per-channel）
+//      - 如果 ptr_row 指向标量，则所有列使用相同值（per-tensor）
+//   2. Sm90ColOrScalarBroadcast：列向量广播（用于 per-token scale）
+//      - 如果 ptr_col 指向一个列向量，则每行使用不同值（per-token）
+//      - 如果 ptr_col 指向标量，则所有行使用相同值（per-tensor）
+//
+// 设计优势：
+//   - 一个编译好的 kernel 可以同时处理 per-tensor 和 per-channel/per-token 两种情况
+//   - scale 始终通过 device pointer 传递，避免了 CPU-GPU 数据传输开销
+//   - 与 torch.compile 兼容，不会导致图断裂
+//
 #pragma once
 
 // Turn off clang-format for the entire file to keep it close to upstream
@@ -63,6 +85,16 @@ using namespace cute;
 using namespace detail;
 
 // Row vector broadcast
+// 中文注释：SM90 行向量广播 epilogue visitor。
+// 用于加载 per-channel 的量化缩放因子或偏置，沿 N 维（列方向）广播。
+// 例如：scale_B 形状为 (1, N)，GEMM 输出 D 的每列乘以对应的 scale_B 值。
+//
+// 工作流程：
+//   1. Producer 阶段：将行向量从全局内存加载到共享内存（smem）
+//   2. Consumer 阶段：从 smem 加载到寄存器，然后在 epilogue 中与累加器相乘
+//
+// 当 row_broadcast = false 时，ptr_row 指向一个标量，所有列使用相同值。
+// 这允许同一个 kernel 处理 per-tensor 和 per-channel 两种量化模式。
 template<
   int Stages,
   class CtaTileShapeMNK,
@@ -178,6 +210,12 @@ struct Sm90RowOrScalarBroadcast {
     ThrNum thr_num;
     Params const& params;
 
+    // 中文注释：Consumer 端的 begin() 回调。
+    // 当 row_broadcast=false（标量广播模式）时，直接用标量值填充寄存器，跳过内存加载。
+    // 当 row_broadcast=true（行向量模式）时，执行以下流程：
+    //   1. 从全局内存加载行向量到共享内存（G2S），越界位置填 0
+    //   2. 使用 NamedBarrier 同步所有线程，确保数据加载完成
+    //   3. 后续在 begin_loop 中从 smem 加载到寄存器（S2R）
     CUTLASS_DEVICE void
     begin() {
       if (!params.row_broadcast) {
@@ -204,16 +242,22 @@ struct Sm90RowOrScalarBroadcast {
       synchronize();
     }
 
+    // 中文注释：每个 epilogue 子 tile 循环的开始回调。
+    // 仅在 epi_m == 0（M 维的第一个子 tile）时从 smem 加载行向量到寄存器。
+    // 后续 epi_m > 0 的子 tile 复用寄存器中已加载的值，避免重复加载。
     CUTLASS_DEVICE void
     begin_loop(int epi_m, int epi_n) {
       if (epi_m == 0) { // Assumes M-major subtile loop
-        if (!params.row_broadcast) return; // Do not issue LDS when row is scalar 
+        if (!params.row_broadcast) return; // Do not issue LDS when row is scalar
         cute::Tensor tSR_sRow_flt = filter_zeros(tSR_sRow(_,_,_,epi_m,epi_n));
         cute::Tensor tSR_rRow_flt = filter_zeros(tSR_rRow);
         copy(tSR_sRow_flt, tSR_rRow_flt);
       }
     }
 
+    // 中文注释：visit 回调 —— epilogue 的核心计算。
+    // 对于累加器中的每个元素，返回对应的行向量值。
+    // 这些值将在外层 EVT（Epilogue Visitor Tree）中与累加器执行乘法/融合乘加。
     template <typename ElementAccumulator, int FragmentSize>
     CUTLASS_DEVICE Array<Element, FragmentSize>
     visit(Array<ElementAccumulator, FragmentSize> const& frg_acc, int epi_v, int epi_m, int epi_n) {
@@ -228,6 +272,13 @@ struct Sm90RowOrScalarBroadcast {
     }
   };
 
+  // 中文注释：构造 Consumer 端的 store 回调。
+  // 负责：
+  //   1. 创建全局内存张量 gRow，指向行向量数据
+  //   2. 切分到当前 CTA（Cooperative Thread Array）负责的 tile
+  //   3. 设置 G2S（全局内存 -> 共享内存）的拷贝布局
+  //   4. 设置 S2R（共享内存 -> 寄存器）的分区布局
+  //   5. 创建用于边界检查的坐标张量 cRow
   template <
     bool ReferenceSrc, // do register tensors reference the src or dst layout of the tiled copy
     class... Args
@@ -275,6 +326,14 @@ struct Sm90RowOrScalarBroadcast {
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
 // Column vector broadcast
+// 中文注释：SM90 列向量广播 epilogue visitor。
+// 用于加载 per-token 的量化缩放因子，沿 M 维（行方向）广播。
+// 例如：scale_A 形状为 (M, 1)，GEMM 输出 D 的每行乘以对应的 scale_A 值。
+//
+// 与 RowOrScalarBroadcast 不同，列向量不需要通过 smem 中转，
+// 因为累加器已经在寄存器中按 M 维分布，每个线程直接从全局内存加载自己负责的行即可。
+//
+// 当 col_broadcast=false 时，ptr_col 指向标量（per-tensor 缩放）。
 template<
   int Stages,
   class CtaTileShapeMNK,

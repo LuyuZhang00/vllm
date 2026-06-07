@@ -6,6 +6,27 @@
 #  - Jan van Lunteren <jvl@zurich.ibm.com>
 #  - Chih-Chieh Yang <chih.chieh.yang@ibm.com>
 #  - Thomas Parnell <tpa@zurich.ibm.com>
+#
+# 本模块实现了分块预填充（chunked prefill）+ 分页解码（paged decode）
+# 的混合注意力计算，主要用于 ROCm 平台。
+#
+# 核心功能：
+# 1. chunked_prefill_paged_decode - 统一入口函数
+#    根据 max_query_len 判断是预填充还是解码：
+#    - max_query_len > 1：调用 context_attention_fwd 进行分块预填充
+#    - 同时也会对 max_query_len == 1 的请求进行分页解码
+#
+# 2. kernel_paged_attention_2d - Triton 解码注意力 kernel
+#    使用在线 softmax 算法遍历分页 KV 缓存
+#    支持：GQA/MQA、滑动窗口、ALiBi、FP8、sink token
+#
+# 3. has_native_kv_cache_layout - 检查 KV 缓存是否为原生布局
+#    用于决定是否使用 ROCm 自定义 paged attention kernel
+#
+# 分页支持：
+# - 通过 block_tables 将逻辑块映射到物理块
+# - 支持非标准块大小（如 Qwen3 的 544）
+# - 支持物理地址指针作为块表
 
 import torch
 
@@ -18,10 +39,13 @@ from .prefix_prefill import context_attention_fwd
 
 logger = init_logger(__name__)
 
+# FP8 数据类型的数值范围信息
 float8_info = torch.finfo(current_platform.fp8_dtype())
 
 
 def has_native_kv_cache_layout(
+    # 检查 KV 缓存块是否使用原生 ROCm 配对布局
+    # 原生 reshape_and_cache 写入器假设打包块
     key_cache: torch.Tensor,
     value_cache: torch.Tensor,
 ) -> bool:
@@ -30,6 +54,12 @@ def has_native_kv_cache_layout(
     The native reshape_and_cache writer assumes packed blocks. If cache update
     needs reshape_and_cache_flash for a stride-padded hybrid layout, decode
     should use the matching Triton path too.
+
+    检查 KV 缓存块是否可以使用原生 ROCm 配对。
+
+    原生 reshape_and_cache 写入器假设打包块。如果缓存更新需要
+    reshape_and_cache_flash 来处理步幅填充的混合布局，
+    解码也应使用匹配的 Triton 路径。
     """
     return (
         key_cache.stride(0) == key_cache.shape[1:].numel()
@@ -44,6 +74,9 @@ def cdiv_fn(x, y):
 
 @triton.jit
 def kernel_paged_attention_2d(
+    # 2D 分页注意力 kernel：每个程序处理一个 (序列, KV 头) 对
+    # 使用在线 softmax 算法遍历分页 KV 缓存
+    # 支持 GQA/MQA（多个 Q 头共享一个 KV 头）
     output_ptr,  # [num_tokens, num_query_heads, head_size]
     query_ptr,  # [num_tokens, num_query_heads, head_size]
     key_cache_ptr,  # [num_blks, num_kv_heads, head_size // x, blk_size, x]
@@ -87,9 +120,12 @@ def kernel_paged_attention_2d(
     FP8_MIN: tl.constexpr = float8_info.min,
     FP8_MAX: tl.constexpr = float8_info.max,
 ):
+    # 程序 ID 二维网格：(序列, KV 头)
     seq_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
 
+    # filter_by_query_len 用于混合预填充+解码模式：
+    # 跳过 query_len > 1 的序列（它们由 prefill kernel 处理）
     if filter_by_query_len:
         cur_batch_in_all_start_index = tl.load(query_start_len_ptr + seq_idx)
         cur_batch_in_all_stop_index = tl.load(query_start_len_ptr + seq_idx + 1)
@@ -99,6 +135,7 @@ def kernel_paged_attention_2d(
     else:
         cur_batch_in_all_start_index = seq_idx
 
+    # 计算当前 KV 头对应的 Q 头范围（GQA 分组）
     query_head_idx = kv_head_idx * num_queries_per_kv + tl.arange(
         0, num_queries_per_kv_padded
     )
@@ -113,7 +150,7 @@ def kernel_paged_attention_2d(
 
     dim_mask = tl.where(tl.arange(0, HEAD_SIZE_PADDED) < HEAD_SIZE, 1, 0).to(tl.int1)
 
-    # Q : (num_queries_per_kv, HEAD_SIZE,)
+    # Q : (num_queries_per_kv, HEAD_SIZE,) - 加载查询向量
     Q = tl.load(
         query_ptr + query_offset + tl.arange(0, HEAD_SIZE_PADDED)[None, :],
         mask=dim_mask[None, :] & head_mask[:, None],
@@ -122,10 +159,13 @@ def kernel_paged_attention_2d(
 
     block_table_offset = seq_idx * block_table_stride
 
+    # 初始化在线 softmax 状态
     if not USE_SINKS:
+        # 无 sink token：M 初始化为 -inf，L 初始化为 0
         M = tl.full([num_queries_per_kv_padded], float("-inf"), dtype=tl.float32)
         L = tl.zeros([num_queries_per_kv_padded], dtype=tl.float32)
     else:
+        # 有 sink token：从 sink_ptr 加载每个 head 的 sink 偏置
         M = tl.load(
             sink_ptr + query_head_idx,
             mask=head_mask,
@@ -133,9 +173,10 @@ def kernel_paged_attention_2d(
         ).to(dtype=tl.float32)
         L = tl.where(float("-inf") < M, 1.0, 0.0)
 
+    # V 的加权累加器
     acc = tl.zeros([num_queries_per_kv_padded, HEAD_SIZE_PADDED], dtype=tl.float32)
 
-    # sequence len for this particular sequence
+    # 加载当前序列的长度
     seq_len = tl.load(seq_lens_ptr + seq_idx)
 
     # alibi slope for this head
@@ -148,20 +189,20 @@ def kernel_paged_attention_2d(
 
     offs_n = tl.arange(0, BLOCK_SIZE)
     offs_d = tl.arange(0, HEAD_SIZE_PADDED)
-    # iterate through tiles
+    # 遍历所有 KV 块
     for j in range(0, num_blocks):
         start_n = j * BLOCK_SIZE
-        # Calculate the logical location within a non-standard physical block,
-        # such as 544 in Qwen/Qwen3-Next-80B-A3B-Thinking.
-        # Supports non-contiguous mapping
-        # from logical blocks to physical blocks
+        # 计算非标准物理块内的逻辑位置
+        # 例如 Qwen/Qwen3-Next-80B-A3B-Thinking 使用 544 的块大小
+        # 支持从逻辑块到物理块的非连续映射
         abs_token_idx = start_n + offs_n
         l_block_idx = abs_token_idx // PHYSICAL_BLOCK_SIZE
-        # Vectorized loading of physical block IDs
+        # 向量化加载物理块 ID
         p_block_idx = tl.load(block_tables_ptr + block_table_offset + l_block_idx)
         internal_offsets = abs_token_idx % PHYSICAL_BLOCK_SIZE
 
-        # 5D addressing logic of K
+        # K 的 5D 地址计算：[Block, Head, Dim//x, Slot, x]
+        # x 通常为 8，用于向量化内存访问
         k_offset = (
             p_block_idx[None, :] * stride_k_cache_0
             + kv_head_idx * stride_k_cache_1
@@ -170,7 +211,7 @@ def kernel_paged_attention_2d(
             + (offs_d[:, None] % x) * stride_k_cache_4
         )
 
-        # 4D addressing logic of V (Slot is innermost)
+        # V 的 4D 地址计算：[Block, Head, Dim, Slot]
         v_offset = (
             p_block_idx[:, None] * stride_v_cache_0
             + kv_head_idx * stride_v_cache_1
@@ -186,6 +227,7 @@ def kernel_paged_attention_2d(
             eviction_policy="evict_last",
         )
 
+        # FP8 反量化：将 K 从 FP8 转为浮点并乘以缩放因子
         if K_load.dtype.is_fp8():
             K = (K_load.to(tl.float32) * tl.load(k_scale)).to(Q.dtype)
         else:
@@ -208,19 +250,21 @@ def kernel_paged_attention_2d(
         boundary = tl.full([BLOCK_SIZE], seq_len, dtype=tl.int32)
         seq_mask = seq_offset[None, :] < boundary
 
-        # First calculate the dot, then apply the mask.
+        # 先计算点积，再应用掩码
         qk = scale * tl.dot(Q, K)
         S = tl.where(head_mask[:, None] & seq_mask, qk, float("-inf"))
 
         context_len = seq_len - 1
 
+        # 滑动窗口：将窗口外的位置设为大负数
         if SLIDING_WINDOW > 0:
             S = tl.where((context_len - seq_offset) < SLIDING_WINDOW, S, -10000)
 
+        # ALiBi 位置偏置
         if USE_ALIBI_SLOPES:
             S += alibi_slope[:, None] * (seq_offset - context_len)
 
-        # compute running maximum
+        # 在线 softmax 更新：计算运行最大值
         # m_j : (num_queries_per_kv,)
         m_j = tl.maximum(M, tl.max(S, axis=1))
 
@@ -245,7 +289,7 @@ def kernel_paged_attention_2d(
         # acc : (num_queries_per_kv, BLOCK_SIZE,)
         acc += tl.dot(p.to(V.dtype), V)
 
-    # epilogue
+    # 尾声：归一化输出
     acc = acc / (L[:, None] + 1e-10)
     if USE_FP8:
         acc = acc * tl.load(out_scale_inv)
@@ -264,6 +308,10 @@ def kernel_paged_attention_2d(
 
 
 def chunked_prefill_paged_decode(
+    # 分块预填充 + 分页解码的统一入口函数
+    # 根据 max_query_len 判断是预填充还是解码：
+    # - max_query_len > 1：调用 context_attention_fwd 进行分块预填充
+    # - max_query_len == 1：使用 kernel_paged_attention_2d 进行分页解码
     query,
     key,
     value,
@@ -287,6 +335,7 @@ def chunked_prefill_paged_decode(
     is_block_table_ptr: bool = False,
     causal: bool = True,
 ):
+    # 计算 softmax 缩放因子
     if sm_scale is None:
         sm_scale = 1.0 / (query.shape[2] ** 0.5)
 
@@ -295,6 +344,7 @@ def chunked_prefill_paged_decode(
     if sliding_window is None or sliding_window <= 0:
         sliding_window = 0
 
+    # 当 max_query_len > 1 时，进行分块预填充
     if max_query_len > 1:
         context_attention_fwd(
             q=query,
@@ -320,6 +370,7 @@ def chunked_prefill_paged_decode(
             causal=causal,
         )
 
+    # 计算解码相关的维度信息
     block_size = value_cache.shape[3]
     num_seqs = len(seq_lens)
     num_query_heads = query.shape[1]
@@ -328,8 +379,7 @@ def chunked_prefill_paged_decode(
     num_queries_per_kv = num_query_heads // num_kv_heads
     head_size = query.shape[2]
 
-    # Conversion of FP8 Tensor from uint8 storage to
-    # appropriate torch.dtype for interpretation by Triton
+    # FP8 类型转换：将 uint8 存储的 FP8 张量转换为 Triton 可识别的 dtype
     if "fp8" in kv_cache_dtype:
         assert key_cache.dtype in [torch.uint8, current_platform.fp8_dtype()]
         assert value_cache.dtype in [torch.uint8, current_platform.fp8_dtype()]
@@ -347,6 +397,7 @@ def chunked_prefill_paged_decode(
         key_cache = key_cache.view(target_dtype)
         value_cache = value_cache.view(target_dtype)
 
+    # 将 num_queries_per_kv 填充到 2 的幂次（最小 16），用于 Triton 向量化
     num_queries_per_kv_padded = max(triton.next_power_of_2(num_queries_per_kv), 16)
 
     from vllm.platforms.rocm import use_rocm_custom_paged_attention
@@ -363,20 +414,22 @@ def chunked_prefill_paged_decode(
         sinks,
     )
     has_native_layout = has_native_kv_cache_layout(key_cache, value_cache)
-    # Force Triton for non-standard blocks like Qwen3's 544 and for
-    # stride-padded hybrid layouts. The latter use reshape_and_cache_flash
-    # during cache update, so keep decode on the matching stride-aware path.
+    # 对于非标准块（如 Qwen3 的 544）和步幅填充的混合布局，
+    # 强制使用 Triton kernel。后者在缓存更新时使用 reshape_and_cache_flash，
+    # 因此解码也应使用匹配的步幅感知路径。
     is_pow2 = block_size > 0 and (block_size & (block_size - 1) == 0)
     if not is_pow2 or not has_native_layout:
         use_custom = False
 
     if use_custom:
+        # 使用 ROCm 自定义 paged attention kernel
         _PARTITION_SIZE_ROCM = 256
         max_num_partitions = (
             max_seq_len + _PARTITION_SIZE_ROCM - 1
         ) // _PARTITION_SIZE_ROCM
         assert _PARTITION_SIZE_ROCM % block_size == 0
         total_num_seq = block_table.shape[0]
+        # 分配临时缓冲区用于分区归约
         tmp_output = torch.empty(
             size=(total_num_seq, num_query_heads, max_num_partitions, head_size),
             dtype=query.dtype,
@@ -411,32 +464,33 @@ def chunked_prefill_paged_decode(
             fp8_out_scale=output_scale,
         )
     else:
+        # 回退到 Triton 实现
         logger.warning_once(
             "Cannot use ROCm custom paged attention kernel,"
             " falling back to Triton implementation."
         )
         real_block_size = value_cache.shape[3]
-        # The standard model directly uses the original block_size.
-        # Non-standard 544 uses 32 to accommodate integer division logic.
-        # Cap at 128 to avoid exceeding GPU shared memory limits
-        # (e.g. hybrid Mamba models inflate block_size to 2048).
-        # The kernel handles TRITON_BLOCK_SIZE != PHYSICAL_BLOCK_SIZE
-        # via the l_block_idx/internal_offsets addressing logic.
+        # 标准模型直接使用原始 block_size。
+        # 非标准的 544 使用 32 以适配整数除法逻辑。
+        # 限制最大 128 以避免超出 GPU 共享内存限制
+        # （例如混合 Mamba 模型将 block_size 膨胀到 2048）。
+        # kernel 通过 l_block_idx/internal_offsets 地址逻辑
+        # 处理 TRITON_BLOCK_SIZE != PHYSICAL_BLOCK_SIZE 的情况。
         MAX_TRITON_BLOCK_SIZE = 128
         TRITON_BLOCK_SIZE = min(block_size, MAX_TRITON_BLOCK_SIZE) if is_pow2 else 32
         if is_block_table_ptr:
-            # Using the physical base address of tensors
+            # 使用物理基地址作为块表
             kv_element_size = key_cache.element_size()
             block_byte_stride = key_cache.stride(0) * kv_element_size
-            # Get the starting physical address of the KV Cache
+            # 获取 KV 缓存的起始物理地址
             base_addr = key_cache.data_ptr()
 
-            # Normalization: Directly calculate the block offset
-            # of the pointer relative to the base address
+            # 归一化：直接计算指针相对于基地址的块偏移
             processed_block_table = ((block_table - base_addr) // block_byte_stride).to(
                 torch.int32
             )
         else:
+            # 使用标准块表索引
             processed_block_table = block_table.to(torch.int32)
 
         kernel_paged_attention_2d[

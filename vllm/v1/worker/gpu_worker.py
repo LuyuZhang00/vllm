@@ -2,6 +2,22 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """A GPU worker class."""
 
+# 中文注释：本模块是 vLLM V1 引擎中的 GPU Worker 实现。
+# Worker 是运行在每个 GPU 进程上的核心组件，负责以下职责：
+#   1. 初始化 GPU 设备和分布式环境（NCCL 通信组等）
+#   2. 加载模型权重到 GPU 显存
+#   3. 通过内存 profiling 确定可用于 KV cache 的显存大小
+#   4. 分配和初始化 KV cache
+#   5. 编译/预热模型（包括 CUDA Graph 捕获）
+#   6. 执行模型前向推理（execute_model）和采样（sample_tokens）
+#   7. 管理 LoRA 适配器的加载/卸载
+#   8. 管理 sleep/wake_up 模式以释放/恢复显存
+#   9. 支持权重在线传输更新（weight transfer）
+#
+# Worker 是 Scheduler（调度器）和 GPUModelRunner（模型运行器）之间的桥梁：
+#   Scheduler -> SchedulerOutput -> Worker.execute_model() -> GPUModelRunner.execute_model()
+#   GPUModelRunner -> ModelRunnerOutput -> Worker -> 返回给 Scheduler/Engine
+
 import gc
 import os
 from collections.abc import Callable
@@ -80,6 +96,12 @@ if TYPE_CHECKING:
 class AsyncIntermediateTensors(IntermediateTensors):
     """IntermediateTensors with lazy comm synchronization"""
 
+    # 中文注释：异步中间张量容器，用于 Pipeline Parallelism (PP) 场景。
+    # 在 PP 中，上一个 PP stage 需要将中间张量（如 hidden_states）发送给下一个 stage。
+    # 该类包装了通信句柄（comm_handles），采用惰性等待（lazy wait）策略：
+    #   - 只有在实际访问 .tensors 属性时才等待通信完成
+    #   - 这样可以让通信和计算尽可能重叠，减少等待时间
+
     def __init__(
         self,
         tensors: dict[str, torch.Tensor],
@@ -110,6 +132,13 @@ class AsyncIntermediateTensors(IntermediateTensors):
 
 
 class Worker(WorkerBase):
+    # 中文注释：GPU Worker 主类，vLLM V1 引擎中每个 GPU 进程对应一个 Worker 实例。
+    # 继承自 WorkerBase，实现了 GPU 设备上的完整推理生命周期：
+    #   初始化 -> 加载模型 -> 内存 profiling -> 分配 KV cache -> 编译预热 -> 推理循环 -> 关闭
+    #
+    # Worker 不直接参与调度决策，而是执行 Scheduler 下发的 SchedulerOutput。
+    # 在多卡场景下，每个 GPU 进程独立运行一个 Worker，通过 NCCL 进行通信。
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -132,13 +161,19 @@ class Worker(WorkerBase):
 
         from vllm.distributed.elastic_ep.elastic_execute import ElasticEPScalingExecutor
 
+        # 中文注释：弹性专家并行（Elastic EP）执行器，支持运行时动态调整 EP 并行度
         self.elastic_ep_executor = ElasticEPScalingExecutor(self)
 
         # Buffers saved before sleep
+        # 中文注释：sleep 模式下保存的模型 buffer（如 BatchNorm 的 running_mean），
+        # 用于 level 2 sleep 后恢复。Level 2 sleep 会将所有显存释放（包括权重），
+        # 因此需要将 buffer 拷贝到 CPU 保存。
         self._sleep_saved_buffers: dict[str, torch.Tensor] = {}
 
         # Weight transfer engine is created in `load_model` once the model
         # is available, since the engine needs a reference to the model.
+        # 中文注释：权重传输引擎，用于在线更新模型权重（如 RLHF 场景）。
+        # 在 load_model 时创建，因为需要引用已加载的模型。
         self.weight_transfer_engine: WeightTransferEngine | None = None
         self._weight_update_active = False
         self._is_checkpoint_format = True
@@ -146,6 +181,8 @@ class Worker(WorkerBase):
         # Torch/CUDA profiler. Enabled and configured through profiler_config.
         # Profiler wrapper is created lazily in profile() when start is called,
         # so we have all the information needed for proper trace naming.
+        # 中文注释：性能分析器，支持 Torch Profiler 和 CUDA Profiler 两种模式。
+        # 采用懒初始化策略，只在第一次调用 profile() 时创建。
         self.profiler: Any | None = None
         self.profiler_config = vllm_config.profiler_config
 
@@ -153,16 +190,26 @@ class Worker(WorkerBase):
         if self.profiler_config.profiler not in ("torch", "cuda", None):
             raise ValueError(f"Unknown profiler type: {self.profiler_config.profiler}")
 
+        # 中文注释：是否使用 V2 版本的 ModelRunner。V2 支持更多优化特性。
         self.use_v2_model_runner = vllm_config.use_v2_model_runner
         # pending non-blocking PP send work from the previous iteration
+        # 中文注释：上一轮迭代中尚未完成的 Pipeline Parallelism 非阻塞发送操作。
+        # 在下一轮 execute_model 开始时需要先等待这些发送完成。
         self._pp_send_work: list[Handle] = []
 
     def sleep(self, level: int = 1) -> None:
+        # 中文注释：让 Worker 进入 sleep 模式，释放 GPU 显存供其他进程使用。
+        # 有两种级别：
+        #   Level 1（默认）：只卸载模型权重到 CPU，保留 KV cache 和其他缓冲区
+        #   Level 2：释放所有 GPU 显存，包括模型权重、buffer、KV cache 等
+        # 该功能用于动态资源管理场景，如多实例共享 GPU。
         from vllm.device_allocator.cumem import CuMemAllocator
 
         free_bytes_before_sleep = torch.cuda.mem_get_info()[0]
 
         # Save the buffers before level 2 sleep
+        # 中文注释：Level 2 sleep 前，将模型的 buffer（如 BatchNorm 的统计量）保存到 CPU。
+        # 因为 level 2 会释放所有显存，buffer 数据也会丢失。
         if level == 2:
             model = self.model_runner.model
             self._sleep_saved_buffers = {
@@ -182,12 +229,16 @@ class Worker(WorkerBase):
         )
 
     def wake_up(self, tags: list[str] | None = None) -> None:
+        # 中文注释：唤醒 Worker，恢复之前 sleep 模式释放的 GPU 显存资源。
+        # 参数 tags 用于选择性恢复特定资源（如 "weights"、"kv_cache"）。
+        # 如果 tags 为 None，则恢复所有资源。
         from vllm.device_allocator.cumem import CuMemAllocator
 
         allocator = CuMemAllocator.get_instance()
         allocator.wake_up(tags)
 
         # Restore the buffers after level 2 sleep
+        # 中文注释：Level 2 sleep 后恢复之前保存的模型 buffer 到 GPU。
         if len(self._sleep_saved_buffers):
             model = self.model_runner.model
             for name, buffer in model.named_buffers():
@@ -195,10 +246,16 @@ class Worker(WorkerBase):
                     buffer.data.copy_(self._sleep_saved_buffers[name].data)
             self._sleep_saved_buffers = {}
 
+        # 中文注释：KV cache 唤醒后，通知 ModelRunner 执行后续初始化（如重新绑定地址）。
         if tags is None or "kv_cache" in tags:
             self.model_runner.post_kv_cache_wake_up()
 
     def _maybe_get_memory_pool_context(self, tag: str) -> AbstractContextManager:
+        # 中文注释：获取 CuMem 内存池上下文管理器（如果启用）。
+        # CuMemAllocator 是 vLLM 自定义的 CUDA 内存分配器，支持：
+        #   - 按 tag 分类管理内存（如 "weights"、"kv_cache"）
+        #   - sleep/wake_up 时精确控制哪些内存需要释放/恢复
+        # 如果未启用 CuMem，则返回空上下文（nullcontext），使用 PyTorch 默认分配器。
         if not self.vllm_config.model_config.enable_cumem_allocator:
             return nullcontext()
 
@@ -237,6 +294,14 @@ class Worker(WorkerBase):
 
     @instrument(span_name="Init device")
     def init_device(self):
+        # 中文注释：初始化 GPU 设备，是 Worker 生命周期的第一步。
+        # 主要流程：
+        #   1. 设置 CUDA 设备
+        #   2. 初始化分布式环境（NCCL 进程组等）
+        #   3. 设置随机种子
+        #   4. 拍摄初始显存快照，计算可用于 KV cache 的显存
+        #   5. 初始化工作区管理器
+        #   6. 构造 GPUModelRunner 实例
         if self.device_config.device_type == "cuda":
             # This env var set by Ray causes exceptions with graph building.
             os.environ.pop("NCCL_ASYNC_ERROR_HANDLING", None)
@@ -248,6 +313,9 @@ class Worker(WorkerBase):
                 and parallel_config.nnodes_within_dp == 1
             ):
                 # Use local DP rank if available, otherwise use global DP rank.
+                # 中文注释：在数据并行（DP）场景下，需要根据 DP rank 计算实际的 local_rank。
+                # 公式：local_rank = dp_local_rank * (tp_size * pp_size) + tp_local_rank
+                # 例如：2 节点 DP，每个节点 4 GPU，则 DP rank 0 占 GPU 0-3，DP rank 1 占 GPU 4-7。
                 dp_local_rank = self.parallel_config.data_parallel_rank_local
                 if dp_local_rank is None:
                     dp_local_rank = self.parallel_config.data_parallel_index
@@ -280,6 +348,9 @@ class Worker(WorkerBase):
             # memory snapshot
             # This ensures NCCL buffers are allocated before we measure
             # available memory
+            # 中文注释：必须先初始化分布式环境（包括 NCCL 通信缓冲区），
+            # 再拍摄显存快照。否则 NCCL 缓冲区的显存不会被计入已用内存，
+            # 导致后续 KV cache 分配时 OOM。
             init_worker_distributed_environment(
                 self.vllm_config,
                 self.rank,
@@ -299,6 +370,9 @@ class Worker(WorkerBase):
             torch.accelerator.empty_cache()
 
             # take current memory snapshot
+            # 中文注释：拍摄初始显存快照，记录当前可用显存总量。
+            # 这个快照用于计算 KV cache 可用的显存大小：
+            #   available_kv_cache = requested_memory - model_weights - activation - cudagraph
             self.init_snapshot = init_snapshot = MemorySnapshot(device=self.device)
             self.requested_memory = request_memory(init_snapshot, self.cache_config)
             logger.debug("worker init memory snapshot: %r", self.init_snapshot)
@@ -309,10 +383,14 @@ class Worker(WorkerBase):
             raise RuntimeError(f"Not support device type: {self.device_config.device}")
 
         # Initialize workspace manager
+        # 中文注释：初始化工作区管理器。num_ubatches=2 用于 DBO（Double Buffer Overlap）
+        # 模式，允许两个 micro-batch 交替执行以重叠通信和计算。
         num_ubatches = 2 if self.vllm_config.parallel_config.enable_dbo else 1
         init_workspace_manager(self.device, num_ubatches)
 
         # Construct the model runner
+        # 中文注释：根据配置选择 V1 或 V2 版本的 GPUModelRunner。
+        # GPUModelRunner 负责实际的模型前向推理、CUDA Graph 捕获、KV cache 操作等。
         if self.use_v2_model_runner:
             from vllm.v1.worker.gpu.model_runner import (
                 GPUModelRunner as GPUModelRunnerV2,
@@ -336,6 +414,14 @@ class Worker(WorkerBase):
     # FIXME(youkaichao & ywang96): Use TorchDispatchMode instead of memory pool
     # to hijack tensor allocation.
     def load_model(self, *, load_dummy_weights: bool = False) -> None:
+        # 中文注释：加载模型权重到 GPU 显存。
+        # 流程说明：
+        #   1. 进入 CuMem 内存池上下文（tag="weights"），使权重分配受 CuMem 管理
+        #   2. 设置当前 vLLM 配置，确保模型加载时使用正确的配置
+        #   3. 临时将 PyTorch 的 max_split_size_mb 设为 20MB，减少内存碎片
+        #      （模型加载过程中有很多大块分配，小的 max_split 可以减少碎片化）
+        #   4. 委托给 GPUModelRunner.load_model() 执行实际加载
+        #   5. 如果配置了权重传输引擎，则创建它（用于在线权重更新）
         with (
             self._maybe_get_memory_pool_context(tag="weights"),
             set_current_vllm_config(self.vllm_config),
@@ -344,6 +430,8 @@ class Worker(WorkerBase):
         ):
             self.model_runner.load_model(load_dummy_weights=load_dummy_weights)
 
+        # 中文注释：如果配置了权重传输（如在线 RLHF），创建权重传输引擎。
+        # 该引擎需要引用已加载的模型，因此必须在 load_model 之后创建。
         if self.vllm_config.weight_transfer_config is not None:
             self.weight_transfer_engine = WeightTransferEngineFactory.create_engine(
                 self.vllm_config.weight_transfer_config,

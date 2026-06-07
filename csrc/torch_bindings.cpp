@@ -1,3 +1,41 @@
+/**
+ * ============================================================
+ * torch_bindings.cpp - PyTorch C++ 算子绑定文件
+ * ============================================================
+ *
+ * 【文件功能概述】
+ * 本文件是 vLLM 的 PyTorch C++ 算子注册和绑定入口。
+ * 它将 C++/CUDA 实现的高性能算子注册到 PyTorch 的算子库中，
+ * 使得 Python 端可以直接调用这些底层实现，避免 Python 解释器开销。
+ *
+ * 【核心职责】
+ * 1. 算子声明：通过 ops.def() 定义算子的函数签名（输入输出类型）
+ * 2. 算子绑定：通过 ops.impl() 将签名与 C++ 实现函数关联
+ * 3. 模块组织：将算子按功能分组到不同的子模块（ops、cuda_utils、custom_ar）
+ * 4. 设备分发：指定算子在哪个设备上执行（CUDA、CPU）
+ *
+ * 【注册机制说明】
+ * - TORCH_LIBRARY_EXPAND：创建一个 PyTorch 扩展库，包含一组相关算子
+ * - ops.def("op_name(...) -> RetType")：定义算子签名，遵循 PyTorch 算子 schema
+ * - ops.impl("op_name", device, &func)：绑定具体实现
+ * - 同一个算子可以有多个签名（如 meta 函数用于 shape 推断）
+ *
+ * 【重要设计决策】
+ * - workspace 参数故意标记为不可变（immutable），因为它们在 kernel 执行后会清零
+ *   这样可以避免与 ScalarType 参数的冲突，使算子支持 torch.compile
+ * - 条件编译（#ifndef USE_ROCM）用于区分 CUDA 和 ROCm 特定的实现
+ *
+ * 【文件结构】
+ * 1. 头部包含和说明
+ * 2. 主算子库（vLLM custom ops）：激活函数、量化、融合算子等
+ * 3. CUDA 工具库（cuda_utils）：设备属性查询
+ * 4. 自定义 AllReduce 库（custom_ar）：分布式通信原语
+ *
+ * 【参考文档】
+ * - PyTorch 算子注册：https://docs.google.com/document/d/1_W62p8WJOQQUzPsJYa7s701JXt0qf2OfLub2sbkHOaU
+ * - ATen 算子 Schema：https://github.com/pytorch/pytorch/blob/main/aten/src/ATen/native/README.md#annotations
+ */
+
 // Provides torch::Tensor for ops.h (previously included transitively via
 // cache.h, which is no longer included here after cache ops moved to
 // _C_stable_libtorch).

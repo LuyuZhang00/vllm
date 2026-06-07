@@ -1,6 +1,24 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Attention layer with PagedAttention and Triton prefix prefill."""
+# ROCm AITER 统一注意力后端模块。
+#
+# 本模块实现了基于 AITER unified_attention 的 ROCm 注意力后端。
+# "统一"意味着 decode 和 prefill 使用同一个内核入口点，
+# 通过不同的参数配置来处理不同的注意力模式。
+#
+# 关键特性：
+# 1. 基于 RocmAttentionBackend/Impl 扩展，复用其元数据构建逻辑
+# 2. 使用 aiter.ops.triton.unified_attention 作为核心内核
+# 3. 支持所有注意力类型：DECODER、ENCODER、ENCODER_ONLY、ENCODER_DECODER
+# 4. 支持 FP8 量化查询输入
+# 5. 支持 RoPE 与 KV 缓存更新的融合操作
+# 6. 支持滑动窗口注意力和 sink token
+# 7. 不支持级联注意力（cascade attention）
+#
+# 与 rocm_aiter_fa.py 的区别：
+# - rocm_aiter_fa.py: 使用 flash_attn_varlen_func + paged_attention 的组合
+# - rocm_aiter_unified_attn.py: 使用 unified_attention 统一内核
 
 import torch
 
@@ -24,36 +42,50 @@ logger = init_logger(__name__)
 
 
 class RocmAiterUnifiedAttentionBackend(RocmAttentionBackend):
+    """ROCm AITER 统一注意力后端。
+
+    继承自 RocmAttentionBackend，使用 unified_attention 内核
+    替代默认的 paged_attention 内核。
+    """
+
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
+        """支持的块大小：16 的倍数。"""
         return [MultipleOf(16)]
 
     @classmethod
     def get_preferred_block_size(cls, default_block_size: int) -> int:
+        """首选块大小为 64。"""
         return 64
 
     @classmethod
     def supports_block_size(cls, block_size: int | None) -> bool:
+        """块大小必须是 16 的倍数。"""
         if block_size is None:
             return True
         return block_size % 16 == 0
 
     @classmethod
     def supports_head_size(cls, head_size: int) -> bool:
+        """支持的头维度 >= 32。"""
         return head_size >= 32
 
     @classmethod
     def supports_mm_prefix(cls) -> bool:
+        """支持多模态前缀。"""
         return True
 
     @classmethod
     def supports_sink(cls) -> bool:
+        """支持 sink token（注意力汇聚 token）。"""
         return True
 
     @classmethod
     def supports_non_causal(cls) -> bool:
+        """不支持非因果注意力。"""
         return False
 
+    # KV 缓存更新不包含在 forward 中（独立操作）
     forward_includes_kv_cache_update: bool = False
 
     @staticmethod
@@ -86,7 +118,9 @@ class RocmAiterUnifiedAttentionBackend(RocmAttentionBackend):
 
     @classmethod
     def supports_attn_type(cls, attn_type: str) -> bool:
-        """RocmAiterUnifiedAttention supports all attention types."""
+        """RocmAiterUnifiedAttention supports all attention types.
+        支持所有注意力类型：DECODER、ENCODER、ENCODER_ONLY、ENCODER_DECODER。
+        """
         return attn_type in (
             AttentionType.DECODER,
             AttentionType.ENCODER,
@@ -96,7 +130,14 @@ class RocmAiterUnifiedAttentionBackend(RocmAttentionBackend):
 
 
 class RocmAiterUnifiedAttentionImpl(RocmAttentionImpl):
+    """ROCm AITER 统一注意力实现。
+
+    使用 aiter.ops.triton.unified_attention 内核执行注意力计算。
+    继承自 RocmAttentionImpl，复用其大部分逻辑，替换核心注意力内核。
+    """
+
     def fused_output_quant_supported(self, quant_key: QuantKey):
+        """仅支持 FP8 静态张量对称量化作为融合输出量化。"""
         return quant_key == kFp8StaticTensorSym
 
     def __init__(
@@ -137,6 +178,12 @@ class RocmAiterUnifiedAttentionImpl(RocmAttentionImpl):
     def _split_kv_cache(
         self, kv_cache: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        """将组合 KV 缓存拆分为独立的 K 缓存和 V 缓存。
+
+        对于非 ENCODER_DECODER 类型，直接沿维度 1 拆分。
+        对于 ENCODER_DECODER 类型，使用 as_strided 重新解释内存布局，
+        因为编码器-解码器层可能与 ROCM_ATTN 解码器层共享同一块物理内存。
+        """
         if self.attn_type != AttentionType.ENCODER_DECODER:
             return kv_cache.unbind(1)
 
@@ -144,6 +191,9 @@ class RocmAiterUnifiedAttentionImpl(RocmAttentionImpl):
         # ROCM_ATTN decoder layers, whose physical layout is K/V first. Keep
         # this cross-attention path on that physical layout so block IDs do not
         # alias different bytes across the shared allocation.
+        # 注意：编码器-解码器层可能与 ROCM_ATTN 解码器层共享同一块物理内存，
+        # 其物理布局是 K/V 优先。保持交叉注意力路径在这种物理布局上，
+        # 以避免块 ID 在共享内存中产生字节别名。
         num_blocks, _, block_size, num_kv_heads, head_size = kv_cache.shape
         block_stride = block_size * num_kv_heads * head_size
         kv_cache = kv_cache.as_strided(
@@ -171,6 +221,11 @@ class RocmAiterUnifiedAttentionImpl(RocmAttentionImpl):
         output_block_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Forward pass with FlashAttention.
+        使用 AITER unified_attention 的前向传播。
+
+        处理流程：
+        1. 如果是编码器注意力，直接使用 Q/K/V 计算（无缓存）
+        2. 否则，从 KV 缓存中获取 K/V，调用 unified_attention 内核
 
         Args:
             query: shape = [num_tokens, num_heads, head_size]
@@ -263,6 +318,12 @@ class RocmAiterUnifiedAttentionImpl(RocmAttentionImpl):
         kv_cache: torch.Tensor,
         slot_mapping: torch.Tensor,
     ):
+        """更新 KV 缓存。将新的 K/V 存入分页缓存。
+
+        对于编码器注意力（ENCODER_ONLY、ENCODER），不需要更新缓存。
+        对于解码器注意力，使用 reshape_and_cache_flash 将 K/V
+        重塑并存入缓存的对应槽位。
+        """
         if self.attn_type in (AttentionType.ENCODER_ONLY, AttentionType.ENCODER):
             # For encoder attention,
             # we use direct Q, K, V tensors without caching
@@ -282,6 +343,11 @@ class RocmAiterUnifiedAttentionImpl(RocmAttentionImpl):
         )
 
     def fused_rope_kvcache_supported(self):
+        """检查是否支持 RoPE 与 KV 缓存更新的融合操作。
+
+        当 AITER 操作启用时支持融合，可以将 RoPE 位置编码计算
+        与 KV 缓存更新合并为一个内核，减少内核启动开销。
+        """
         return rocm_aiter_ops.is_enabled()
 
     def do_rope_and_kv_cache_update(
@@ -296,6 +362,14 @@ class RocmAiterUnifiedAttentionImpl(RocmAttentionImpl):
         kv_cache: torch.Tensor,
         layer_slot_mapping: torch.Tensor,
     ):
+        """融合执行 RoPE 位置编码和 KV 缓存更新。
+
+        将以下操作合并为单个内核调用：
+        1. 对 Q 和 K 应用 RoPE（旋转位置编码）
+        2. 将更新后的 K/V 存入分页 KV 缓存
+
+        对于编码器注意力，跳过此操作。
+        """
         if self.attn_type in (AttentionType.ENCODER_ONLY, AttentionType.ENCODER):
             # For encoder attention,
             # we use direct Q, K, V tensors without caching

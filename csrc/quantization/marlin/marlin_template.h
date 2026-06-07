@@ -19,6 +19,40 @@
  * Adapted from https://github.com/IST-DASLab/marlin
  */
 
+// =============================================================================
+// 中文注释: Marlin 量化 GEMM Kernel 核心实现
+// =============================================================================
+// 本文件实现了 Marlin 量化矩阵乘法的 CUDA kernel，是整个 Marlin 库的核心。
+//
+// 算法概述:
+//   Marlin 是一种专门为量化权重矩阵设计的高性能 GEMM 实现。
+//   核心思想是将量化权重 B 从全局内存加载到共享内存，反量化后与激活 A
+//   通过 Tensor Core 进行矩阵乘法。
+//
+// 主要优化技术:
+//   1. 多级异步流水线 (Multi-stage Async Pipeline):
+//      - 使用 cp_async 指令从全局内存异步加载到共享内存
+//      - 4 个流水线阶段 (Ampere+) 或 2 个 (Turing) 实现计算与加载重叠
+//
+//   2. Tensor Core 利用:
+//      - 使用 ldmatrix 指令从共享内存加载到 Tensor Core fragment
+//      - 使用 mma.sync 指令执行 16x16x16 矩阵乘法累加
+//
+//   3. Stripe 分区 (Striped Partitioning):
+//      - B 矩阵按 stripe 模式分配给不同 SM，确保负载均衡
+//      - 同一 stripe 的多个列 slice 由同一个 thread block 处理
+//
+//   4. 全局归约:
+//      - 当多个 thread block 处理同一列 slice 时，使用 locks 进行同步
+//      - 支持 atomicAdd 或 FP32 临时缓冲区两种归约方式
+//
+//   5. 权重反量化优化:
+//      - 支持多种量化格式 (4-bit/8-bit, 对称/非对称, grouped/channel-wise)
+//      - 通过 dequant.h 中的模板实现编译期优化
+//
+// kernel 参数通过模板在编译期确定，运行时参数通过 MARLIN_KERNEL_PARAMS 传递。
+// =============================================================================
+
 #ifndef MARLIN_NAMESPACE_NAME
   #define MARLIN_NAMESPACE_NAME marlin
 #endif
@@ -78,6 +112,10 @@ __global__ void Marlin(
 
 // Instruction for loading a full 16x16 matrix fragment of operand A from shared
 // memory, directly in tensor core layout.
+// 中文注释: 从共享内存加载 A 矩阵 fragment 到 Tensor Core 寄存器
+// 使用 ldmatrix.sync.aligned 指令，直接从共享内存加载到 Tensor Core 的 fragment 布局
+// count 参数决定加载的 fragment 数量 (1, 2, 或 4 个 8x8 子块)
+// 这条指令是 Tensor Core 矩阵乘法的关键步骤之一
 template <int count, vllm::ScalarTypeId type_id>
 __device__ inline void ldsm(typename MarlinScalarType<type_id>::FragA& frag_a,
                             const void* smem_ptr) {
@@ -103,6 +141,10 @@ __device__ inline void ldsm(typename MarlinScalarType<type_id>::FragA& frag_a,
 
 // Multiply dequantized values by the corresponding quantization scale; used
 // only for grouped quantization.
+// 中文注释: 对反量化后的 B fragment 乘以量化缩放因子
+// 用于 grouped quantization 场景，每个 group 有独立的 scale
+// frag_b 包含反量化后的权重值，frag_s 包含对应的缩放因子
+// 使用 __hmul2 进行 half2 向量化乘法，同时处理 2 个元素
 template <vllm::ScalarTypeId type_id>
 __device__ inline void scale(typename MarlinScalarType<type_id>::FragB& frag_b,
                              typename MarlinScalarType<type_id>::FragS& frag_s,
@@ -174,6 +216,10 @@ __device__ inline void scale_float(
 }
 
 // Wait until barrier reaches `count`, then lock for current threadblock.
+// 中文注释: 屏障获取 -- 等待直到 lock 计数器达到指定值
+// 用途: 多个 thread block 处理同一列 slice 时的同步
+// 流程: thread 0 轮询检查 lock 值，其他线程等待 __syncthreads
+// 使用 ld.global.acquire.gpu 保证内存可见性
 __device__ inline void barrier_acquire(int* lock, int count) {
   if (threadIdx.x == 0) {
     int state = -1;
@@ -189,6 +235,10 @@ __device__ inline void barrier_acquire(int* lock, int count) {
 }
 
 // Release barrier and increment visitation count.
+// 中文注释: 屏障释放 -- 释放锁并递增访问计数
+// 用途: 通知其他 thread block 当前 block 已完成本 slice 的处理
+// 使用 red.relaxed.gpu.global.add.s32 原子递增 lock 值
+// reset=true 时重置 lock 为 0 (用于最后一轮)
 __device__ inline void barrier_release(int* lock, bool reset = false) {
   __syncthreads();
   if (threadIdx.x == 0) {
@@ -279,6 +329,26 @@ __global__ void Marlin(
   // ensures good utilization of all SMs for many kinds of shape and GPU
   // configurations, while requiring as few slow global cross-threadblock
   // reductions as possible.
+  //
+  // 中文注释: Marlin kernel 主体函数
+  //
+  // Stripe 分区策略:
+  //   B 矩阵的 N 维度被分成多个 slice (每个 slice 宽 16*thread_n_blocks)
+  //   不同的 thread block 以 stripe 模式处理这些 slice，例如:
+  //     slice 0: block 0
+  //     slice 1: block 0, block 1
+  //     slice 2: block 1, block 2
+  //     ...
+  //   这种方式确保所有 SM 都能被充分利用，同时最小化跨 block 归约
+  //
+  // 主循环流程:
+  //   1. fetch_to_shared: 通过 cp_async 将 A, B, scale 从全局内存异步加载到共享内存
+  //   2. __syncthreads: 等待加载完成
+  //   3. ldsm: 从共享内存加载 A fragment 到寄存器
+  //   4. dequant + scale: 反量化 B fragment 并乘以缩放因子
+  //   5. mma.sync: Tensor Core 矩阵乘法累加 frag_c += frag_a @ frag_b
+  //   6. 重复步骤 1-5 直到 K 维度处理完毕
+  //   7. write_result: 将 frag_c 写回全局内存 (可能需要归约)
 
   #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 890
   // FP8 computation is only supported for Ada Lovelace or newer architectures.
@@ -839,6 +909,12 @@ __global__ void Marlin(
   };
   // Asynchronously fetch the next A, B and s tile from global to the next
   // shared memory pipeline location.
+  // 中文注释: 异步加载函数 -- 将 A, B, scale 从全局内存加载到共享内存的指定 pipeline 阶段
+  // 这是流水线优化的第一步，通过 cp_async 实现计算与加载的重叠
+  // 参数:
+  //   pipe: 目标 pipeline 阶段 (0 ~ stages-1)
+  //   a_off: A 矩阵的偏移量 (用于跨 tile 迭代)
+  //   pred: 谓词，用于边界检查 (最后一个 tile 可能不满)
   auto fetch_to_shared = [&](int pipe, int a_off, bool pred = true) {
     if (pred) {
       int4* sh_a_stage = sh_a + a_sh_stage * pipe;
@@ -921,6 +997,10 @@ __global__ void Marlin(
   };
 
   // Wait until the next thread tile has been loaded to shared memory.
+  // 中文注释: 等待共享内存加载完成
+  // 使用 cp_async_wait<stages-2> 等待最早的 pipeline 阶段完成
+  // stages-2 而非 stages-1 是因为使用了双缓冲 (double buffering)
+  // __syncthreads 确保所有线程都看到加载完成的数据
   auto wait_for_stage = [&]() {
     // We only have `stages - 2` active fetches since we are double buffering
     // and can only issue the next fetch when it is guaranteed that the previous
@@ -932,6 +1012,10 @@ __global__ void Marlin(
 
   // Load the next sub-tile from the current location in the shared memory pipe
   // into the current register buffer.
+  // 中文注释: 从共享内存加载数据到寄存器
+  // 这是流水线优化的第二步，将共享内存中的数据加载到 Tensor Core 的 fragment 寄存器中
+  // 使用 ldsm 指令加载 A fragment，直接读取加载 B fragment
+  // k 参数用于双缓冲索引 (k%2 交替使用两个寄存器 buffer)
   auto fetch_to_registers = [&](int k, int pipe) {
     int4* sh_a_stage = sh_a + a_sh_stage * pipe;
   #pragma unroll
@@ -1403,6 +1487,10 @@ __global__ void Marlin(
   // number of warps while keeping the n dimension of a tile reasonable, we have
   // multiple warps that accumulate their partial sums of the same output
   // location; which we have to reduce over in the end. We do in shared memory.
+  // 中文注释: Thread block 内的归约操作
+  // 当多个 warp 处理同一输出位置的不同 K 维度切片时，需要将它们的部分和归约
+  // 使用对数级并行归约 (parallel logarithmic reduction) 在共享内存中完成
+  // 时间复杂度 O(log N)，其中 N 是参与归约的 warp 数
   auto thread_block_reduce = [&]() {
     constexpr int red_off = threads / b_sh_stride_threads / 2;
     if (red_off >= 1) {

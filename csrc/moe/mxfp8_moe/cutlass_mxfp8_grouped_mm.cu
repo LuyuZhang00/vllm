@@ -3,6 +3,30 @@
 // Adapted from SGLang:
 // https://github.com/sgl-project/sglang/blob/ded068a76e00878881d52d5bfb791e0f60d7311b/sgl-kernel/csrc/expert_specialization/es_sm100_mxfp8_blockscaled.cu
 
+// =============================================================================
+// 中文注释：MXFP8 分组矩阵乘法（MoE 专家计算）入口文件
+//
+// 本文件实现了基于 CUTLASS 的 MXFP8（Microscaling FP8）分组矩阵乘法，
+// 用于 MoE 模型中多个专家的批量矩阵乘法计算。
+//
+// MXFP8 量化方案：
+// - 激活和权重使用 FP8 格式（E4M3 或 E5M2）
+// - 每个 128 元素块共享一个缩放因子（blockscale）
+// - 通过 blockscale 实现更细粒度的量化，比 per-tensor 量化精度更高
+//
+// 算法：使用 CUTLASS 的 grouped GEMM 实现，一次调用处理所有专家的矩阵乘法。
+// 输入：
+//   a: [num_tokens, k] — 激活（FP8）
+//   b: [num_experts, k, n] — 专家权重（FP8）
+//   sfa/sfb: 激活和权重的 blockscale 因子
+//   problem_sizes: [num_experts, 3] — 每个专家的 (m, n, k) 尺寸
+//   expert_offsets: [num_experts] — 每个专家在 token 维度上的偏移
+// 输出：
+//   d: [num_tokens, n] — 矩阵乘法结果（bf16/fp16）
+//
+// 要求：SM >= 100（Blackwell 架构），k 和 n 必须对齐到 128。
+// =============================================================================
+
 #include <torch/all.h>
 
 #include "cutlass_mxfp8_grouped_mm_launcher.cuh"

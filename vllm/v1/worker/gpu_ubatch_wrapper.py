@@ -1,5 +1,29 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+#
+# =============================================================================
+# 模块概述: UBatch Wrapper (micro-batch 包装器)
+# =============================================================================
+# 本模块实现了一个将单个大 batch 拆分成多个 micro-batch (ubatch) 并行执行的包装层。
+#
+# 核心设计思想:
+#   1. 当一个 forward pass 包含大量 token 时，将其拆分成多个较小的 ubatch，
+#      每个 ubatch 在独立的 CUDA stream 和线程上并行执行模型前向传播。
+#   2. 这种拆分使得计算 (compute) 和通信 (communication, 如 MoE all-to-all)
+#      可以重叠执行，从而提高 GPU 利用率和整体吞吐量。
+#   3. 同时支持 CUDA graph 捕获：对首次执行的特定 token 数量形状进行 graph 捕获，
+#      后续相同形状的执行可以直接 replay 已捕获的 graph，避免 kernel launch 开销。
+#
+# 主要组件:
+#   - UBatchWrapper: 核心包装类，管理 ubatch 拆分、并行执行、CUDA graph 捕获/重放
+#   - SMControlContextManager: SM (Streaming Multiprocessor) 资源分配管理，
+#     在计算和通信之间动态分配 GPU 计算单元
+#   - UbatchMetadata / CUDAGraphMetaData: 元数据结构体
+#
+# 与上层的交互:
+#   - GPUModelRunner 调用模型 forward 时，如果启用了 ubatching，会经过此包装层
+#   - ForwardContext 中的 ubatch_slices 决定了如何拆分 batch
+# =============================================================================
 
 import threading
 from collections.abc import Callable
@@ -43,6 +67,10 @@ def _cat_ubatch_outputs(
     matching shapes and the caller receives the same structure the model
     produced for a single ubatch (#40769).
     """
+    # 中文注释: 将多个 ubatch 的模型输出沿 batch 维度拼接起来。
+    # 大多数模型每个 ubatch 返回单个 hidden-states tensor，直接 torch.cat 即可。
+    # 但某些模型（如 EAGLE3 推测解码）会返回 tuple 形式的辅助输出，
+    # 此时需要对 tuple 中的每个分量分别进行拼接，保持输出结构一致。
     if sorted_results and isinstance(sorted_results[0], tuple):
         return tuple(torch.cat(parts, dim=0) for parts in zip(*sorted_results))
     return torch.cat(sorted_results, dim=0)
@@ -50,6 +78,17 @@ def _cat_ubatch_outputs(
 
 @dataclass
 class UbatchMetadata:
+    """中文注释: 单个 ubatch (micro-batch) 的元数据。
+
+    每个 ubatch 包含:
+    - context: ubatch 上下文，管理该 ubatch 的 CUDA stream、forward context、
+      线程同步等信息
+    - input_ids / positions / inputs_embeds: 模型输入的切片数据，
+      由原始 batch 按 token_slice 切分而来
+    - intermediate_tensors: 中间张量（如 pipeline parallel 场景下的中间激活），
+      按 token_slice 切分
+    - num_tokens: 该 ubatch 中包含的 token 数量
+    """
     context: UBatchContext
     input_ids: torch.Tensor
     positions: torch.Tensor
@@ -60,12 +99,33 @@ class UbatchMetadata:
 
 @dataclass
 class CUDAGraphMetaData:
+    """中文注释: CUDA graph 捕获后的元数据。
+
+    用于缓存已捕获的 CUDA graph 及其关联信息:
+    - cudagraph: 已捕获的 CUDA graph 对象，后续可通过 replay() 快速重放
+    - ubatch_metadata: 捕获时使用的 ubatch 元数据
+    - outputs: 捕获时产生的输出 tensor 引用（CUDA graph 重放时直接使用此引用）
+    """
     cudagraph: torch.cuda.CUDAGraph
     ubatch_metadata: UbatchMetadata
     outputs: Any | None = None
 
 
 class SMControlContextManager:
+    """中文注释: SM (Streaming Multiprocessor) 资源分配上下文管理器。
+
+    背景: 在使用专家并行 (Expert Parallelism) 的 MoE 模型中，GPU 需要同时执行:
+      - 计算 (compute): 矩阵乘法、注意力计算等
+      - 通信 (communication): MoE 的 all-to-all 专家分发通信
+    两者都使用 GPU 的 SM 资源。如果不加控制，通信 kernel 可能占用过多 SM，
+    导致计算 kernel 无法充分利用 GPU。
+
+    设计思路:
+      - 进入上下文时: 将 SM 分为两部分，comm_sms 个 SM 用于通信，
+        total_sms - comm_sms 个 SM 用于计算
+      - 退出上下文时: 恢复所有 SM 用于计算或通信（不加限制）
+    这样可以确保 ubatch 执行期间计算和通信都能获得合理的 SM 资源。
+    """
     def __init__(
         self,
         comm_sms: int,
@@ -92,25 +152,48 @@ class SMControlContextManager:
             "SM/CU control is supported on CUDA and ROCm platforms"
         )
         device = torch.accelerator.current_device_index()
+        # 中文注释: 获取当前 GPU 设备的总 SM 数量
         total_sms = num_compute_units(device)
 
         assert comm_sms < total_sms
         self.total_sms = total_sms
+        # 中文注释: 计算 SM = 总 SM - 通信 SM，确保计算有足够的资源
         self.compute_sms = total_sms - comm_sms
         self.comm_sms = comm_sms
         self.set_comm_sms = set_comm_sms
         self.set_compute_sms = set_compute_sms
 
     def __enter__(self):
+        # 中文注释: 进入上下文时，按比例分配 SM 给通信和计算
         self.set_comm_sms(self.comm_sms)
         self.set_compute_sms(self.compute_sms)
 
     def __exit__(self, exc_type, exc_value, traceback):
+        # 中文注释: 退出上下文时，恢复所有 SM 可用于任意用途
         self.set_comm_sms(self.total_sms)
         self.set_compute_sms(self.total_sms)
 
 
 class UBatchWrapper:
+    """中文注释: UBatch (micro-batch) 包装器，核心类。
+
+    职责:
+    1. 将一个大的 forward batch 拆分成多个较小的 ubatch 并行执行
+    2. 管理 ubatch 的 CUDA stream、线程同步和 forward context
+    3. 支持 CUDA graph 捕获和重放，提升重复执行效率
+    4. 集成 SM 控制，协调计算和通信的 GPU 资源分配
+
+    工作原理:
+    - 当 ForwardContext 中存在 ubatch_slices 时，说明需要拆分执行
+    - 每个 ubatch 在独立线程 + 独立 CUDA stream 上运行模型 forward
+    - 通过 threading.Barrier 同步所有 ubatch 线程的就绪状态
+    - 所有 ubatch 完成后，在主线程中拼接输出
+
+    CUDA graph 支持:
+    - 首次遇到某个 num_tokens 形状时，捕获 CUDA graph 并缓存
+    - 后续相同形状的执行直接 replay 已捕获的 graph
+    - graph 捕获在 SM 控制上下文中进行，确保计算/通信 SM 比例正确
+    """
     def __init__(
         self,
         runnable: Callable,
@@ -118,23 +201,31 @@ class UBatchWrapper:
         runtime_mode: CUDAGraphMode,
         device: torch.cuda.device,
     ):
+        # 中文注释: runnable 是实际执行模型 forward 的可调用对象（通常是 ModelRunner 的方法）
         self.runnable = runnable
         self.vllm_config = vllm_config
         self.compilation_config = vllm_config.compilation_config
+        # 中文注释: 专用的通信 CUDA stream，用于 ubatch 间的通信操作（如 MoE all-to-all）
         self.comm_stream = torch.cuda.Stream(device=device)
-        # Ubatch threads plus the main thread
+        # 中文注释: 线程同步屏障，确保所有 ubatch 线程都初始化好 CUDA context 后再开始执行。
+        # num_ubatches 个 ubatch 线程 + 主线程 = num_ubatches + 1
         self.ready_barrier = threading.Barrier(
             self.vllm_config.parallel_config.num_ubatches + 1
         )
 
+        # 中文注释: 缓存已捕获的 CUDA graph，key 为 num_tokens（batch 中的总 token 数），
+        # value 为 CUDA graph 及其元数据。相同 num_tokens 形状的后续执行可以直接 replay。
         self.cudagraphs: dict[int, CUDAGraphMetaData] = {}
 
+        # 中文注释: 如果启用了 CUDA graph 模式（FULL 或 PIECEWISE），创建 CUDAGraphWrapper
+        # 用于处理非 ubatch 路径（即不需要拆分时）的 CUDA graph 捕获/重放
         self.cudagraph_wrapper = None
         if runtime_mode is not CUDAGraphMode.NONE:
             self.cudagraph_wrapper = CUDAGraphWrapper(
                 runnable, vllm_config, runtime_mode=runtime_mode
             )
 
+        # 中文注释: 创建 SM 控制上下文管理器，用于在 ubatch 执行期间动态分配计算/通信 SM 资源
         self.sm_control = self._create_sm_control_context(vllm_config)
         self.device = device
         self.is_debugging_mode = envs.VLLM_LOGGING_LEVEL == "DEBUG"
@@ -142,17 +233,38 @@ class UBatchWrapper:
 
     @property
     def graph_pool(self):
+        # 中文注释: 获取 CUDA graph 的内存池。
+        # 如果存在 cudagraph_wrapper 则使用其 graph pool，否则使用平台默认的。
+        # graph pool 是 CUDA 提供的专用内存区域，graph 捕获时的内存分配都在此池中进行，
+        # 使得 replay 时可以快速复用相同的内存地址。
         if self.cudagraph_wrapper is not None:
             return self.cudagraph_wrapper.graph_pool
         return None
 
     def clear_graphs(self) -> None:
+        # 中文注释: 清除所有已缓存的 CUDA graph。
+        # 当模型权重更新或配置变化时需要调用此方法，因为旧的 graph 不再有效。
         self.cudagraphs.clear()
         if self.cudagraph_wrapper is not None:
             self.cudagraph_wrapper.clear_graphs()
 
     @staticmethod
     def _create_sm_control_context(vllm_config: VllmConfig):
+        """中文注释: 创建 SM 控制上下文管理器。
+
+        流程:
+        1. 从环境变量读取通信 SM 数量 (VLLM_DBO_COMM_SMS)
+        2. 如果启用了专家并行 (EP)，获取 DeepEP all2all 管理器，
+           并将其最大 SM 使用数作为通信 SM 的上限
+        3. 创建回调函数：通信 SM 数量由 all2all_manager 控制，
+           计算 SM 数量由 DeepGEMM 控制
+        4. 返回配置好的 SMControlContextManager 实例
+
+        为什么需要 SM 控制:
+        - MoE 模型的 all-to-all 通信和计算共享 GPU SM 资源
+        - 如果不限制，通信 kernel 可能占用过多 SM，导致计算 kernel 延迟
+        - 通过 SM 分配，可以让计算和通信各自获得稳定、合理的 SM 资源份额
+        """
         comm_sms: int = envs.VLLM_DBO_COMM_SMS
 
         set_comm_sms = lambda sms: None

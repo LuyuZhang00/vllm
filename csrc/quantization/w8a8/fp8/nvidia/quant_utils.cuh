@@ -1,5 +1,37 @@
 #pragma once
 
+// =============================================================================
+// 中文注释: NVIDIA GPU FP8 量化/反量化工具
+// =============================================================================
+// 本文件实现了 NVIDIA GPU 上 FP8 数据类型的类型转换工具函数。
+//
+// 核心功能:
+//   1. vec_conversion<Tout, Tin>(): 无缩放因子的向量化类型转换
+//      - 支持 FP8 <-> half/bf16/float 之间的相互转换
+//      - 支持打包格式: fp8x2 (uint16), fp8x4 (uint32), fp8x8 (uint2)
+//      - 利用 NVIDIA 硬件指令 __nv_cvt_* 实现高效转换
+//
+//   2. scaled_vec_conversion<Tout, Tin>(): 带缩放因子的向量化类型转换
+//      - 量化: HP / scale -> FP8
+//      - 反量化: FP8 * scale -> HP
+//      - 用于动态量化场景，每个 group/channel 有独立的缩放因子
+//
+//   3. convert/scaled_convert: 模板分发接口
+//      - 根据 Fp8KVCacheDataType 枚举选择 E4M3 或 E5M2 格式
+//      - 用于 KV cache 的 FP8 存储
+//
+//   4. DISPATCH_BY_KV_CACHE_DTYPE: 宏分发器
+//      - 根据源数据类型和 KV cache 数据类型自动选择正确的模板实例化
+//
+// 支持的数据类型组合:
+//   输入: float, half (uint16), bfloat16, float2, Float4_, Float8_
+//   输出: 同上 + uint8_t (FP8 标量), uint16_t (FP8x2), uint32_t (FP8x4)
+//
+// 硬件要求:
+//   - FP8 转换需要 SM >= 80 (Ampere/SM80+ 的 __nv_fp8 类型)
+//   - 部分模板特化在 SM < 80 时会被禁用 (通过 __CUDA_ARCH__ 检查)
+// =============================================================================
+
 #include "../../../../attention/attention_dtypes.h"
 #include <torch/headeronly/core/ScalarType.h>
 #include <assert.h>
@@ -13,6 +45,7 @@ namespace vllm {
 namespace fp8 {
   #ifdef ENABLE_FP8
 
+// 中文注释: vec_conversion 默认模板 -- 同类型转换直接返回 (零开销)
 template <typename Tout, typename Tin>
 __inline__ __device__ Tout vec_conversion(
     const Tin& x, const __nv_fp8_interpretation_t fp8_type = __NV_E4M3) {
@@ -20,6 +53,10 @@ __inline__ __device__ Tout vec_conversion(
 }
 
 // float -> c10::Float8_e4m3fn
+// 中文注释: float 到 FP8 的标量转换
+// - SM >= 80: 使用硬件指令 __nv_cvt_float_to_fp8，带饱和截断 (__NV_SATFINITE)
+// - SM < 80: 退化为 PyTorch 的软件实现
+// __NV_SATFINITE 表示超出范围的值被截断到 FP8 的最大/最小可表示值
 template <>
 __inline__ __device__ c10::Float8_e4m3fn
 vec_conversion<c10::Float8_e4m3fn, float>(
@@ -298,6 +335,16 @@ __inline__ __device__ bf16_8_t vec_conversion<bf16_8_t, Float8_>(
      Dequant(FP8) * scale =>  HP
  */
 
+// =============================================================================
+// 中文注释: 带缩放因子的向量化类型转换接口
+// =============================================================================
+// 约定:
+//   量化: FP8 = Quantize(HP / scale) -- 高精度除以缩放因子后量化
+//   反量化: HP = Dequant(FP8) * scale -- FP8 反量化后乘以缩放因子
+//
+// 默认模板: 同类型直接返回 (用于 kAuto 模式，即不做 FP8 转换)
+// =============================================================================
+
 template <typename Tout, typename Tin>
 __inline__ __device__ Tout scaled_vec_conversion(
     const Tin& x, const float scale, const __nv_fp8_interpretation_t fp8_type) {
@@ -513,6 +560,10 @@ __inline__ __device__ float4 scaled_vec_conversion<float4, uint32_t>(
 }
   #endif  // ENABLE_FP8
 
+// 中文注释: 根据 KV cache 数据类型分发的无缩放转换接口
+// 用于 KV cache 使用 FP8 存储时的数据类型转换
+// 参数 kv_dt 决定使用 E4M3 还是 E5M2 格式
+// 注意: 当前代码被 #if 0 禁用以减小二进制大小
 template <typename Tout, typename Tin, Fp8KVCacheDataType kv_dt>
 __inline__ __device__ Tout convert(const Tin& x) {
   #if 0  // Disable the following code to reduce the binary size.
@@ -526,6 +577,9 @@ __inline__ __device__ Tout convert(const Tin& x) {
   __builtin_unreachable();  // Suppress missing return statement warning
 }
 
+// 中文注释: 根据 KV cache 数据类型分发的带缩放转换接口
+// 用于 KV cache 使用 FP8 + per-token 缩放因子的场景
+// 典型流程: 写入 KV cache 时量化 (HP / scale -> FP8)，读取时反量化 (FP8 * scale -> HP)
 template <typename Tout, typename Tin, Fp8KVCacheDataType kv_dt>
 __inline__ __device__ Tout scaled_convert(const Tin& x, const float scale) {
   #ifdef ENABLE_FP8
@@ -543,6 +597,11 @@ __inline__ __device__ Tout scaled_convert(const Tin& x, const float scale) {
   // the data type of the key and value cache. The FN is a macro that calls a
   // function with template<typename scalar_t, typename cache_t,
   // Fp8KVCacheDataType kv_dt>.
+  // 中文注释: KV cache 数据类型分发宏
+  // 根据源数据类型 (float/half/bf16) 和 KV cache 数据类型 (Auto/E4M3/E5M2)
+  // 自动选择正确的模板实例化
+  // 使用方式: DISPATCH_BY_KV_CACHE_DTYPE(src_dtype, kv_dtype, my_kernel_func)
+  // 其中 my_kernel_func 必须是一个接受 <scalar_t, cache_t, kv_dt> 模板参数的宏
   #define DISPATCH_BY_KV_CACHE_DTYPE(SRC_DTYPE, KV_DTYPE, FN)                  \
     vllm::Fp8KVCacheDataType KV_CACHE_DTYPE =                                  \
         vllm::get_fp8_kv_cache_data_type(KV_DTYPE);                            \

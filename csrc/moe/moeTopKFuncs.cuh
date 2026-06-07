@@ -17,6 +17,28 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+
+// =============================================================================
+// 中文注释：MoE Warp 级 Top-K 归约工具库
+//
+// 本文件提供了一组高效的 warp 级 Top-K 归约原语，用于在 MoE 路由算子中
+// 从一组候选专家中选出得分最高的 K 个专家。
+//
+// 核心设计思想：
+// 1. 使用 CUB 的 TwiddleIn/TwiddleOut 技巧将浮点数编码为可直接比较的整数，
+//    同时将索引打包到低位中，实现"值+索引"的单次比较。
+// 2. 利用 warp 内 __shfl_xor_sync 进行 butterfly reduction，无需 shared memory。
+// 3. 支持 K=1 到 K=4 的小 K 值高效特化路径，以及 N>4 候选数的多轮归约路径。
+//
+// 被调用位置：
+// - grouped_topk_kernels.cu 中的 grouped_topk_fused_kernel 和
+//   grouped_topk_fused_small_expert_count_kernel
+//
+// 模板参数说明：
+// - K: 需要选出的 top-k 个数
+// - N: 每个线程持有的候选数量（通常 1~4）
+// - Type: 数据类型（float, half, bfloat16）
+// =============================================================================
 #pragma once
 
 #include <cooperative_groups.h>

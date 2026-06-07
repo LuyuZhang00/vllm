@@ -1,5 +1,33 @@
 // copied and adapted from https://github.com/ggerganov/llama.cpp/blob/b2899/ggml-cuda/vecdotq.cuh
 // and https://github.com/ggerganov/llama.cpp/blob/b2899/ggml-cuda/mmq.cu
+
+// =============================================================================
+// 中文注释: GGUF 量化向量点积辅助函数
+// =============================================================================
+// 本文件提供了 GGUF 量化格式的向量点积计算所需的辅助函数。
+//
+// 主要功能:
+//   1. get_int_b2/b4: 从不同对齐方式的内存中读取 int32
+//      - get_int_b2: 2 字节对齐，需要两次 uint16 读取后组合
+//      - get_int_b4: 4 字节对齐，直接读取 int32
+//
+//   2. get_int_from_int8/uint8: 从 int8/uint8 数组中读取 int32
+//      - 支持对齐和非对齐两种版本
+//      - 非对齐版本需要两次 uint16 读取
+//      - 对齐版本直接读取 int32
+//
+//   3. vec_dot_q_*: 各种量化格式的向量点积函数
+//      - vec_dot_q4_0/1: 4-bit 量化向量点积
+//      - vec_dot_q5_0/1: 5-bit 量化向量点积
+//      - vec_dot_q8_0/1: 8-bit 量化向量点积
+//      - vec_dot_q_K: K-quant 格式向量点积
+//
+// 设计说明:
+//   - 对齐读取比非对齐读取快，但要求数据地址是 4 字节对齐的
+//   - VDR (Vec Dot Ratio) 决定每个线程处理的连续整数数量
+//   - 使用 __dp4a 指令 (SM71+) 加速 INT8 点积计算
+// =============================================================================
+
 static __device__ __forceinline__ int get_int_b2(const void * x, const int & i32) {
     const uint16_t * x16 = (const uint16_t *) x; // assume at least 2 byte alignment
 

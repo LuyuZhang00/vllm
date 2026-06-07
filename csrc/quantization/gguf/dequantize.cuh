@@ -1,4 +1,30 @@
 // copied and adapted from https://github.com/ggerganov/llama.cpp/blob/b2899/ggml-cuda/convert.cu
+
+// =============================================================================
+// 中文注释: GGUF 量化格式反量化函数
+// =============================================================================
+// 本文件实现了各种 GGUF 量化格式的设备端反量化函数。
+// 每个函数将一个量化的 block 反量化为 half2 (2 个半精度浮点值)。
+//
+// 反量化公式:
+//   - 对称量化 (Q4_0, Q5_0, Q8_0): result = (quant_val - offset) * scale
+//   - 非对称量化 (Q4_1, Q5_1, Q8_1): result = quant_val * scale + min
+//
+// 参数说明:
+//   vx: 指向量化数据的指针
+//   ib: block 索引 (第几个 block)
+//   iqs: block 内的量化值索引 (第几个 int32)
+//   v: 输出的 half2 向量 (2 个反量化后的值)
+//
+// 各格式说明:
+//   Q4_0: 4-bit 对称量化，每 32 个值一个 block，block = {d, qs[16]}
+//   Q4_1: 4-bit 非对称量化，block = {dm, qs[16]}，dm = (delta, min)
+//   Q5_0: 5-bit 对称量化，block = {d, qh[4], qs[16]}
+//   Q5_1: 5-bit 非对称量化，block = {dm, qh[4], qs[16]}
+//   Q8_0: 8-bit 对称量化，block = {d, qs[32]}
+//   Q8_1: 8-bit 非对称量化，block = {dm, qs[32]}
+// =============================================================================
+
 // Dequant functions
 static __device__ __forceinline__ void dequantize_q4_0(const void * vx, const int ib, const int iqs, dfloat2 & v){
     const block_q4_0 * x = (const block_q4_0 *) vx;

@@ -1,3 +1,25 @@
+// =============================================================================
+// 中文注释：MoE WNA16 量化 GEMM kernel 实现文件
+//
+// 本文件实现了 WNA16 (Weight-Only N-bit with 16-bit activation) 量化 MoE
+// 矩阵乘法 kernel。
+//
+// WNA16 量化方案：
+// - 权重使用 N-bit 整数存储（N=4 或 2），激活使用 16-bit（bf16/fp16）
+// - 权重按组量化，每 group_size 个权重共享一个 scale 和 zero_point
+// - 推理时先将量化权重反量化为 16-bit，再与激活做矩阵乘法
+//
+// 核心算法（moe_wna16_gemm_kernel）：
+// 1. 每个 block 处理一个 (block_size_m, block_size_n) 的输出子块
+// 2. 从 sorted_token_ids 获取本 block 处理的 token 索引
+// 3. 从 expert_ids 获取本 block 对应的专家 ID
+// 4. 将输入激活加载到 shared memory（按反量化后的权重布局排列）
+// 5. 按 block_size_k 分块遍历 K 维度，加载量化权重并反量化
+// 6. 使用 FMA 指令累加结果
+// 7. 将结果写入输出（可选乘以 topk_weights）
+//
+// 依赖：moe_wna16_utils.h（提供 ScalarType 转换工具）
+// =============================================================================
 
 #include <torch/all.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -10,6 +32,26 @@
 
 #define DIVIDE(x, size) (((x) + (size) - 1) / (size))
 
+// 中文注释：moe_wna16_gemm_kernel —— WNA16 量化 MoE 矩阵乘法 kernel。
+// 模板参数：
+//   scalar_t: 激活数据类型（half 或 bfloat16）
+//   bit: 量化位宽（4 或 2）
+//   GROUPS: 每个 uint32 中包含的量化组数（32/bit）
+//
+// 线程组织：
+//   gridDim.x = num_blocks_m（token 分块数）
+//   gridDim.y = num_blocks_n（输出维度分块数）
+//   gridDim.z = num_blocks_k（输入维度分块数）
+//   blockDim.x = BLOCK_SIZE_N（每线程处理一个输出元素）
+//
+// 算法流程：
+// 1. 加载 BLOCK_SIZE_M x BLOCK_SIZE_K 的输入激活到 shared memory
+//    （按反量化后的权重布局重新排列，便于后续计算）
+// 2. 按 BLOCK_SIZE_K 分块遍历 K 维度：
+//    a. 加载量化权重（uint32）到寄存器
+//    b. 反量化为 scalar_t 类型
+//    c. 与 shared memory 中的激活做点积累加
+// 3. 将结果写入输出（可选乘以 topk_weights）
 template <typename scalar_t, int bit, int GROUPS>
 __global__ void moe_wna16_gemm_kernel(
     const scalar_t* __restrict__ input, scalar_t* __restrict__ output,

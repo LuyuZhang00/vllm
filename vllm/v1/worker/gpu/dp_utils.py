@@ -1,5 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+"""
+数据并行（Data Parallelism, DP）与 CUDA Graph 协调工具模块。
+
+在数据并行模式下，多个 GPU 各自处理批次的不同部分。为了确保
+CUDA Graph 的正确性，所有 DP 排名必须使用相同形状的 CUDA Graph。
+
+本模块提供两个关键功能：
+1. sync_cudagraph_and_dp_padding: 在所有 DP 排名间同步批次描述符和填充
+2. dispatch_cg_and_dp_padding: 调度 CUDA Graph 并同步 DP 排名
+
+协调策略：
+- 所有排名必须使用相同的 CUDA Graph 模式（取最小值 = 最严格模式）
+- token 数取所有排名中的最大值（不足的排名需要填充）
+- 统一 token 计数如果不一致则设为 None
+"""
 from __future__ import annotations
 
 import torch
@@ -22,10 +38,30 @@ def sync_cudagraph_and_dp_padding(
     dp_size: int,
     dp_rank: int,
 ) -> tuple[BatchExecutionDescriptor, torch.Tensor | None]:
-    """
-    Coordinates the batch descriptor and DP padding across all ranks.
+    """在所有 DP 排名间协调批次描述符和 DP 填充。
 
-    Returns (synced_batch_desc, num_tokens_across_dp).
+    使用 all_reduce 收集所有排名的 token 数、CG 模式和统一 token 计数，
+    然后选择一致的策略。
+
+    协调规则：
+    1. CG 模式取所有排名的最小值（最严格模式）
+    2. 如果任何排名需要 eager 模式，所有排名都使用 eager
+    3. token 数取所有排名的最大值（不足的需要填充）
+    4. 统一 token 计数不一致时设为 None
+
+    参数:
+        cudagraph_manager: CUDA Graph 管理器（profile 阶段可为 None）
+        desired_batch_desc: 本排名期望的批次描述符
+        num_tokens: 本排名的 token 数
+        num_reqs: 本排名的请求数
+        uniform_token_count: 本排名的统一 token 计数
+        dp_size: DP 总排名数
+        dp_rank: 当前 DP 排名
+
+    返回:
+        (synced_batch_desc, num_tokens_across_dp):
+        - 同步后的批次描述符
+        - 所有 DP 排名的 token 数张量（或 None，如果所有排名的 token 数为 0）
     """
     assert dp_size > 1, "DP size must be greater than 1"
     group = get_dp_group().cpu_group
@@ -45,9 +81,10 @@ def sync_cudagraph_and_dp_padding(
         )
         return synced_desc, None
 
+    # CG 模式取最小值 = 最严格模式
     synced_cg_mode = CUDAGraphMode(int(cg_mode_across_dp.min().item()))
 
-    # If any rank wants to run eager, all ranks run eager
+    # 如果任何排名需要 eager，所有排名都使用 eager
     if synced_cg_mode == CUDAGraphMode.NONE:
         return BatchExecutionDescriptor(
             cg_mode=CUDAGraphMode.NONE,
@@ -59,21 +96,21 @@ def sync_cudagraph_and_dp_padding(
         "cudagraph_manager should only be None during profile run, "
         "where synced_cg_mode must be NONE across all DP ranks"
     )
+    # token 数取最大值（不足的排名需要填充）
     synced_num_tokens = int(num_tokens_across_dp.max().item())
     synced_uniform_token_count = uniform_token_counts_across_dp[0]
-    # If ranks disagree on the uniform token count, or its 0 (means None) set to None
+    # 如果排名间不一致或为 0（表示 None），设为 None
     if synced_uniform_token_count == 0 or not torch.all(
         uniform_token_counts_across_dp == synced_uniform_token_count
     ):
         synced_uniform_token_count = None
 
-    # Dispatch for the final synced values, use num_reqs instead of synced_num_reqs
-    # so we don't perform request padding for PIECEWISE graphs
+    # 使用同步后的值调度 CUDA Graph
     synced_desc = cudagraph_manager.dispatch(
         num_reqs, synced_num_tokens, synced_uniform_token_count
     )
 
-    # Update num_tokens_across_dp to reflect padded size.
+    # 更新 num_tokens_across_dp 以反映填充后的大小
     num_tokens_across_dp[:] = synced_desc.num_tokens
 
     return synced_desc, num_tokens_across_dp
@@ -88,6 +125,24 @@ def dispatch_cg_and_sync_dp(
     dp_rank: int,
     need_eager: bool = False,
 ) -> tuple[BatchExecutionDescriptor, torch.Tensor | None]:
+    """调度 CUDA Graph 并同步 DP 排名。
+
+    这是对外的高层接口，结合了 CUDA Graph 调度和 DP 同步两个步骤。
+
+    参数:
+        cudagraph_manager: CUDA Graph 管理器（profile 阶段可为 None）
+        num_reqs: 请求数量
+        num_tokens: token 数量
+        uniform_token_count: 统一的每请求 token 数
+        dp_size: DP 总排名数
+        dp_rank: 当前 DP 排名
+        need_eager: 是否强制使用 eager 模式
+
+    返回:
+        (batch_desc, num_tokens_across_dp):
+        - 批次执行描述符
+        - 所有 DP 排名的 token 数张量（DP_SIZE=1 时为 None）
+    """
     if need_eager:
         batch_desc = BatchExecutionDescriptor(
             cg_mode=CUDAGraphMode.NONE,

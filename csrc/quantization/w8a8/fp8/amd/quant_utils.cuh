@@ -1,4 +1,27 @@
 #pragma once
+
+// =============================================================================
+// 中文注释: AMD GPU (ROCm/HIP) FP8 量化/反量化工具
+// =============================================================================
+// 本文件实现了 AMD GPU 上 FP8 数据类型的类型转换工具函数。
+// 与 nvidia/quant_utils.cuh 提供相同的接口，但使用 HIP 指令实现。
+//
+// 核心功能 (与 NVIDIA 版本对齐):
+//   1. cvt_c10<fp8_type>(float): float 到 FP8 的硬件转换
+//      - Float8_e4m3fn: 使用 __hip_cvt_float_to_fp8 (ROCm 6.3+)
+//      - Float8_e4m3fnuz: 使用 __hip_cvt_float_to_fp8 (FNUZ 变体)
+//      - ROCm 6.2 退化: 使用 PyTorch 的软件实现
+//
+//   2. vec_conversion/scaled_vec_conversion: 向量化类型转换
+//      - 与 NVIDIA 版本相同的接口和语义
+//      - 使用 HIP 的 __hip_cvt_* 指令族
+//
+// AMD FP8 类型说明:
+//   - OCP 标准 (ROCm 6.3+): __hip_fp8_e4m3 (对应 NVIDIA 的 __nv_fp8_e4m3)
+//   - FNUZ 变体: __hip_fp8_e4m3_fnuz (MI300 等旧架构使用)
+//   - 通过 HIP_FP8_TYPE_OCP 宏区分
+// =============================================================================
+
 #include <hip/hip_fp8.h>
 
 #include <hip/hip_fp16.h>

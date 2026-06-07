@@ -1,3 +1,25 @@
+// =============================================================================
+// 模块功能概述: 激活函数量化 CUDA Kernel
+// =============================================================================
+// 本文件实现了 fused 激活函数 + 量化的 CUDA kernel，主要用于 MoE (Mixture of Experts)
+// 场景下的 SwiGLU 激活函数与 FP8 量化的融合计算。
+//
+// 核心功能:
+//   1. SiLU (Swish) 激活函数与门控乘法的融合计算: output = SiLU(gate) * up
+//   2. 计算结果直接量化为 FP8 格式 (E4M3)，减少显存占用和数据搬运开销
+//   3. 支持 per-token 的动态缩放因子，保证量化精度
+//
+// 典型应用场景:
+//   - MoE 模型中 Expert 的 FFN 层，gate_proj 和 up_proj 的输出经 SiLU 门控后
+//     直接量化为 FP8，再传给 down_proj，避免中间结果以高精度存储
+//   - DeepGemm 风格的 fused SiLU+Mul+Quant kernel，支持多专家批量处理
+//
+// 关键设计:
+//   - 使用 128-bit 向量化加载 (int4) 提升内存带宽利用率
+//   - gridDim.y 维度实现多 block 并行处理单个 token 的不同 hidden 维度段
+//   - 支持 NVIDIA GPU (CUDA) 和 AMD GPU (ROCm/HIP) 双平台
+// =============================================================================
+
 #include <ATen/cuda/CUDAContext.h>
 #include <torch/all.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -11,6 +33,8 @@
 
 #include <c10/util/Float8_e4m3fn.h>
 
+// 平台适配: NVIDIA 使用 cuda 头文件，AMD 使用 hip 头文件，
+// 并通过 typedef 统一类型名称，使后续 kernel 代码可以跨平台复用。
 #ifndef USE_ROCM
   #include <cuda_bf16.h>
   #include <cuda_fp16.h>
@@ -36,12 +60,30 @@ typedef __hip_fp8x4_e4m3_fnuz __nv_fp8x4_e4m3;
 #include "core/registration.h"
 namespace vllm {
 
+// 中文注释: SiLU (Swish) 激活函数的设备端实现
+// SiLU(x) = x * sigmoid(x) = x / (1 + exp(-x))
+// 这是 GLU 变体 (如 SwiGLU) 中常用的激活函数
 template <typename T>
 __device__ __forceinline__ T silu_kernel(const T& x) {
   // x * sigmoid(x)
   return (T)(((float)x) / (1.0f + expf((float)-x)));
 }
 
+// 中文注释: 融合激活函数 + 门控乘法 + FP8 量化的通用 kernel 模板
+//
+// 功能: 对输入 [..., 2, d] 执行 act_fn(x[0:d]) * x[d:2d] 并量化为 FP8
+// 输入布局: input 的最后一维是 2d，前半部分是 gate，后半部分是 up
+// 输出: 量化后的 FP8 结果 [..., d]
+//
+// 线程映射策略:
+//   - gridDim.x = num_tokens (每个 block 处理一个 token)
+//   - gridDim.y = 1/2/4 (根据 token 数量动态调整，用于将 hidden dim 分段并行)
+//   - blockDim.x = min(d, 512)
+//
+// 向量化策略:
+//   - 使用 128-bit (int4) 向量化加载 input 数据，每次加载 128/sizeof(scalar_t) 个元素
+//   - 输出使用 64-bit (int2) 写入，因为 FP8 元素宽度是输入的一半
+//   - 对齐处理后剩余的标量部分单独处理 (scalar cleanup code)
 // Activation and gating kernel template.
 template <typename scalar_t, scalar_t (*ACT_FN)(const scalar_t&),
           typename fp8_type>
@@ -113,14 +155,18 @@ __global__ void act_and_mul_quant_kernel(
   }
 }
 
+// 中文注释: SiLU 激活函数的 float 标量版本，使用快速除法指令
 __device__ __forceinline__ float silu(float x) {
   return __fdividef(x, (1.f + expf(-x)));
 }
 
+// 中文注释: SiLU 的 float2 向量化版本，同时处理 2 个元素以提升吞吐
 __device__ __forceinline__ float2 silu2(float2 x) {
   return make_float2(silu(x.x), silu(x.y));
 }
 
+// 中文注释: SiLU 的 bfloat162 向量化版本
+// 先在 float 精度下计算 SiLU，再转换为 bfloat16 存储
 __device__ __forceinline__ __nv_bfloat162 silu2_v2(float2 x) {
 #ifndef USE_ROCM
   return make_bfloat162(__float2bfloat16_rn(silu(x.x)),
@@ -130,6 +176,8 @@ __device__ __forceinline__ __nv_bfloat162 silu2_v2(float2 x) {
 #endif
 }
 
+// 中文注释: Warp 内归约求最大值，用于计算 per-group 的动态量化缩放因子
+// 通过 __shfl_xor_sync 实现 butterfly reduction，每个 warp (32 线程) 协作求最大值
 #ifndef USE_ROCM
 __device__ __forceinline__ float warp_max(float v) {
   static constexpr unsigned FULL_MASK = 0xffffffffu;
@@ -148,6 +196,12 @@ __device__ __forceinline__ __nv_bfloat16 warp_max(__nv_bfloat16 v) {
 }
 #endif
 
+// 中文注释: 异步内存拷贝辅助函数 (用于 pipeline 优化)
+// cp_async4: 从全局内存异步拷贝 16 字节 (128-bit) 到共享内存
+// cp_async_fence: 提交异步拷贝组 (commit_group)
+// cp_async_wait<N>: 等待前 N 个异步拷贝组完成
+// 这些函数在 SM >= 80 (Ampere) 时使用硬件异步拷贝指令，
+// 在旧架构上退化为普通同步拷贝
 template <typename T, typename U>
 __device__ __forceinline__ void cp_async4(T* _smem_ptr, const U* _glob_ptr) {
 #if __CUDACC_VER_MAJOR__ >= 11 && __CUDA_ARCH__ >= 800
@@ -275,6 +329,32 @@ __device__ __forceinline__ void token_bounds(int32_t n_tokens,
   }
 }
 
+// 中文注释: DeepGemm 风格的 fused SiLU + Mul + FP8 量化 kernel
+//
+// 功能概述:
+//   针对 MoE 模型设计，将 SiLU 激活、门控乘法、FP8 量化三个操作融合为一个 kernel。
+//   输入形状: (E, T, 2*H) -- E 个专家，T 个 token，每个 token 有 gate 和 up 两部分
+//   输出形状: (E, T, H) -- 量化后的 FP8 结果，以及对应的缩放因子
+//
+// 关键设计:
+//   1. 使用 persistent kernel 模式: 固定启动 BLOCK_COUNT 个 thread block，
+//      每个 block 通过 token_bounds 计算自己负责的 token 范围
+//   2. 使用多级 pipeline (NUM_STAGES) 实现计算与加载重叠:
+//      - 共享内存中维护多个 stage 的加载缓冲区
+//      - cp_async 异步加载与计算交替执行
+//   3. 每个 warp 负责 hidden dim 的一段，通过 warp_expert_search
+//      在共享内存中查找当前 token 所属的 expert
+//   4. 支持 UE8M0 格式的缩放因子打包存储 (4 个 scale 打包到一个 int32)
+//
+// 参数说明:
+//   _input: 输入张量 (E, T, 2*H)，bfloat16 格式
+//   _y_q: 输出量化张量 (E, T, H)，FP8 格式
+//   _y_s: 输出缩放因子，支持 float32 或 packed UE8M0 格式
+//   tokens_per_expert: 每个专家分配到的 token 数量
+//   E/T/H: 专家数、token 数、隐藏维度的一半
+//   CEIL_UE8M0: 是否对缩放因子做 ceil(2^(ceil(log2(scale)))) 取整
+//   GROUP_SIZE: 量化分组大小，默认 128
+//   NUM_STAGES: pipeline 阶段数
 template <int BLOCK_COUNT, int SMEM_SIZE_BYTES_Y, typename fp8_type,
           typename scale_t, int THREADS, typename Idx_t, bool CEIL_UE8M0,
           int GROUP_SIZE = 128, int NUM_STAGES = 3>
@@ -563,6 +643,16 @@ __global__ void silu_mul_fp8_quant_deep_gemm_kernel(
 
 }  // namespace vllm
 
+// =============================================================================
+// 中文注释: 以下为 Python/C++ 绑定层，负责参数校验和 kernel 启动
+// =============================================================================
+
+// 中文注释: 通用的激活函数 + 门控 + 量化 kernel 启动宏
+// 根据 token 数量动态调整 grid 维度:
+//   - token 数 > 32: gridDim.y = 1 (每个 token 一个 block，隐藏维度不拆分)
+//   - token 数 16~32: gridDim.y = 2 (每个 token 两个 block，隐藏维度拆成 2 段)
+//   - token 数 < 16: gridDim.y = 4 (每个 token 4 个 block，隐藏维度拆成 4 段)
+// 这样做的目的是: 当 batch 较小时，通过拆分隐藏维度来充分利用 GPU SM
 // Launch activation, gating, and quantize kernel.
 #define LAUNCH_ACTIVATION_GATE_KERNEL(KERNEL)                               \
   int d = input.size(-1) / 2;                                               \
@@ -583,6 +673,10 @@ __global__ void silu_mul_fp8_quant_deep_gemm_kernel(
             });                                                             \
       });
 
+// 中文注释: SiLU + 门控乘法 + FP8 量化的 Python 绑定函数
+// 输入: input [..., 2*d] (前半 gate，后半 up)
+// 输出: out [..., d] (FP8 量化结果)
+// 该函数适用于通用的 SiLU*Up 门控激活场景
 void silu_and_mul_quant(torch::Tensor& out,    // [..., d]
                         torch::Tensor& input,  // [..., 2 * d]
                         torch::Tensor& scale) {
@@ -594,6 +688,19 @@ void silu_and_mul_quant(torch::Tensor& out,    // [..., d]
   LAUNCH_ACTIVATION_GATE_KERNEL(vllm::silu_kernel);
 }
 
+// 中文注释: DeepGemm 风格的 persistent SiLU + Mul + FP8 量化函数 (MoE 专用)
+//
+// 功能: 专门针对 MoE 模型的批量 SiLU 门控激活 + FP8 量化
+// 输入: input (E, T, 2*H) -- E 个专家，每个专家 T 个 token，隐藏维度 2*H
+//        tokens_per_expert (E) -- 每个专家实际分配到的 token 数量
+// 输出: y_q (E, T, H) -- FP8 量化结果
+//        y_s (E, T, H//group_size) -- 量化缩放因子
+//
+// 与 silu_and_mul_quant 的区别:
+//   1. 使用 persistent kernel 模式，固定 SM 数量启动，由 kernel 内部调度 token
+//   2. 支持多专家批量处理，通过 tokens_per_expert 进行 masked 计算
+//   3. 支持 UE8M0 格式的缩放因子打包 (用于 MXFP4/FP8 格式)
+//   4. 仅支持 NVIDIA GPU (SM >= 80)
 void persistent_masked_m_silu_mul_quant(
     const at::Tensor& input,              // (E, T, 2*H)
     const at::Tensor& tokens_per_expert,  // (E)

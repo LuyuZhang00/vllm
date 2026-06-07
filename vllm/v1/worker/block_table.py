@@ -1,6 +1,59 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+"""
+block_table.py — 块表（Block Table）模块
+
+=============================================================
+【核心职责】
+=============================================================
+本模块是 vLLM V1 GPU Model Runner 与 KV Cache Manager 之间的桥梁。
+它维护了"逻辑 block → 物理 block"的映射表（block table），
+并负责计算 slot mapping（槽位映射），供 Attention Kernel 使用。
+
+=============================================================
+【关键概念】
+=============================================================
+1. Block Table（块表）：
+   - 二维表格，形状为 [max_num_reqs, max_num_blocks_per_req]。
+   - 每一行对应一个请求，记录该请求所占用的物理 KV block ID 序列。
+   - 这是 PagedAttention 的核心数据结构——Attention Kernel 通过块表
+     将 token 的逻辑位置翻译为 KV cache 在显存中的物理位置。
+
+2. Slot Mapping（槽位映射）：
+   - 一维数组，形状为 [max_num_batched_tokens]。
+   - 每个元素是一个 "slot ID"，表示该 token 对应的 KV cache 物理槽位。
+   - slot_id = block_table[row, block_index] * block_size + offset_in_block。
+   - Attention Kernel 写入/读取 KV cache 时，直接用 slot_mapping 索引。
+
+3. Hybrid Block（混合块）：
+   - 当 KV cache 分配的 block_size 与 Attention Kernel 使用的 kernel_block_size
+     不一致时（例如分配 32-token block，kernel 使用 16-token block），
+     需要将一个分配块拆成多个内核块。map_to_kernel_blocks() 负责此转换。
+
+4. Context Parallel（CP，上下文并行）：
+   - 当使用 context parallelism 时，不同 rank 负责同一序列的不同位置。
+   - slot mapping 计算时需要判断当前 token 是否属于本 rank，
+     不属于本 rank 的 token 会被填充为 PAD_SLOT_ID。
+
+=============================================================
+【整体数据流】
+=============================================================
+Scheduler 分配 block IDs
+    → BlockTable.append_row() / add_row() 记录映射（CPU 端）
+    → BlockTable.commit_block_table() 将块表同步到 GPU
+    → BlockTable.compute_slot_mapping() 计算 slot mapping（GPU 端 Triton kernel）
+    → Attention Kernel 使用 slot_mapping 读写 KV cache
+
+=============================================================
+【类层次】
+=============================================================
+- BlockTable：单个 KV cache 组的块表，处理一组 block_size 的映射。
+- MultiGroupBlockTable：当模型有多种 KV cache 组（如混合注意力）时，
+  统一管理多个 BlockTable 实例，对外提供一致的接口。
+=============================================================
+"""
+
 import numpy as np
 import torch
 
@@ -18,11 +71,35 @@ logger = init_logger(__name__)
 class BlockTable:
     """
     块表类，用于管理 KV 缓存的块映射关系。
-    
+
     该类维护了一个二维表格，记录每个请求使用的块 ID 列表，
     并提供槽位映射计算功能，用于注意力机制中快速定位 KV 缓存。
     """
-    
+
+    # 中文注释：
+    # 【BlockTable 核心职责详解】
+    #
+    # BlockTable 是 vLLM V1 中连接 Scheduler/KV Cache Manager 和
+    # Attention Kernel 的关键数据结构。
+    #
+    # 核心数据结构：
+    #   block_table: [max_num_reqs, max_num_blocks_per_req] 的二维表
+    #     - 第 i 行存储第 i 个请求的物理 block ID 列表
+    #     - 例如 row[0] = [5, 12, 37] 表示请求 0 的前 3 个逻辑 block
+    #       分别映射到物理 block 5、12、37
+    #
+    #   slot_mapping: [max_num_batched_tokens] 的一维数组
+    #     - 存储当前 batch 中每个 token 对应的 KV cache 槽位 ID
+    #     - Attention Kernel 通过这个数组直接定位 K/V 在显存中的位置
+    #
+    # 工作流程：
+    #   1. Scheduler 调用 KV Cache Manager 为请求分配 block IDs
+    #   2. Model Runner 调用 add_row()/append_row() 将 block IDs 写入块表
+    #   3. 调用 commit_block_table() 将 CPU 端数据同步到 GPU
+    #   4. 调用 compute_slot_mapping() 在 GPU 上用 Triton kernel 计算
+    #      每个 token 的 slot ID
+    #   5. Attention Kernel 使用 slot_mapping 读写 KV cache
+
     def __init__(
         self,
         block_size: int,
@@ -36,7 +113,13 @@ class BlockTable:
     ):
         """
         初始化块表。
-        
+
+        # 中文注释：
+        # 初始化过程包含以下几个关键步骤：
+        #   步骤 1：确定 block_size 和 hybrid block 模式
+        #   步骤 2：创建 block_table 和 slot_mapping 的 CPU-GPU 双缓冲区
+        #   步骤 3：初始化上下文并行（CP）相关参数
+
         Args:
             block_size: Block size used for KV cache memory allocation
                 KV 缓存内存分配的块大小
@@ -58,6 +141,10 @@ class BlockTable:
             cp_kv_cache_interleave_size: Context parallel KV cache interleave size.
                 上下文并行 KV 缓存交错大小
         """
+        # 【步骤 1】确定 block_size 以及是否需要 hybrid block 模式
+        # KV Cache Manager 分配 block 时使用 block_size（例如 32 tokens），
+        # 但 Attention Kernel 可能使用不同的 kernel_block_size（例如 16 tokens）。
+        # 两者相同时直接映射；不同时需要将一个分配块拆成多个内核块。
         self.max_num_reqs = max_num_reqs
         self.max_num_batched_tokens = max_num_batched_tokens
         self.pin_memory = pin_memory
@@ -89,13 +176,30 @@ class BlockTable:
             self.blocks_per_kv_block = block_size // kernel_block_size
             self.use_hybrid_blocks = True
 
+        # 中文注释：
+        # 当使用 hybrid block 模式时，max_num_blocks_per_req 需要乘以
+        # blocks_per_kv_block。例如原来每个请求最多 100 个 32-token block，
+        # 拆分后变成 200 个 16-token kernel block。
         self.max_num_blocks_per_req = max_num_blocks_per_req * self.blocks_per_kv_block
 
+        # 【步骤 2】创建核心数据结构的 CPU-GPU 双缓冲区
+        #
+        # block_table: 二维表 [max_num_reqs, max_num_blocks_per_req]
+        #   - CPU 端（numpy）由 Scheduler/Model Runner 写入 block IDs
+        #   - GPU 端由 Attention Kernel 读取
+        #   - commit_block_table() 负责 CPU → GPU 同步
+        #
+        # num_blocks_per_row: 记录每行实际有多少个有效 block
+        #   - 纯 CPU 端的元数据，用于 append_row() 追加时定位写入位置
         self.block_table = self._make_buffer(
             self.max_num_reqs, self.max_num_blocks_per_req, dtype=torch.int32
         )
         self.num_blocks_per_row = np.zeros(max_num_reqs, dtype=np.int32)
 
+        # slot_mapping: 一维数组 [max_num_batched_tokens]
+        #   - 存储当前 batch 中每个 token 对应的 KV cache 槽位 ID
+        #   - 由 compute_slot_mapping() 中的 Triton kernel 计算
+        #   - Attention Kernel 通过 slot_mapping 向指定槽位写入/读取 K/V
         self.slot_mapping = self._make_buffer(
             self.max_num_batched_tokens, dtype=torch.int64
         )

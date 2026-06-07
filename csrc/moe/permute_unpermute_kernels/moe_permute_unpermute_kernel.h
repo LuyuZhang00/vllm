@@ -1,3 +1,29 @@
+// =============================================================================
+// 中文注释：MoE Token 排列/反排列 kernel 头文件
+//
+// 本头文件声明了 MoE token 排列和反排列操作所需的函数和类：
+//
+// 1. CubKeyValueSorter —— CUB radix sort 封装类。
+//    用于将 (expert_id, token_index) 对排序，使得同一专家的 token 连续存放。
+//    内部维护了 keys_out/values_out 缓冲区和 num_bits_ 参数。
+//
+// 2. sortAndScanExpert —— 排列 + 前缀和计算函数。
+//    使用 CubKeyValueSorter 对 token 按专家排序，然后计算每个专家的
+//    token 起始偏移（expert_first_token_offset）。
+//
+// 3. expandInputRowsKernelLauncher —— token 排列 kernel。
+//    将输入 token 按排序后的顺序复制到输出缓冲区。
+//    同时记录逆排列索引（inv_permuted_idx），用于后续 unpermute。
+//
+// 4. finalizeMoeRoutingKernelLauncher —— token 反排列 + 加权求和 kernel。
+//    将专家输出还原到原始 token 顺序，并按 topk_weights 加权求和。
+//
+// 5. preprocessTopkIdLauncher —— 专家 ID 预处理函数。
+//    当使用 expert parallelism 时，将全局专家 ID 映射为本地专家 ID。
+//
+// 实际 kernel 实现在 moe_permute_unpermute_kernel.inl 文件中。
+// =============================================================================
+
 #pragma once
 // reference from tensorrt_llm moe kernel implementation archive in
 // https://github.com/BBuf/tensorrt-llm-moe/tree/master

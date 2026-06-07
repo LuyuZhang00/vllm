@@ -2,6 +2,27 @@
 
 #include "core/registration.h"
 
+// =============================================================================
+// 中文注释: AWQ Marlin 权重重排 kernel
+// =============================================================================
+// 本文件实现了将 AWQ (Activation-aware Weight Quantization) 格式的
+// 量化权重转换为 Marlin 内部格式的 kernel。
+//
+// AWQ 与 GPTQ 的区别:
+//   - AWQ 不使用列重排 (perm)，权重按原始顺序存储
+//   - AWQ 使用激活感知的量化策略，对重要通道使用更细粒度的缩放因子
+//   - 因此 repack 时不需要处理 perm，流程更简单
+//
+// 重排流程:
+//   1. 从全局内存读取 AWQ 格式的权重 tile
+//   2. 将权重按 Marlin 的 tile 布局写回全局内存
+//   3. 使用多阶段异步流水线优化
+//
+// 与 gptq_marlin_repack.cu 的区别:
+//   - 没有 perm 参数 (has_perm=false)
+//   - 权重布局略有不同
+// =============================================================================
+
 namespace marlin {
 
 template <int const num_threads, int const num_bits, bool is_a_8bit>

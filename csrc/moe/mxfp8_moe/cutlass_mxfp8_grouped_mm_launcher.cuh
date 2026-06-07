@@ -3,6 +3,17 @@
 // Adapted from SGLang:
 // https://github.com/sgl-project/sglang/blob/ded068a76e00878881d52d5bfb791e0f60d7311b/sgl-kernel/csrc/expert_specialization/es_sm100_mxfp8_blockscaled_launcher.cuh
 
+// =============================================================================
+// 中文注释：MXFP8 分组矩阵乘法 CUTLASS 启动器
+//
+// 本文件是 MXFP8 分组 GEMM 的 CUTLASS 启动器，负责：
+// 1. 预计算每个专家的指针偏移、步长、布局等元数据
+// 2. 调用 CUTLASS 的 grouped GEMM 实现
+//
+// 使用 CUTLASS 的 CuTe 抽象进行张量布局和步长计算。
+// 依赖 cutlass_mxfp8_grouped_mm_functor.cuh 和 cutlass_mxfp8_grouped_mm_traits.cuh。
+// =============================================================================
+
 #pragma once
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>

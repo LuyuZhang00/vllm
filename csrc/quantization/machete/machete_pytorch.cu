@@ -4,6 +4,30 @@
 
 #include "core/registration.h"
 
+// =============================================================================
+// 中文注释: Machete 量化 GEMM 的 Python/C++ 绑定层
+// =============================================================================
+// Machete 是另一种高性能量化 GEMM 实现，与 Marlin 类似但有不同的优化策略。
+// 本文件提供 Machete 的 Python 绑定接口。
+//
+// 主要功能:
+//   1. supported_schedules(): 查询当前硬件支持的调度策略列表
+//   2. mm(): 执行量化矩阵乘法 C = A @ B_dequant
+//   3. prepack_B(): 预处理权重矩阵 B 为 Machete 的内部格式
+//
+// 与 Marlin 的区别:
+//   - Machete 使用 CUTLASS 库的模板化 GEMM 实现
+//   - 支持更多的量化格式和缩放策略 (group/channel/token scales)
+//   - 通过 schedule 参数选择不同的 tile/mma 配置
+//   - 需要预先 pack 权重矩阵
+//
+// 支持的缩放策略:
+//   - group_scales: per-group 缩放因子 (grouped quantization)
+//   - group_zeros: per-group 零点 (非对称量化)
+//   - channel_scales: per-channel 缩放因子 (用于权重的每列缩放)
+//   - token_scales: per-token 缩放因子 (用于激活的每行缩放)
+// =============================================================================
+
 namespace machete {
 
 using namespace vllm;

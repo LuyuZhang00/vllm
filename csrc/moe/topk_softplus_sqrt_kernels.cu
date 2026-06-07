@@ -17,6 +17,26 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+
+// =============================================================================
+// 中文注释：MoE Top-K Softplus-Sqrt 路由 kernel 实现文件
+//
+// 本文件实现了 DeepSeek V2/V3 等模型使用的 softplus-sqrt 路由激活函数 + top-k 选择。
+//
+// 与 softmax/sigmoid 路由的区别：
+// - softplus(x) = log(1 + exp(x))，比 softmax 更平滑，适合稀疏路由
+// - sqrt(softplus(x)) 进一步压缩数值范围，提高路由稳定性
+// - 支持 correction_bias（校正偏置），用于微调路由决策
+// - 支持 routed_scaling_factor，对最终权重进行缩放
+//
+// 支持两种路径：
+// 1. Hash MoE 路径（USE_HASH=true）：通过 tid2eid 查找表直接获取专家索引，
+//    无需进行 top-k 搜索。适用于预先确定路由的场景。
+// 2. 标准路径（USE_HASH=false）：与 topk_softmax_kernels.cu 类似的
+//    融合 softplus-sqrt + top-k 选择。
+//
+// 与 topk_softmax_kernels.cu 的设计类似，针对专家数为 2 的幂次做了模板特化。
+// =============================================================================
 #include <type_traits>
 #include <torch/all.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -79,6 +99,19 @@ __device__ __forceinline__ float toFloat(T value) {
   work for any k.
 */
 
+// 中文注释：topkGatingSoftplusSqrt —— 融合的 softplus-sqrt + top-k 选择 kernel。
+// 与 topkGating（topk_softmax_kernels.cu）类似，但使用 softplus-sqrt 激活函数。
+//
+// 算法流程：
+// 1. 从全局内存加载 gating_output 到寄存器（向量化加载）
+// 2. 对每个值计算 softplus(x) = log(1 + exp(x))，数值稳定版本：
+//    当 x > threshold 时，softplus(x) ≈ x（避免 exp 溢出）
+// 3. 计算 sqrt(softplus(x))，得到最终得分
+// 4. 可选加 correction_bias
+// 5. 通过 butterfly reduction 在 warp 内找 top-k
+// 6. 输出 topk_weights 和 topk_indices
+//
+// Hash MoE 路径：跳过 top-k 搜索，直接从 tid2eid 查找表获取专家索引。
 template <int VPT, int NUM_EXPERTS, int WARPS_PER_CTA, int BYTES_PER_LDG,
           int WARP_SIZE_PARAM, bool USE_HASH, typename IndType,
           typename InputType = float>

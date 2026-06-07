@@ -19,6 +19,33 @@
  * Adapted from https://github.com/IST-DASLab/marlin
  */
 
+// =============================================================================
+// 中文注释: Marlin 量化 GEMM 主入口文件
+// =============================================================================
+// 本文件是 Marlin 量化矩阵乘法的 Python/C++ 绑定层和 kernel 调度逻辑。
+//
+// 整体流程:
+//   1. marlin_gemm(): Python 绑定入口，参数校验和数据准备
+//   2. marlin_mm(): 核心调度函数，选择最优 kernel 配置并启动
+//   3. permute_cols_kernel(): 列重排 kernel (activation reordering)
+//   4. determine_exec_config(): 自动选择最优的线程配置
+//   5. get_marlin_kernel(): 根据参数选择具体的 Marlin kernel 实例
+//
+// 支持的量化格式:
+//   - W4A16: 4-bit 权重 + 16-bit 激活 (FP16/BF16)
+//   - W8A16: 8-bit 权重 + 16-bit 激活
+//   - W4A8: 4-bit 权重 + 8-bit 激活 (FP8/INT8)
+//   - 支持 grouped quantization (per-group scale/zero-point)
+//   - 支持 activation reordering (act_order) 提升量化精度
+//
+// 关键设计:
+//   - 自动配置选择: 根据矩阵形状和 GPU 能力自动选择最优的
+//     thread_m_blocks, thread_n_blocks, thread_k_blocks 配置
+//   - 分块处理: 当 M 维度较大时，拆分为多个 block 并行处理
+//   - 列重排: 支持 act_order 模式，通过 permute_cols_kernel 对 A 矩阵列重排
+//   - SM 版本适配: Turing (SM75) 使用 2 阶段 pipeline，Ampere+ 使用 4 阶段
+// =============================================================================
+
 #ifndef MARLIN_NAMESPACE_NAME
   #define MARLIN_NAMESPACE_NAME marlin
 #endif
@@ -65,6 +92,19 @@ torch::Tensor marlin_gemm(
 
 // For a given "a" of size [M,K] performs a permutation of the K columns based
 // on the given "perm" indices.
+// 中文注释: 列重排 kernel (Activation Reordering)
+// 功能: 对输入矩阵 A 的 K 维度列进行重排，使得同一量化 group 的列连续存放
+// 这是 act_order (activation ordering) 优化的关键步骤
+//
+// 为什么需要列重排:
+//   - 在 grouped quantization 中，每个 group 有独立的 scale/zero-point
+//   - 如果同一 group 的 K 维度元素在内存中不连续，kernel 需要频繁跳转访问 scale
+//   - 通过重排使同一 group 的列连续，kernel 可以顺序访问 scale，提升效率
+//
+// 实现方式:
+//   - 每个 thread block 处理 block_rows 行
+//   - 每个线程并行处理 K 维度的多个元素
+//   - perm_int_ptr[k] 存储第 k 列应该从原始矩阵的哪一列读取
 __global__ void permute_cols_kernel(int4 const* __restrict__ a_int4_ptr,
                                     int const* __restrict__ perm_int_ptr,
                                     int4* __restrict__ out_int4_ptr, int size_m,
@@ -119,12 +159,19 @@ __global__ void permute_cols_kernel(int4 const* __restrict__ a_int4_ptr,
   }
 }
 
+// 中文注释: 线程配置结构体
+// thread_k: 每个线程处理的 K 维度大小 (以 16 元素为单位)
+// thread_n: 每个线程处理的 N 维度大小
+// num_threads: thread block 中的线程数
 typedef struct {
   int thread_k;
   int thread_n;
   int num_threads;
 } thread_config_t;
 
+// 中文注释: 小 batch (M <= 1) 的线程配置候选列表
+// 优先使用较大的 tile (128x128) 以充分利用 Tensor Core
+// 当共享内存不够时退化为较小的 tile
 thread_config_t small_batch_thread_configs[] = {
     // Ordered by priority
 
@@ -133,6 +180,8 @@ thread_config_t small_batch_thread_configs[] = {
     {64, 128, 128},
     {128, 64, 128}};
 
+// 中文注释: 大 batch (M > 1) 的线程配置候选列表
+// 使用更大的 N 维度 tile (256) 来提升吞吐量
 thread_config_t large_batch_thread_configs[] = {
     // Ordered by priority
 
@@ -141,11 +190,20 @@ thread_config_t large_batch_thread_configs[] = {
     {64, 128, 128},
     {128, 64, 128}};
 
+// 中文注释: 执行配置结构体
+// blocks_per_sm: 每个 SM 上运行的 thread block 数量
+// tb_cfg: 线程配置 (thread_k, thread_n, num_threads)
 typedef struct {
   int blocks_per_sm;
   thread_config_t tb_cfg;
 } exec_config_t;
 
+// 中文注释: 计算 scale 在共享内存中所需的缓存大小
+// 用于判断当前配置是否能放入共享内存
+// 参数说明:
+//   - group_size == -1: 每个 N 列一个 scale (per-channel)
+//   - group_size == 0: 使用 act_order，最坏情况是 32 个 group
+//   - group_size > 0: 标准的 per-group quantization
 int get_scales_cache_size(thread_config_t const& th_config, int prob_m,
                           int prob_n, int prob_k, int num_bits, int group_size,
                           bool has_act_order, bool is_k_full, int stages) {
@@ -248,6 +306,10 @@ bool is_valid_config(thread_config_t const& th_config, int thread_m_blocks,
   return cache_size <= max_shared_mem;
 }
 
+// 中文注释: 根据模板参数选择具体的 Marlin kernel 实例
+// 通过 kernel_selector.h 中的宏展开，将所有可能的模板组合编译为具体的 kernel 函数
+// 然后返回匹配当前参数的函数指针
+// 如果没有匹配的 kernel，返回 MarlinDefault (空函数)
 MarlinFuncPtr get_marlin_kernel(
     const vllm::ScalarType a_type, const vllm::ScalarType b_type,
     const vllm::ScalarType c_type, const vllm::ScalarType s_type,
@@ -312,6 +374,27 @@ exec_config_t determine_exec_config(
   return exec_cfg;
 }
 
+// 中文注释: Marlin 矩阵乘法核心调度函数
+//
+// 功能: 执行 C = A @ B_dequant 的量化矩阵乘法
+// 流程:
+//   1. 如果有 act_order，先调用 permute_cols_kernel 对 A 的列重排
+//   2. 获取 GPU 的共享内存大小和计算能力
+//   3. 当 M 较大时，将 M 维度拆分为多个 block 并行处理
+//   4. 对每个 M block:
+//      a. determine_exec_config 选择最优线程配置
+//      b. get_marlin_kernel 获取对应的 kernel 函数指针
+//      c. 启动 kernel 执行矩阵乘法
+//
+// M 维度分块策略:
+//   - max_thread_m_blocks = 4: 每个 thread block 最多处理 4*16=64 行
+//   - 当 M > 64 时，启动多个 thread block 并行处理不同行
+//   - 使用 locks 数组进行跨 block 同步 (用于全局归约)
+//
+// SM 版本适配:
+//   - SM75 (Turing): 2 阶段 pipeline，只支持 FP16/INT8 激活
+//   - SM80+ (Ampere): 4 阶段 pipeline，支持所有数据类型
+//   - SM89 (Ada): 额外支持 FP8 激活 (W4A8-FP8)
 void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
                void* a_s, void* b_s, void* g_s, void* zp, void* g_idx,
                void* perm, void* a_tmp, int prob_m, int prob_n, int prob_k,
@@ -530,6 +613,27 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
 
 }  // namespace marlin
 
+// 中文注释: Marlin GEMM 的 Python 绑定入口函数
+// 从 PyTorch 张量中提取数据指针和参数，进行校验后调用 marlin_mm
+//
+// 参数说明:
+//   a: 输入激活矩阵 [M, K]，支持 FP16/BF16/FP8/INT8
+//   c_or_none: 可选的输出矩阵 [M, N]，如果为 None 则自动分配
+//   b_q_weight: 量化权重矩阵，packed 格式
+//   b_bias_or_none: 可选的偏置向量 [N]
+//   b_scales: 权重量化缩放因子 [num_groups, N]
+//   a_scales_or_none: 激活缩放因子 [M] (仅 8-bit 激活时使用)
+//   global_scale_or_none: 全局缩放因子 (仅 NVFP4 格式)
+//   b_zeros_or_none: 零点 (非对称量化时使用)
+//   g_idx_or_none: 分组索引 (act_order 时使用)
+//   perm_or_none: 列重排索引 (act_order 时使用)
+//   workspace: 工作空间，用于跨 block 同步
+//   b_type_id: 权重数据类型 ID
+//   size_m/n/k: 矩阵乘法维度
+//   is_k_full: K 维度是否完整 (影响 act_order 的处理方式)
+//   use_atomic_add: 是否使用 atomicAdd 归约
+//   use_fp32_reduce: 是否使用 FP32 全局归约
+//   is_zp_float: 零点是否为 float 类型
 torch::Tensor marlin_gemm(
     torch::Tensor& a, std::optional<torch::Tensor> c_or_none,
     torch::Tensor& b_q_weight,

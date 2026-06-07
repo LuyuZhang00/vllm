@@ -1,15 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""FlashInfer MLA Sparse Attention Backend.
+"""
+FlashInfer MLA 稀疏注意力后端模块。
 
-This backend uses the FlashInfer TRT-LLM MLA kernel with sparse_mla_top_k
-for models like DeepSeek-V3.2 that use index-based sparse attention.
+本模块实现了基于 FlashInfer TRT-LLM MLA 内核的稀疏注意力后端，
+主要用于 NVIDIA Blackwell（SM10.x）GPU 上的 DeepSeek V3.2 等稀疏模型。
 
-For sparse MLA:
-- block_tables shape changes from [batch_size, max_num_blocks] (dense)
-  to [batch_size, q_len_per_request, sparse_mla_top_k] (sparse)
-- The sparse indices represent physical cache slot positions to attend to
-- sparse_mla_top_k parameter must be set to the topk value
+核心特性：
+1. 使用 FlashInfer 的 trtllm_batch_decode_with_kv_cache_mla 内核
+2. 支持 sparse_mla_top_k 参数进行稀疏注意力
+3. 支持 FP8 KV 缓存（fp8, fp8_e4m3）
+4. 使用 Triton 内核将 per-request 索引转换为全局物理索引
+
+与 FlashMLA 稀疏后端的区别：
+- 使用 FlashInfer 而非 FlashMLA 内核
+- 仅支持 Blackwell GPU（SM10.x）
+- 需要 qk_nope_head_dim 在 [128, 192] 范围内
 """
 
 from dataclasses import dataclass
@@ -49,16 +55,15 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-FLASHINFER_MLA_SPARSE_WORKSPACE_BUFFER_SIZE = 128 * 1024 * 1024
+FLASHINFER_MLA_SPARSE_WORKSPACE_BUFFER_SIZE = 128 * 1024 * 1024  # 128MB
 
 
 class FlashInferMLASparseBackend(AttentionBackend):
-    """FlashInfer MLA backend with sparse attention support.
-
-    This backend uses the FlashInfer TRT-LLM MLA kernel with sparse_mla_top_k
-    for models like DeepSeek-V3.2 that use index-based sparse attention.
     """
+    FlashInfer MLA 稀疏注意力后端。
 
+    使用 FlashInfer TRT-LLM MLA 内核和 sparse_mla_top_k 参数进行稀疏注意力。
+    """
     supported_dtypes: ClassVar[list[torch.dtype]] = [torch.float16, torch.bfloat16]
     supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
         "auto",
@@ -70,6 +75,7 @@ class FlashInferMLASparseBackend(AttentionBackend):
 
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
+        """支持的块大小：32 和 64。"""
         return [32, 64]
 
     @staticmethod
@@ -86,6 +92,7 @@ class FlashInferMLASparseBackend(AttentionBackend):
 
     @classmethod
     def get_supported_head_sizes(cls) -> list[int]:
+        """支持的 head size：576。"""
         return [576]
 
     @classmethod
@@ -98,7 +105,7 @@ class FlashInferMLASparseBackend(AttentionBackend):
 
     @classmethod
     def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
-        # FlashInfer sparse MLA targets Blackwell (SM 10.x)
+        """FlashInfer 稀疏 MLA 目标 Blackwell（SM 10.x）。"""
         return capability.major == 10
 
     @classmethod
@@ -113,7 +120,8 @@ class FlashInferMLASparseBackend(AttentionBackend):
         use_sparse: bool,
         device_capability: DeviceCapability,
     ) -> str | None:
-        # FlashInfer MLA sparse kernel requires qk_nope_head_dim in [128, 192]
+        """检查是否支持给定的配置组合。"""
+        # FlashInfer MLA 稀疏内核要求 qk_nope_head_dim 在 [128, 192] 范围内
         from vllm.config import get_current_vllm_config
 
         vllm_config = get_current_vllm_config()
@@ -125,7 +133,7 @@ class FlashInferMLASparseBackend(AttentionBackend):
                     "FlashInfer MLA Sparse kernel requires qk_nope_head_dim "
                     f"in [128, 192], but got {qk_nope_head_dim}"
                 )
-            # Check for index_topk which indicates sparse model
+            # 检查 index_topk 是否存在（表示稀疏模型）
             if not hasattr(hf_text_config, "index_topk"):
                 return "FlashInfer MLA Sparse requires model with index_topk config"
         return None
@@ -134,7 +142,7 @@ class FlashInferMLASparseBackend(AttentionBackend):
     def get_kv_cache_shape(
         num_blocks: int,
         block_size: int,
-        num_kv_heads: int,  # assumed to be 1 for MLA
+        num_kv_heads: int,  # 对于 MLA 假设为 1
         head_size: int,
         cache_dtype_str: str = "auto",
     ) -> tuple[int, ...]:
@@ -142,28 +150,29 @@ class FlashInferMLASparseBackend(AttentionBackend):
 
     @classmethod
     def get_required_kv_cache_layout(cls) -> "KVCacheLayoutType | None":
+        """要求 HND（Head-NumTokens-Dim）布局。"""
         return "HND"
 
 
 @dataclass
 class FlashInferMLASparseMetadata(AttentionMetadata):
-    """Attention metadata for FlashInfer MLA Sparse backend."""
+    """
+    FlashInfer MLA 稀疏注意力的元数据。
 
+    包含稀疏注意力所需的基本元数据。
+    """
     num_reqs: int
     max_query_len: int
     max_seq_len: int
     num_actual_tokens: int
 
-    # Query start locations
-    query_start_loc: torch.Tensor
-    slot_mapping: torch.Tensor
-    block_table: torch.Tensor
-    req_id_per_token: torch.Tensor
+    query_start_loc: torch.Tensor  # Query 起始位置
+    slot_mapping: torch.Tensor  # Slot 映射
+    block_table: torch.Tensor  # 块表
+    req_id_per_token: torch.Tensor  # 每个 token 的请求 ID
 
-    # Sequence lengths for all requests (context + query)
-    seq_lens: torch.Tensor
+    seq_lens: torch.Tensor  # 所有序列的序列长度（context + query）
 
-    # Sparse-specific
     block_size: int = 64
     topk_tokens: int = 2048
 
@@ -171,8 +180,11 @@ class FlashInferMLASparseMetadata(AttentionMetadata):
 class FlashInferMLASparseMetadataBuilder(
     AttentionMetadataBuilder[FlashInferMLASparseMetadata]
 ):
-    """Builder for FlashInfer MLA Sparse attention metadata."""
+    """
+    FlashInfer MLA 稀疏注意力的元数据构建器。
 
+    负责构建 FlashInfer 内核所需的元数据。
+    """
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
 
     def __init__(
@@ -203,17 +215,25 @@ class FlashInferMLASparseMetadataBuilder(
         common_attn_metadata: CommonAttentionMetadata,
         fast_build: bool = False,
     ) -> FlashInferMLASparseMetadata:
+        """
+        构建 FlashInfer MLA 稀疏注意力的元数据。
+
+        流程：
+        1. 构建 req_id_per_token 映射
+        2. 零填充缓冲区以支持 CUDA Graph
+        3. 返回元数据
+        """
         cm = common_attn_metadata
         num_tokens = cm.num_actual_tokens
 
-        # Build req_id_per_token mapping
+        # 构建 req_id_per_token 映射
         starts = np.asarray(cm.query_start_loc_cpu, dtype=np.int32)
         seg_lengths = np.diff(starts)
         req_id_per_token = np.repeat(
             np.arange(seg_lengths.shape[0], dtype=np.int32), seg_lengths
         )
 
-        # Zero-fill for cudagraphs
+        # 为 CUDA Graph 零填充
         self.req_id_per_token_buffer.fill_(0)
         self.req_id_per_token_buffer[: req_id_per_token.shape[0]].copy_(
             torch.from_numpy(req_id_per_token), non_blocking=True
@@ -235,11 +255,12 @@ class FlashInferMLASparseMetadataBuilder(
         )
 
 
-# Global workspace buffer (lazily initialized)
+# 全局 workspace 缓冲区（延迟初始化）
 _fi_sparse_workspace: torch.Tensor | None = None
 
 
 def _get_workspace_buffer(device: torch.device) -> torch.Tensor:
+    """获取或创建 FlashInfer 稀疏 MLA 的 workspace 缓冲区。"""
     global _fi_sparse_workspace
     if _fi_sparse_workspace is None:
         _fi_sparse_workspace = torch.zeros(
@@ -251,10 +272,10 @@ def _get_workspace_buffer(device: torch.device) -> torch.Tensor:
 
 
 class FlashInferMLASparseImpl(SparseMLAAttentionImpl[FlashInferMLASparseMetadata]):
-    """FlashInfer MLA Sparse implementation.
+    """
+    FlashInfer MLA 稀疏注意力的具体实现。
 
-    Uses the TRT-LLM MLA kernel with sparse_mla_top_k parameter for
-    sparse attention computation.
+    使用 TRT-LLM MLA 内核和 sparse_mla_top_k 参数进行稀疏注意力计算。
     """
 
     def __init__(
@@ -269,7 +290,7 @@ class FlashInferMLASparseImpl(SparseMLAAttentionImpl[FlashInferMLASparseMetadata
         logits_soft_cap: float | None,
         attn_type: str,
         kv_sharing_target_layer_name: str | None,
-        # MLA Specific Arguments
+        # MLA 特有参数
         topk_indice_buffer: torch.Tensor | None = None,
         indexer: "Indexer | None" = None,
         **mla_args,
@@ -295,7 +316,7 @@ class FlashInferMLASparseImpl(SparseMLAAttentionImpl[FlashInferMLASparseMetadata
         self.num_kv_heads = num_kv_heads
         self.kv_cache_dtype = kv_cache_dtype
 
-        # MLA-specific dimensions
+        # MLA 特有维度
         self.kv_lora_rank: int = mla_args["kv_lora_rank"]
         self.qk_nope_head_dim: int = mla_args["qk_nope_head_dim"]
         self.qk_rope_head_dim: int = mla_args["qk_rope_head_dim"]
@@ -307,9 +328,9 @@ class FlashInferMLASparseImpl(SparseMLAAttentionImpl[FlashInferMLASparseMetadata
         self.bmm1_scale: float | None = None
         self.bmm2_scale: float | None = None
 
-        # fp8 query quantization is required when using fp8 kv_cache,
-        # as the TRTLLM-GEN sparse MLA kernel requires matching dtypes
-        # for query and kv_cache (mixed bf16+fp8 is not supported).
+        # FP8 query 量化在使用 FP8 KV 缓存时是必需的，
+        # 因为 TRTLLM-GEN 稀疏 MLA 内核要求 query 和 kv_cache 的 dtype 匹配
+        #（不支持混合 bf16+fp8）。
         self.supports_quant_query_input = True
 
     def forward_mqa(
@@ -319,6 +340,15 @@ class FlashInferMLASparseImpl(SparseMLAAttentionImpl[FlashInferMLASparseMetadata
         attn_metadata: FlashInferMLASparseMetadata,
         layer: AttentionLayer,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """
+        稀疏 MLA 注意力的主前向传播入口。
+
+        流程：
+        1. 如果 q 是元组，拼接为完整 q
+        2. 将 topk 逻辑索引转换为全局物理索引
+        3. 计算 bmm1_scale 和 bmm2_scale（考虑 FP8 缩放）
+        4. 调用 trtllm_batch_decode_with_kv_cache_mla 计算注意力
+        """
         if isinstance(q, tuple):
             q = torch.cat(q, dim=-1)
 
@@ -327,6 +357,7 @@ class FlashInferMLASparseImpl(SparseMLAAttentionImpl[FlashInferMLASparseMetadata
         assert self.topk_indices_buffer is not None
         topk_indices = self.topk_indices_buffer[:num_actual_toks]
 
+        # 将逻辑索引转换为物理索引，并获取有效计数
         topk_indices_physical, seq_lens = triton_convert_req_index_to_global_index(
             attn_metadata.req_id_per_token[:num_actual_toks],
             attn_metadata.block_table,
@@ -339,6 +370,7 @@ class FlashInferMLASparseImpl(SparseMLAAttentionImpl[FlashInferMLASparseMetadata
         if self._workspace_buffer is None:
             self._workspace_buffer = _get_workspace_buffer(q.device)
 
+        # 计算缩放因子（考虑 FP8 缓存）
         if self.bmm1_scale is None:
             self.bmm1_scale = self.scale
             if is_quantized_kv_cache(self.kv_cache_dtype):
