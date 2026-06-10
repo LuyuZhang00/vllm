@@ -1826,14 +1826,35 @@ class GPUModelRunner(
         num_reqs: int,
         for_cudagraph_capture: bool = False,
     ) -> tuple[torch.Tensor | None, np.ndarray | None]:
+        """获取 encoder-decoder 模型中 encoder 侧的序列长度。
+
+        仅对 CrossAttentionSpec（交叉注意力）类型的 KV Cache 有效。
+        交叉注意力需要知道 encoder 侧有多少 token 可供 attend，
+        这些长度信息会被设置到 CommonAttentionMetadata.encoder_seq_lens 中，
+        最终传递给 CrossAttentionBuilder 构建交叉注意力的元数据。
+
+        Args:
+            num_scheduled_tokens:  本轮调度的每个请求的 token 数量 {req_id: count}
+            kv_cache_spec:         KV Cache 规格（决定是否为交叉注意力）
+            num_reqs:              当前 batch 的请求数量
+            for_cudagraph_capture: 是否为 CUDA Graph 捕获模式
+
+        Returns:
+            tuple[encoder_seq_lens_gpu, encoder_seq_lens_cpu]:
+            - 非交叉注意力: (None, None)
+            - 交叉注意力: (GPU 张量, CPU numpy 数组)
+        """
+        # (1) 非交叉注意力类型: 无需 encoder 序列长度，直接返回
         if not isinstance(kv_cache_spec, CrossAttentionSpec):
             return None, None
 
-        # Zero out buffer for padding requests that are not actually scheduled (CGs)
+        # (2) 清零 buffer（padding 位置保持为 0）
         self.encoder_seq_lens.np[:num_reqs] = 0
 
-        # Build encoder_seq_lens array mapping request indices to
-        # encoder lengths for inputs scheduled in this batch
+        # (3) 遍历本轮调度的请求，计算每个请求的 encoder 输入 token 总数
+        # encoder 输入 = 所有多模态特征的 token 长度之和
+        # 无论 encoder 编码是否完成，都需要报告总长度，以便 cross-attention
+        # 知道有多少 encoder token 可以 attend
         for req_id in num_scheduled_tokens:
             req_index = self.input_batch.req_id_to_index[req_id]
             req_state = self.requests[req_id]
@@ -1841,16 +1862,15 @@ class GPUModelRunner(
                 self.encoder_seq_lens.np[req_index] = 0
                 continue
 
-            # Get the total number of encoder input tokens for running encoder requests
-            # whether encoding is finished or not so that cross-attention knows how
-            # many encoder tokens to attend to.
+            # 累加所有多模态特征的 encoder token 长度
             encoder_input_tokens = sum(
                 feature.mm_position.length for feature in req_state.mm_features
             )
             self.encoder_seq_lens.np[req_index] = encoder_input_tokens
+
+        # (4) CUDA Graph 捕获模式: 使用最大 encoder 长度
+        # 确保 max_seqlen_k 被正确捕获，以便 CUDA Graph replay 时不会越界
         if for_cudagraph_capture:
-            # During CUDA graph capture, we need to use realistic encoder lengths
-            # so that max_seqlen_k is captured with the correct value.
             max_encoder_len = getattr(
                 self.model_config.hf_config,
                 "max_source_positions",
@@ -1858,6 +1878,7 @@ class GPUModelRunner(
             )
             self.encoder_seq_lens.np[:num_reqs] = max_encoder_len
 
+        # (5) 拷贝到 GPU 并返回 GPU/CPU 两个版本
         self.encoder_seq_lens.copy_to_gpu(num_reqs)
         encoder_seq_lens = self.encoder_seq_lens.gpu[:num_reqs]
         encoder_seq_lens_cpu = self.encoder_seq_lens.np[:num_reqs]
@@ -2200,87 +2221,174 @@ class GPUModelRunner(
         slot_mappings: dict[int, torch.Tensor] | None = None,
     ) -> tuple[PerLayerAttnMetadata, CommonAttentionMetadata | None]:
         """
-        :return: tuple[attn_metadata, spec_decode_common_attn_metadata]
+        构建注意力元数据 (Attention Metadata)，供 Attention 后端使用。
+
+        本函数是模型前向传播的核心准备步骤之一。它为每个 Attention 层构建
+        后端（FlashAttention / FlashInfer / Triton 等）所需的元数据，包括：
+        - query_start_loc: 每个请求在 query 张量中的起止位置
+        - seq_lens: 每个请求的上下文总长度
+        - block_table: 逻辑块 → 物理块的映射表
+        - slot_mapping: 每个 token 在 KV Cache 中的写入地址
+        - is_prefilling: 每个请求是否处于 prefill 阶段
+
+        调用时机:
+            在 execute_model() 的 Step 1i 中调用，位于 _prepare_inputs() 之后、
+            set_forward_context() 之前。
+
+        Args:
+            num_tokens:        实际 token 总数（未 padding）
+            num_reqs:          实际请求数量（未 padding）
+            max_query_len:     本轮 batch 中最长的 query 长度
+            num_tokens_padded: padding 后的 token 总数（用于 CUDA Graph 对齐）
+            num_reqs_padded:   padding 后的请求数量
+            ubatch_slices:     微批次切片信息（用于 DBO / Microbatching）
+            logits_indices:    需要计算 logits 的 token 位置索引
+            use_spec_decode:   是否使用推测解码
+            for_cudagraph_capture: 是否为 CUDA Graph 捕获模式
+            num_scheduled_tokens:  每个请求本轮调度的 token 数量（用于交叉注意力）
+            cascade_attn_prefix_lens: 级联注意力的前缀长度（用于共享前缀优化）
+            slot_mappings:     每个 KV Cache 组的 slot mapping 张量字典
+
+        Returns:
+            tuple[attn_metadata, spec_decode_common_attn_metadata]:
+            - attn_metadata: 按层名索引的注意力元数据字典。
+              普通模式: dict[layer_name, AttentionMetadata]
+              微批次模式: list[dict[layer_name, AttentionMetadata]]
+              模型 forward 时通过 ForwardContext 按层名获取对应的元数据。
+            - spec_decode_common_attn_metadata: 推测解码草稿模型使用的
+              CommonAttentionMetadata（未 padding 版本），无推测解码时为 None。
         """
-        # Attention metadata is not needed for attention free models
+        # ================================================================
+        # 阶段 1: 早期返回 & 基本参数校验
+        # ================================================================
+
+        # (1a) 无 KV Cache 的模型（如纯 encoder 模型）不需要注意力元数据
         if len(self.kv_cache_config.kv_cache_groups) == 0:
             return {}, None
 
+        # (1b) 如果未提供 padded 尺寸，则使用未 padding 的值
         num_tokens_padded = num_tokens_padded or num_tokens
         num_reqs_padded = num_reqs_padded or num_reqs
         assert num_reqs_padded is not None and num_tokens_padded is not None
 
+        # (1c) 初始化 attn_metadata 容器
+        # 普通模式: dict[layer_name, AttentionMetadata]
+        # 微批次模式 (UBatch): list[dict[layer_name, AttentionMetadata]]
         attn_metadata: PerLayerAttnMetadata = {}
         if ubatch_slices is not None:
             attn_metadata = [dict() for _ in range(len(ubatch_slices))]
 
+        # ================================================================
+        # 阶段 2: 计算 max_seq_len（最长上下文长度）
+        # ================================================================
+
+        # (2a) CUDA Graph 捕获模式: 使用模型最大长度，确保后端选择正确的 kernel
+        # 例如 FlashAttention 在 sliding window 模型中需要看到大于窗口大小的
+        # max_seq_len 才能选择正确的 kernel
         if for_cudagraph_capture:
-            # For some attention backends (e.g. FA) with sliding window models we need
-            # to make sure the backend see a max_seq_len that is larger to the sliding
-            # window size when capturing to make sure the correct kernel is selected.
             max_seq_len = self.max_model_len
         else:
+            # (2b) 正常模式: 取当前 batch 中所有请求的最大序列长度
+            # optimistic_seq_lens_cpu 在 _prepare_inputs() 中已计算完成
             max_seq_len = self.optimistic_seq_lens_cpu.numpy()[:num_reqs].max().item()
+
+        # ================================================================
+        # 阶段 3: 获取 Block Table（逻辑块 → 物理块映射）
+        # ================================================================
 
         kv_cache_groups = self.kv_cache_config.kv_cache_groups
 
         def _get_block_table(kv_cache_gid: int):
+            """获取指定 KV Cache 组的 block table 张量。
+
+            Block table 是 PagedAttention 的核心数据结构：
+            block_table[req_idx][logical_block] = physical_block
+
+            对于 EncoderOnlyAttentionSpec（encoder-only 模型的双向注意力），
+            使用全零的占位 block table，因为 encoder 不使用 KV Cache。
+
+            对于 padding 的请求位置，填充 NULL_BLOCK_ID 以避免 CUDA Graph
+            模式下访问无效内存。
+            """
             assert num_reqs_padded is not None and num_tokens_padded is not None
             kv_cache_spec = kv_cache_groups[kv_cache_gid].kv_cache_spec
             if isinstance(kv_cache_spec, EncoderOnlyAttentionSpec):
+                # encoder-only 注意力: 使用占位 block table
                 blk_table_tensor = torch.zeros(
                     (num_reqs_padded, 1),
                     dtype=torch.int32,
                     device=self.device,
                 )
             else:
+                # 标准 decoder 注意力: 从 InputBatch 获取真实的 block table
                 blk_table = self.input_batch.block_table[kv_cache_gid]
                 blk_table_tensor = blk_table.get_device_tensor(num_reqs_padded)
 
-            # Fill unused block table entries with NULL_BLOCK_ID (null block)
-            # for CUDAGraph padding. Block 0 is reserved for padding.
+            # (3a) 将 padding 位置填充为 NULL_BLOCK_ID（block 0 保留给 padding）
+            # 这样后端 kernel 在处理 padding 行时会安全地跳过
             blk_table_tensor[num_reqs:num_reqs_padded].fill_(NULL_BLOCK_ID)
             return blk_table_tensor
 
+        # (3b) 获取第一个 KV Cache 组（gid=0）的 block table 和 slot mapping
+        # 它们将作为 CommonAttentionMetadata 的默认值
         assert slot_mappings is not None
         block_table_gid_0 = _get_block_table(0)
         slot_mapping_gid_0 = slot_mappings[0]
 
+        # (3c) 对于 MoE 模型的 routed experts，需要将 slot mapping 拷贝到
+        # 私有设备 buffer。因为共享的 slot_mappings 会被下一步的
+        # _prepare_inputs() 覆盖，而异步 D2H 拷贝可能仍在飞行中。
         if self.routed_experts_initialized:
-            # Copy this step's attention slot_mapping into our private
-            # device buffer. The shared ``slot_mappings[attn_gid]`` is
-            # owned by the attention block table and will be overwritten
-            # by the next ``_prepare_inputs``; we need a stable snapshot
-            # because the async D2H may still be in flight on the copy
-            # stream when the next step runs.
             attn_gid = self.routed_experts_attn_gid
             slot_mapping_attn = slot_mappings[attn_gid]
             self.routed_experts_slot_mapping_device[:num_tokens].copy_(
                 slot_mapping_attn[:num_tokens]
             )
 
+        # ================================================================
+        # 阶段 4: 准备 CPU 侧的序列长度信息
+        # ================================================================
+
+        # (4a) 获取每个请求已计算的 token 数量（即已有的 KV Cache 长度）
         num_computed_tokens_cpu = self.input_batch.num_computed_tokens_cpu_tensor[
             :num_reqs_padded
         ]
+        # (4b) 获取每个请求的 prompt 总长度
         num_prompt_tokens_cpu = self.input_batch.num_prompt_tokens_cpu_tensor[
             :num_reqs_padded
         ]
+        # (4c) 获取乐观的序列长度（= num_computed + num_scheduled）
         seq_lens_cpu = self.optimistic_seq_lens_cpu[:num_reqs_padded]
         seq_lens_cpu_upper_bound = seq_lens_cpu
 
-        # is_prefilling: True if request is still in prefill phase.
-        # Used by mamba backends to distinguish actual decodes from
-        # short extends.
+        # (4d) 判断每个请求是否仍在 prefill 阶段
+        # 条件: 已计算的 token 数 < prompt 总长度（即还有 token 未处理）
+        # Mamba 后端需要区分真正的 decode 和短 extend
         is_prefilling = num_computed_tokens_cpu < num_prompt_tokens_cpu
-        # Zero out padded rows so stale data from condense() doesn't
-        # misclassify padding as prefill in CUDA graph mode.
+        # (4e) 将 padding 行清零，防止 condense() 遗留的脏数据
+        # 在 CUDA Graph 模式下误将 padding 判定为 prefill
         is_prefilling[num_reqs:] = False
 
+        # (4f) 异步推测解码模式: GPU 张量是权威来源，不使用 CPU 侧数据
+        # 因为异步模式下 CPU 侧的值可能是乐观估计（假设所有 draft token 被接受）
         if self.use_async_spec_decode:
-            # GPU tensors are authoritative in async mode.
             seq_lens_cpu = None
             num_computed_tokens_cpu = None
 
+        # ================================================================
+        # 阶段 5: 构建 CommonAttentionMetadata（公共注意力元数据）
+        # ================================================================
+
+        # CommonAttentionMetadata 是所有后端共享的通用元数据。
+        # 每个后端的 MetadataBuilder 接收它作为输入，构建后端特定的元数据。
+        #
+        # 关键字段说明:
+        # - query_start_loc: 前缀和格式，用于定位每个请求的 query 范围
+        #   例如 3 个请求 query 长度 [5, 3, 7] → [0, 5, 8, 15]
+        # - seq_lens: 每个请求的上下文总长度（= 已计算 + 本轮新增）
+        # - block_table_tensor: 逻辑块 → 物理块映射 [num_reqs, max_blocks]
+        # - slot_mapping: 每个 token 的 KV Cache 写入地址 [num_tokens]
+        # - is_prefilling: 是否在 prefill 阶段（用于 Mamba 后端区分模式）
         cm_base = CommonAttentionMetadata(
             query_start_loc=self.query_start_loc.gpu[: num_reqs_padded + 1],
             query_start_loc_cpu=self.query_start_loc.cpu[: num_reqs_padded + 1],
@@ -2299,6 +2407,8 @@ class GPUModelRunner(
             positions=self.positions[:num_tokens_padded],
         )
 
+        # (5a) Decode Context Parallelism (DCP): 多 GPU 分散长序列 KV Cache
+        # 每个 rank 只持有部分序列，需要记录本地 rank 负责的序列长度
         if self.dcp_world_size > 1:
             self.dcp_local_seq_lens.cpu[:num_reqs] = get_dcp_local_seq_lens(
                 self.optimistic_seq_lens_cpu[:num_reqs],
@@ -2314,17 +2424,20 @@ class GPUModelRunner(
                 :num_reqs_padded
             ]
 
+        # (5b) KV Sharing Fast Prefill: 共享前缀优化时，记录需要计算 logits 的位置
         if logits_indices is not None and self.cache_config.kv_sharing_fast_prefill:
             cm_base.num_logits_indices = logits_indices.size(0)
             cm_base.logits_indices_padded = self._prepare_kv_sharing_fast_prefill(
                 logits_indices
             )
 
-        # Cache attention metadata builds across hybrid KV-cache groups
-        # The only thing that changes between different hybrid KV-cache groups when the
-        # same metadata builder and KVCacheSpec is the same is the block table, so we
-        # can cache the attention metadata builds and just update the block table using
-        # `builder.update_block_table` if the builder supports it.
+        # ================================================================
+        # 阶段 6: 为每个 KV Cache 组构建后端特定的注意力元数据
+        # ================================================================
+
+        # (6a) 元数据构建缓存: 对于混合 KV Cache 组（如 hybrid attention 模型），
+        # 不同组之间只有 block table 和 slot mapping 不同，其他元数据可以复用。
+        # 缓存 key = (KVCacheSpec 类型, MetadataBuilder 类型)
         cached_attn_metadata: dict[
             tuple[KVCacheSpec, type[AttentionMetadataBuilder]], AttentionMetadata
         ] = {}
@@ -2335,19 +2448,37 @@ class GPUModelRunner(
             common_attn_metadata: CommonAttentionMetadata,
             ubid: int | None = None,
         ) -> None:
+            """为单个 attention group 构建后端特定的元数据。
+
+            一个 KV Cache 组内可以有多个 attention group（例如 sliding window
+            和 full attention 使用不同的 group）。每个 group 有自己的
+            MetadataBuilder，但同一 group 内的所有层共享同一个元数据对象。
+
+            Args:
+                kv_cache_gid:    KV Cache 组索引
+                attn_gid:        attention group 索引（在 KV Cache 组内）
+                common_attn_metadata: 公共注意力元数据
+                ubid:            微批次索引（DBO 模式下使用，普通模式为 None）
+            """
+            # (6a-1) 获取该 attention group 的 MetadataBuilder
             attn_group = self.attn_groups[kv_cache_gid][attn_gid]
             builder = attn_group.get_metadata_builder(ubid or 0)
+
+            # (6a-2) 确定 KV Cache 规格（用于缓存 key）
             kv_cache_spec = kv_cache_groups[kv_cache_gid].kv_cache_spec
             if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):
                 kv_cache_spec = kv_cache_spec.kv_cache_specs[attn_group.layer_names[0]]
             cache_key = (kv_cache_spec, type(builder))
 
+            # (6a-3) 获取级联注意力的前缀长度（共享前缀优化）
             cascade_attn_prefix_len = (
                 cascade_attn_prefix_lens[kv_cache_gid][attn_gid]
                 if cascade_attn_prefix_lens
                 else 0
             )
 
+            # (6a-4) 推测解码 + Mamba/GDN 后端: 需要额外的 accepted tokens 信息
+            # 用于正确处理 draft token 的接受/拒绝
             extra_attn_metadata_args = {}
             if use_spec_decode and isinstance(
                 builder, (Mamba2AttentionMetadataBuilder, GDNAttentionMetadataBuilder)
@@ -2367,7 +2498,10 @@ class GPUModelRunner(
                         self.mamba_prev_last_scheduled_idx.gpu[:num_reqs_padded]
                     )
 
+            # (6a-5) 构建后端特定的注意力元数据（三种路径）
             if for_cudagraph_capture:
+                # 路径 A: CUDA Graph 捕获模式
+                # 使用特殊的构建方法，生成适合 CUDA Graph 捕获的元数据
                 attn_metadata_i = builder.build_for_cudagraph_capture(
                     common_attn_metadata
                 )
@@ -2375,20 +2509,28 @@ class GPUModelRunner(
                 cache_key in cached_attn_metadata
                 and builder.supports_update_block_table
             ):
+                # 路径 B: 缓存命中且 builder 支持增量更新
+                # 只更新 block table 和 slot mapping，复用其他元数据
+                # 这避免了重复构建相同模式的元数据（如 hybrid attention 模型）
                 attn_metadata_i = builder.update_block_table(
                     cached_attn_metadata[cache_key],
                     common_attn_metadata.block_table_tensor,
                     common_attn_metadata.slot_mapping,
                 )
             else:
+                # 路径 C: 正常构建（缓存未命中或不支持增量更新）
+                # 调用 builder.build() 构建完整的后端元数据
                 attn_metadata_i = builder.build(
                     common_prefix_len=cascade_attn_prefix_len,
                     common_attn_metadata=common_attn_metadata,
                     **extra_attn_metadata_args,
                 )
+                # 如果 builder 支持增量更新，则缓存本次构建结果
                 if builder.supports_update_block_table:
                     cached_attn_metadata[cache_key] = attn_metadata_i
 
+            # (6a-6) 将构建好的元数据按层名存入 attn_metadata 字典
+            # 同一 attention group 内的所有层共享同一个元数据对象
             if ubid is None:
                 assert isinstance(attn_metadata, dict)
                 attn_metadata_dict = attn_metadata
@@ -2399,24 +2541,29 @@ class GPUModelRunner(
             for layer_name in attn_group.layer_names:
                 attn_metadata_dict[layer_name] = attn_metadata_i
 
-        # Prepare the attention metadata for each KV cache group and make layers
-        # in the same group share the same metadata.
+        # (6b) 遍历所有 KV Cache 组，为每组构建元数据
+        # KV Cache 组的划分依据: 不同的注意力模式（如 full attention vs sliding window）
+        # 或不同的 KV Cache 类型（如 Mamba + Attention 混合模型）
         spec_decode_common_attn_metadata = None
         for kv_cache_gid, kv_cache_group in enumerate(kv_cache_groups):
-            cm = copy(cm_base)  # shallow copy
+            # (6b-1) 浅拷贝公共元数据，每组可以独立修改 block table 等字段
+            cm = copy(cm_base)
 
-            # Basically only the encoder seq_lens, block_table and slot_mapping change
-            # for each kv_cache_group.
+            # (6b-2) 设置交叉注意力的 encoder 序列长度（仅 encoder-decoder 模型需要）
             cm.encoder_seq_lens, cm.encoder_seq_lens_cpu = self._get_encoder_seq_lens(
                 num_scheduled_tokens or {},
                 kv_cache_group.kv_cache_spec,
                 num_reqs_padded,
                 for_cudagraph_capture=for_cudagraph_capture,
             )
+            # (6b-3) 非第一个 KV Cache 组: 使用各自的 block table 和 slot mapping
+            # 不同组的物理 KV Cache 布局可能不同
             if kv_cache_gid > 0:
                 cm.block_table_tensor = _get_block_table(kv_cache_gid)
                 cm.slot_mapping = slot_mappings[kv_cache_gid]
 
+            # (6b-4) 推测解码: 为草稿模型保存 CommonAttentionMetadata
+            # EAGLE/DFlash/Gemma4 等草稿模型需要与 target model 共享 KV Cache 元数据
             if self.speculative_config and spec_decode_common_attn_metadata is None:
                 if isinstance(
                     self.drafter,
@@ -2427,11 +2574,14 @@ class GPUModelRunner(
                         ExtractHiddenStatesProposer,
                     ),
                 ):
+                    # 这些草稿模型只在特定的 KV Cache 组上运行
                     if self.drafter.kv_cache_gid == kv_cache_gid:
                         spec_decode_common_attn_metadata = cm
                 else:
+                    # 其他草稿模型直接使用第一个组的元数据
                     spec_decode_common_attn_metadata = cm
-            # Capture per-group block tables for multi-group proposers.
+
+            # (6b-5) 多组草稿模型: 捕获每组的 block table 供草稿模型使用
             if self.speculative_config and isinstance(self.drafter, Step3p5MTPProposer):
                 self.drafter.set_per_group_attn_metadata(
                     kv_cache_gid, cm.block_table_tensor, cm.slot_mapping
@@ -2441,23 +2591,30 @@ class GPUModelRunner(
                     kv_cache_gid, cm.block_table_tensor
                 )
 
+            # (6b-6) 为该 KV Cache 组内的每个 attention group 构建元数据
             for attn_gid in range(len(self.attn_groups[kv_cache_gid])):
                 if ubatch_slices is not None:
+                    # DBO 微批次模式: 将公共元数据按 ubatch 切片拆分，
+                    # 每个微批次独立构建元数据
                     for ubid, _cm in enumerate(split_attn_metadata(ubatch_slices, cm)):
                         _build_attn_group_metadata(kv_cache_gid, attn_gid, _cm, ubid)
-
                 else:
+                    # 普通模式: 直接构建
                     _build_attn_group_metadata(kv_cache_gid, attn_gid, cm)
 
+        # ================================================================
+        # 阶段 7: 多模态前缀 LM 的双向注意力处理
+        # ================================================================
+
+        # (7a) 对于多模态前缀 LM（如 Gemma3/4），图像 token 需要双向注意力
+        # 即图像 token 之间可以互相 attend，而非单向的 causal attention
         if self.is_mm_prefix_lm:
             req_doc_ranges = {}
 
-            # Gemma4 bidi: skip ranges that exceed the sliding
-            # window. When image tokens > sliding_window, bidi causes
-            # early image tokens to attend to the entire image
-            # (e.g. 6 → 1092 targets), degrading spatial precision.
-            # Per-range filtering keeps bidi for small images/video
-            # frames while skipping oversized images.
+            # (7b) Gemma4 双向注意力: 跳过超过 sliding window 的图像范围
+            # 当图像 token 数 > sliding_window 时，双向注意力会导致早期图像
+            # token attend 到整个图像（如 6 → 1092 targets），降低空间精度。
+            # 按范围过滤：保留小图像/视频帧的双向注意力，跳过超大图像。
             hf_text_config = self.model_config.hf_text_config
             _bidi_sw = getattr(hf_text_config, "sliding_window", None)
 
@@ -2474,15 +2631,19 @@ class GPUModelRunner(
                 req_idx = self.input_batch.req_id_to_index[req_id]
                 req_doc_ranges[req_idx] = image_doc_ranges
 
-            # Set mm_prefix_range for all attention metadata
+            # (7c) 将双向注意力范围设置到所有注意力元数据中
             self._set_mm_prefix_range_for_metadata(attn_metadata, req_doc_ranges)
 
+        # ================================================================
+        # 阶段 8: 推测解码元数据的 unpadding 处理
+        # ================================================================
+
+        # (8a) 推测解码的草稿模型使用 piecewise CUDA Graph（非 full CG），
+        # 直接修改注意力元数据，因此不需要 padded 的元数据。
+        # 将 padded 的 CommonAttentionMetadata 还原为未 padding 的版本。
         if spec_decode_common_attn_metadata is not None and (
             num_reqs != num_reqs_padded or num_tokens != num_tokens_padded
         ):
-            # Currently the drafter still only uses piecewise cudagraphs (and modifies
-            # the attention metadata in directly), and therefore does not want to use
-            # padded attention metadata.
             spec_decode_common_attn_metadata = (
                 spec_decode_common_attn_metadata.unpadded(num_tokens, num_reqs)
             )
@@ -2495,24 +2656,43 @@ class GPUModelRunner(
         num_computed_tokens: np.ndarray,
         num_common_prefix_blocks: list[int],
     ) -> list[list[int]] | None:
-        """
-        :return: Optional[cascade_attn_prefix_lens]
-            cascade_attn_prefix_lens is 2D: ``[kv_cache_group_id][attn_group_idx]``,
-            None if we should not use cascade attention
-        """
+        """计算级联注意力 (Cascade Attention) 的公共前缀长度。
 
+        级联注意力是一种优化：当多个请求共享相同的前缀（如 system prompt）时，
+        将注意力计算拆分为两部分：
+        1. 公共前缀部分: 所有请求共享同一份 KV Cache，只需计算一次
+        2. 独特部分: 每个请求独立计算
+
+        这避免了重复计算共享前缀的 attention，显著减少计算量。
+
+        本函数遍历所有 KV Cache 组和 attention group，计算每组的公共前缀长度。
+        如果任何一组可以使用级联注意力，返回 2D 数组；否则返回 None。
+
+        Args:
+            num_scheduled_tokens:    每个请求本轮调度的 token 数量
+            num_computed_tokens:     每个请求已计算的 token 数量
+            num_common_prefix_blocks: 每个 KV Cache 组的共享前缀块数
+
+        Returns:
+            Optional[list[list[int]]]:
+            - 2D 数组: [kv_cache_group_id][attn_group_idx] = 前缀长度（token 数）
+            - None: 不使用级联注意力
+        """
         use_cascade_attn = False
         num_kv_cache_groups = len(self.kv_cache_config.kv_cache_groups)
         cascade_attn_prefix_lens: list[list[int]] = [
             [] for _ in range(num_kv_cache_groups)
         ]
 
+        # 遍历每个 KV Cache 组和其下的 attention group
         for kv_cache_gid in range(num_kv_cache_groups):
             for attn_group in self.attn_groups[kv_cache_gid]:
                 if isinstance(attn_group.kv_cache_spec, EncoderOnlyAttentionSpec):
+                    # encoder-only 注意力: 不使用级联注意力
                     cascade_attn_prefix_len = 0
                 else:
-                    # 0 if cascade attention should not be used
+                    # 计算该 attention group 的公共前缀长度
+                    # 返回 0 表示不使用级联注意力
                     cascade_attn_prefix_len = self._compute_cascade_attn_prefix_len(
                         num_scheduled_tokens,
                         num_computed_tokens,
@@ -2533,73 +2713,62 @@ class GPUModelRunner(
         kv_cache_spec: KVCacheSpec,
         attn_metadata_builder: AttentionMetadataBuilder,
     ) -> int:
-        """Compute the length of the common prefix for cascade attention.
+        """计算单个 attention group 的级联注意力公共前缀长度。
 
-        NOTE(woosuk): The common prefix length returned by this function
-        represents the length used specifically for cascade attention, not the
-        actual number of tokens shared between requests. When cascade attention
-        is disabled (use_cascade=False), this function returns 0 even if
-        requests share common tokens. Additionally, the common prefix length is
-        truncated to a multiple of the block size and may be further truncated
-        due to implementation details explained below.
+        级联注意力将 attention 拆分为两个 kernel：
+        1. 公共前缀 kernel: 处理所有请求共享的 KV Cache 部分（双向注意力）
+        2. 独特部分 kernel: 处理每个请求独有的部分（因果注意力）
+
+        返回值是用于级联注意力的公共前缀长度，不等于请求间实际共享的 token 数。
+        当级联注意力被禁用时（use_cascade=False），即使请求共享 token 也返回 0。
+
+        限制条件：
+        - 前缀长度必须是 block_size 的整数倍（PagedAttention 的块对齐要求）
+        - 前缀长度不能超过任何请求的 num_computed_tokens（避免掩码问题）
 
         Args:
-            num_scheduled_tokens: Number of tokens scheduled per request.
-            num_common_prefix_blocks: Number of shared KV cache blocks.
+            num_scheduled_tokens:    每个请求本轮调度的 token 数量
+            num_computed_tokens:     每个请求已计算的 token 数量
+            num_common_prefix_blocks: 共享的 KV Cache 块数
+            kv_cache_spec:           KV Cache 规格（block_size 等）
+            attn_metadata_builder:   注意力元数据构建器
 
         Returns:
-            int: Length of common prefix in tokens.
+            int: 公共前缀长度（token 数），0 表示不使用级联注意力
         """
-
+        # (1) 计算初始的公共前缀长度（块数 × 块大小）
         common_prefix_len = num_common_prefix_blocks * kv_cache_spec.block_size
         if common_prefix_len == 0:
-            # Common case.
+            # 常见情况: 没有共享前缀
             return 0
 
-        # NOTE(woosuk): Cascade attention uses two attention kernels: one
-        # for the common prefix and the other for the rest. For the first
-        # kernel, we concatenate all the query tokens (possibly from
-        # different requests) and treat them as if they are from the same
-        # request. Then, we use bi-directional attention to process the
-        # common prefix in the KV cache. Importantly, this means that the
-        # first kernel does not do any masking.
-
-        # Consider the following example:
-        # Request 1's input query: [D, E, X]
-        # Request 1's kv cache: [A, B, C, D, E, X]
-        # Request 1's num_computed_tokens: 3 (i.e., [A, B, C])
-        # Request 2's input query: [E, Y]
-        # Request 2's kv cache: [A, B, C, D, E, Y]
-        # Request 2's num_computed_tokens: 4 (i.e., [A, B, C, D])
-
-        # If we use [A, B, C, D, E] as the common prefix, then the
-        # first kernel will compute the bi-directional attention between
-        # input query [D, E, X, E, Y] and common prefix [A, B, C, D, E].
-        # However, this is wrong because D in Request 1 should not attend to
-        # E in the common prefix (i.e., we need masking).
-        # To avoid this, [A, B, C, D] should be the common prefix.
-        # That is, the common prefix should be capped by the minimum
-        # num_computed_tokens among the requests, and plus one to include
-        # the first token of the query.
-
-        # In practice, we use [A, B, C] as the common prefix, instead of
-        # [A, B, C, D] (i.e., the common prefix is capped by the minimum
-        # num_computed_tokens, without plus one).
-        # This is because of an implementation detail: We want to always
-        # use two kernels for cascade attention. Let's imagine:
-        # Request 3's input query: [D]
-        # Request 3's kv cache: [A, B, C, D]
-        # Request 3's num_computed_tokens: 3 (i.e., [A, B, C])
-        # If we use [A, B, C, D] as the common prefix for Request 1-3,
-        # then Request 3 will be processed only by the first kernel,
-        # and the second kernel will get an empty input. While this is not
-        # a fundamental problem, our current implementation does not support
-        # this case.
+        # (2) 限制公共前缀长度: 不能超过任何请求的 num_computed_tokens
+        #
+        # 级联注意力的第一个 kernel 使用双向注意力处理公共前缀，
+        # 将所有请求的 query token 拼接后统一 attend 到公共前缀的 KV Cache。
+        # 由于双向注意力不做掩码，如果前缀包含某个请求尚未计算的 token，
+        # 就会导致信息泄漏。
+        #
+        # 示例:
+        #   Request 1: query=[D,E,X], kv=[A,B,C,D,E,X], computed=3 ([A,B,C])
+        #   Request 2: query=[E,Y],   kv=[A,B,C,D,E,Y], computed=4 ([A,B,C,D])
+        #
+        # 如果前缀=[A,B,C,D,E]，第一个 kernel 计算 query=[D,E,X,E,Y] 对
+        # prefix=[A,B,C,D,E] 的双向注意力。但 Request 1 的 D 不应该 attend 到
+        # E（因为 E 在 Request 1 中尚未计算），所以前缀必须 ≤ min(computed)。
+        #
+        # 实际使用 min(computed) 而非 min(computed)+1，因为实现要求始终使用
+        # 两个 kernel。如果前缀=min(computed)+1，某些请求（如 Request 3 只有
+        # query=[D], computed=3）将只由第一个 kernel 处理，第二个 kernel 得到
+        # 空输入，当前实现不支持这种情况。
         common_prefix_len = min(common_prefix_len, num_computed_tokens.min())
-        # common_prefix_len should be a multiple of the block size.
+
+        # (3) 对齐到 block_size 的整数倍（PagedAttention 的块对齐要求）
         common_prefix_len = (
             common_prefix_len // kv_cache_spec.block_size * kv_cache_spec.block_size
         )
+
+        # (4) 判断是否使用 sliding window 或 local attention
         use_sliding_window = isinstance(kv_cache_spec, SlidingWindowSpec) or (
             isinstance(kv_cache_spec, FullAttentionSpec)
             and kv_cache_spec.sliding_window is not None
@@ -2608,6 +2777,10 @@ class GPUModelRunner(
             isinstance(kv_cache_spec, FullAttentionSpec)
             and kv_cache_spec.attention_chunk_size is not None
         )
+
+        # (5) 询问 MetadataBuilder 是否应该使用级联注意力
+        # Builder 会根据前缀长度、query 长度、head 数量、GPU SM 数等因素
+        # 综合判断级联注意力是否能带来性能收益
         assert isinstance(kv_cache_spec, AttentionSpec)
         use_cascade = attn_metadata_builder.use_cascade_attention(
             common_prefix_len=common_prefix_len,
@@ -2620,6 +2793,8 @@ class GPUModelRunner(
             num_sms=self.num_sms,
             dcp_world_size=self.dcp_world_size,
         )
+
+        # (6) 返回公共前缀长度: 如果 Builder 判断不使用级联注意力，返回 0
         return common_prefix_len if use_cascade else 0
 
     def _calc_mrope_positions(self, scheduler_output: "SchedulerOutput"):
@@ -2802,21 +2977,43 @@ class GPUModelRunner(
         self,
         logits_indices: torch.Tensor,
     ) -> torch.Tensor:
+        """准备 KV Sharing Fast Prefill 所需的 logits 索引张量。
+
+        KV Sharing Fast Prefill 是一种优化：在 prefill 阶段，多个请求可能共享
+        相同的前缀（如 system prompt）。通过在 attention 层直接输出 logits，
+        可以避免重复计算共享前缀的 attention。
+
+        本函数将 logits_indices 拷贝到预分配的设备 buffer 中，并进行 padding
+        以满足 CUDA Graph 的对齐要求。
+
+        Args:
+            logits_indices: 需要计算 logits 的 token 位置索引（GPU 张量）
+
+        Returns:
+            padding 后的 logits_indices 张量（GPU）
+        """
         assert self.kv_sharing_fast_prefill_logits_indices is not None
         num_logits = logits_indices.shape[0]
         assert num_logits > 0
+
+        # (1) 拷贝实际的 logits 索引到预分配 buffer
         self.kv_sharing_fast_prefill_logits_indices[:num_logits].copy_(logits_indices)
-        # There might have leftover indices in logits_indices[num_logits:]
-        # from previous iterations, whose values may be greater than the
-        # batch size in the current iteration. To ensure indices are always
-        # valid, fill the padded indices with the last index. Broadcast the
-        # scalar GPU-side to avoid a D2H sync on `.item()`.
+
+        # (2) 填充 padding 位置: 使用最后一个有效索引
+        # buffer 中 logits_indices[num_logits:] 可能包含上一步遗留的值，
+        # 这些值可能大于当前 batch 的大小，导致索引越界。
+        # 使用最后一个有效索引填充，确保所有索引都合法。
+        # 在 GPU 侧广播标量，避免 D2H 同步。
         self.kv_sharing_fast_prefill_logits_indices[num_logits:] = logits_indices[-1]
-        # Dispatch for the decoder portion of the model.
+
+        # (3) 使用 CUDA Graph dispatcher 计算 padding 后的大小
+        # decoder 部分不使用 full CUDA Graph（因为 logits 数量变化大）
         _, batch_desc = self.cudagraph_dispatcher.dispatch(
             num_logits, invalid_modes={CUDAGraphMode.FULL}
         )
         num_logits_padded = batch_desc.num_tokens
+
+        # (4) 返回 padding 后的 logits 索引切片
         logits_indices_padded = self.kv_sharing_fast_prefill_logits_indices[
             :num_logits_padded
         ]
@@ -3886,20 +4083,30 @@ class GPUModelRunner(
         dict[int, torch.Tensor] | None,
         dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None,
     ]:
-        """
-        Build slot mappings in both formats needed by the system.
+        """构建 slot mapping，提供两种格式供不同组件使用。
+
+        Slot mapping 是 PagedAttention 的核心数据结构之一。它告诉 KV Cache
+        的 reshape_and_cache kernel 每个 token 应该写入 KV Cache 的哪个物理位置。
+
+        计算公式: slot_id = physical_block_number * block_size + offset_in_block
+
+        本函数输出两种格式：
+        - 按 KV Cache 组索引: dict[gid, Tensor]，供 _build_attention_metadata 使用
+        - 按层名索引: dict[layer_name, Tensor]，供 set_forward_context 使用
 
         Args:
-            num_tokens_padded: Total number of tokens (padded)
-            num_reqs_padded: Total number of requests (padded)
-            num_tokens_unpadded: Actual number of tokens (unpadded)
-            ubatch_slices: Optional ubatch slicing info for DBO
+            num_tokens_padded:   padding 后的 token 总数
+            num_reqs_padded:     padding 后的请求数量
+            num_tokens_unpadded: 实际 token 总数（未 padding）
+            ubatch_slices:       微批次切片信息（DBO 模式）
 
         Returns:
-            A tuple of:
-            - slot_mappings_by_gid: dict[int, torch.Tensor] for attention metadata
-            - slot_mappings_by_layer: dict[str, torch.Tensor] or list for ForwardContext
+            tuple[slot_mappings_by_gid, slot_mappings_by_layer]:
+            - slot_mappings_by_gid: {gid: Tensor} 供注意力元数据构建
+            - slot_mappings_by_layer: {layer_name: Tensor} 或 list 供 ForwardContext
+              无 KV Cache 时返回 (None, None)
         """
+        # (1) 无 KV Cache 的模型: 返回 None
         if not (
             hasattr(self, "kv_cache_config")
             and self.kv_cache_config is not None
@@ -3908,37 +4115,58 @@ class GPUModelRunner(
             return None, None
 
         def _get_slot_mapping(kv_cache_gid: int):
+            """获取单个 KV Cache 组的 slot mapping 张量。
+
+            Args:
+                kv_cache_gid: KV Cache 组索引
+
+            Returns:
+                slot_mapping: shape [num_tokens_padded] 的 GPU 张量，
+                    每个元素是该 token 在 KV Cache 中的线性地址
+            """
             assert num_reqs_padded is not None and num_tokens_padded is not None
             kv_cache_spec = self.kv_cache_config.kv_cache_groups[
                 kv_cache_gid
             ].kv_cache_spec
             if isinstance(kv_cache_spec, EncoderOnlyAttentionSpec):
+                # encoder-only 注意力: 使用全零占位（不使用 KV Cache）
                 slot_mapping = torch.zeros(
                     (num_tokens_padded,),
                     dtype=torch.int64,
                     device=self.device,
                 )
             else:
+                # 标准 decoder 注意力: 从 block table 获取真实的 slot mapping
+                # slot_mapping 在 _prepare_inputs() 阶段已通过
+                # block_table.compute_slot_mapping() 计算完成
                 blk_table = self.input_batch.block_table[kv_cache_gid]
                 slot_mapping = blk_table.slot_mapping.gpu[:num_tokens_padded]
 
-            # Fill unused with -1. Needed for reshape_and_cache in full cuda
-            # graph mode. `blk_table_tensor` -1 to match mamba PAD_SLOT_ID
+            # (1a) 将 padding 位置填充为 -1
+            # -1 是无效的 slot ID，reshape_and_cache kernel 会跳过它
+            # 在 full CUDA Graph 模式下，padding 行必须有合法值，否则
+            # reshape_and_cache 可能写入错误的内存位置
+            # -1 也与 Mamba 后端的 PAD_SLOT_ID 保持一致
             slot_mapping[num_tokens_unpadded:num_tokens_padded].fill_(-1)
 
             return slot_mapping
 
+        # (2) 按 KV Cache 组索引构建 slot mapping 字典
         slot_mappings_by_gid = {
             gid: _get_slot_mapping(gid)
             for gid, _ in enumerate(self.kv_cache_config.kv_cache_groups)
         }
 
+        # (3) 按层名索引构建 slot mapping 字典
+        # 同一 KV Cache 组内的所有层共享同一个 slot mapping
         slot_mappings_by_layer: dict[str, torch.Tensor] = {}
         for gid, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups):
             slot_mapping = slot_mappings_by_gid[gid]
             for layer_name in kv_cache_group.layer_names:
                 slot_mappings_by_layer[layer_name] = slot_mapping
 
+        # (4) DBO 微批次模式: 按 token slice 切分 slot mapping
+        # 每个微批次只处理部分 token，需要对应的 slot mapping 切片
         if ubatch_slices is not None:
             result: list[dict[str, torch.Tensor]] = []
             for ubatch in ubatch_slices:
@@ -6982,17 +7210,29 @@ class GPUModelRunner(
         attn_metadata: Any,
         req_doc_ranges: dict[int, list[tuple[int, int]]],
     ) -> None:
-        """Set mm_prefix_range for all attention metadata objects.
+        """为所有注意力元数据对象设置多模态前缀的双向注意力范围。
 
-        This method handles both list and non-list attention metadata,
-        computing mm_prefix_range_tensor once and sharing it across all
-        metadata objects to avoid redundant host-to-device transfers.
+        对于多模态前缀 LM（如 Gemma3/4），图像 token 需要双向注意力
+        （即图像 token 之间可以互相 attend）。本函数将每个请求的图像
+        token 范围信息注入到注意力元数据中，供后端 kernel 在构建注意力
+        掩码时使用。
+
+        处理两种 attn_metadata 结构：
+        - dict 模式: dict[layer_name, AttentionMetadata]
+        - list 模式: list[dict[layer_name, AttentionMetadata]]（微批次）
+
+        为了减少 H2D 拷贝，Triton 后端的 tensor 只计算一次，所有层共享。
+
+        Args:
+            attn_metadata: 注意力元数据（dict 或 list[dict]）
+            req_doc_ranges: 每个请求的图像 token 范围
+                {req_idx: [(start, end), ...]}
         """
         from vllm.v1.attention.backends.triton_attn import (
             TritonAttentionMetadata,
         )
 
-        # Get all metadata objects from either list or dict structure
+        # (1) 收集所有元数据对象（兼容 dict 和 list 两种结构）
         metadata_list = []
         if isinstance(attn_metadata, list):
             for ub_metadata in attn_metadata:
@@ -7000,12 +7240,15 @@ class GPUModelRunner(
         else:
             metadata_list.extend(attn_metadata.values())
 
-        # Set mm_prefix_range for all metadata and compute tensor once
+        # (2) 为每个元数据对象设置双向注意力范围
+        # Triton 后端需要额外的 tensor 格式，只计算一次并共享
         shared_tensor = None
         for metadata in metadata_list:
+            # 设置 Python dict 格式的范围（所有后端通用）
             metadata.mm_prefix_range = req_doc_ranges  # type: ignore[attr-defined]
 
-            # Only compute tensor for TritonAttentionMetadata
+            # 仅对 TritonAttentionMetadata 计算 tensor 格式
+            # 所有 Triton 层共享同一个 tensor，避免重复的 H2D 拷贝
             if isinstance(metadata, TritonAttentionMetadata):
                 if shared_tensor is None:
                     shared_tensor = (
